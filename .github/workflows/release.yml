@@ -1,0 +1,62 @@
+name: Release Go Binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64, "386"]
+        exclude:
+          - goos: darwin
+            goarch: "386"
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="code-reducer"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="code-reducer.exe"
+          fi
+          # Compile with optimizations and strip symbols
+          go build -ldflags="-s -w" -o "dist/${BINARY_NAME}" main.go
+
+      - name: Package Binary
+        id: package
+        run: |
+          cd dist
+          BINARY_NAME="code-reducer"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="code-reducer.exe"
+            zip "../code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.zip" "${BINARY_NAME}"
+            echo "asset_path=code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.zip" >> $GITHUB_OUTPUT
+          else
+            tar -czvf "../code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" "${BINARY_NAME}"
+            echo "asset_path=code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.asset_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

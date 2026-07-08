@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Mantener actualizadas las dependencias de Go (go.mod)
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Mantener actualizados los workflows de GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
