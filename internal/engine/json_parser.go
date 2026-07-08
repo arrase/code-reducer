@@ -7,18 +7,21 @@ import (
 	"strings"
 )
 
-var jsonFenceRegex = regexp.MustCompile("(?s)^\\x60{3,}(?:json)?\\s*(.*?)\\s*\\x60{3,}$")
+var markdownFenceRe = regexp.MustCompile("(?s)^\\x60{3,}(?:markdown|json)?\\s*(.*?)\\s*\\x60{3,}$")
+
+// StripOuterMarkdownFence strips surrounding markdown or json code fences from input strings.
+func StripOuterMarkdownFence(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if matches := markdownFenceRe.FindStringSubmatch(trimmed); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	return trimmed
+}
 
 // CleanJSONResponse extracts JSON content from surrounding markdown code fences.
 func CleanJSONResponse(response string) string {
-	trimmed := strings.TrimSpace(response)
+	trimmed := StripOuterMarkdownFence(response)
 
-	// Strip markdown code fences if present
-	if matches := jsonFenceRegex.FindStringSubmatch(trimmed); len(matches) > 1 {
-		return strings.TrimSpace(matches[1])
-	}
-
-	// Sometimes models output text before or after the JSON block. Let's find the first '{' or '[' and the last '}' or ']'.
 	firstBrace := strings.Index(trimmed, "{")
 	firstBracket := strings.Index(trimmed, "[")
 
@@ -30,18 +33,39 @@ func CleanJSONResponse(response string) string {
 	}
 
 	if startIdx != -1 {
-		lastBrace := strings.LastIndex(trimmed, "}")
-		lastBracket := strings.LastIndex(trimmed, "]")
+		var stack []rune
+		inString := false
+		var escape bool
 
-		endIdx := -1
-		if lastBrace != -1 && (lastBracket == -1 || lastBrace > lastBracket) {
-			endIdx = lastBrace
-		} else if lastBracket != -1 {
-			endIdx = lastBracket
-		}
+		for i, r := range trimmed[startIdx:] {
+			if escape {
+				escape = false
+				continue
+			}
+			if r == '\\' && inString {
+				escape = true
+				continue
+			}
+			if r == '"' {
+				inString = !inString
+				continue
+			}
 
-		if endIdx != -1 && endIdx > startIdx {
-			return trimmed[startIdx : endIdx+1]
+			if !inString {
+				if r == '{' || r == '[' {
+					stack = append(stack, r)
+				} else if r == '}' || r == ']' {
+					if len(stack) > 0 {
+						last := stack[len(stack)-1]
+						if (r == '}' && last == '{') || (r == ']' && last == '[') {
+							stack = stack[:len(stack)-1]
+						}
+					}
+					if len(stack) == 0 {
+						return trimmed[startIdx : startIdx+i+1]
+					}
+				}
+			}
 		}
 	}
 

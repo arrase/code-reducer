@@ -1,198 +1,130 @@
-# wiki/quickstart.md — Code-Reducer Architecture Quickstart
+# Code Reducer — Wiki/Quickstart
 
-## System Boundaries & Module Interaction Topology
+## System Architecture Overview
+
+**Code Reducer** is a CLI-driven tool that generates and maintains Markdown architecture documentation from Go code repositories using LLM inference via Ollama. The system operates on three core boundaries: the **command-line interface**, the **configuration resolution pipeline**, the **AI synthesis engine**, and the **security/file I/O layer**. All modules converge through a shared `repoRoot` path boundary enforced by the security module, which validates all filesystem operations against an absolute root to prevent traversal attacks.
+
+### Module Interaction Map
 
 ```
-┌─────────────── cmd ───────────────┐
-│ RootCmd → executeCommand(mode)    │
-│ init / update subcommands         │
-│ RunSetupFlow (interactive)        │
-└──────────────┬────────────────────┘
-               │ CLI dispatch
-┌──────────────▼────────────────────┐
-│ internal/config                    │
-│ Config.ResolveConfig()             │
-│ 4-layer merge: defaults < yaml < env < flags │
-└──────────────┬────────────────────┘
-               │ resolved *Config
-┌──────────────▼────────────────────┐
-│ security                           │
-│ AcquireLock → SafeResolve         │
-│ Path containment enforced          │
-└──────────────┬────────────────────┘
-┌──────────────▼────────────────────┐
-│ internal/tools                     │
-│ VerifyGitRepo, DiscoverCodeFiles  │
-│ ReadFileSafely, WriteFileSafely   │
-└──────────────┬────────────────────┘
-               │ file list + *Config
-┌──────────────▼────────────────────┐
-│ internal/engine                    │
-│ buildTree → synthesizeNode         │
-│ reduceInChunks → RunInit           │
-│ LLMClient (Ollama)                 │
-└───────────────────────────────────┘
+User CLI Invocation (cmd)
+    │
+    ├─► config.ResolveConfig() ───────────────┐
+    │     │                                    │
+    │     ▼                                    ▼
+    │  System Defaults ◄──────────────────────────────────┐
+    │      YAML File (.code-reducer.yaml)                  │
+    │      Env Variables                                   │
+    │      CLI Flags                                       │
+    │                                                       ▼
+    │                                              *Config struct
+    │                                                      │
+    ▼                                                     ▼
+Engine (engine) ◄───────────────── Security (security)
+│                   │                    │
+│  Runner           │   SimpleLock       │
+│  DirNode Tree     │   SafeResolve      │
+│  synthesizeNode() │                    │
+│  LLMClient        │    ReadFileSafely  │
+│  MetadataCache    │    WriteFileSafely │
+└───────────────────┴────────────────────┘
+         │
+         ▼
+tools (git_tools / file_tools) ── git verify, ignore patterns, binary detection
 ```
 
-**Execution lifecycle:** Runner acquires process lock (`security`) → verifies repository root (`tools`) → loads/resolves configuration (`config`) → executes synthesis pipeline (`engine`). All I/O operations pass through `SafeResolve` to prevent path traversal escapes outside the canonical repo root.
+**Data Flow Summary:** `cmd` parses CLI arguments and persists user config → `config` resolves the canonical `*Config` through a priority merge pipeline → `engine.Runner` consumes `*Config`, builds a `DirNode` tree via recursive traversal, synthesizes per-node summaries through LLM calls with SHA256 caching, then generates global architecture/quickstart docs → `security` enforces path boundaries and process locks for all filesystem operations throughout the pipeline.
 
 ---
 
-## Module 1: `cmd` — CLI Surface & Orchestration
+## Developer Quick Reference
 
-**Boundary:** External entry point. Owns command registration, setup flow, and lifecycle orchestration. Does not own configuration resolution or engine execution—delegates both.
+### cmd — CLI Entry Point & Subcommand Registry
 
-| Component | Responsibility |
-|-----------|----------------|
-| `RootCmd.executeCommand(mode)` | Root orchestrator: git validation → implicit setup → config merge → `.metadata.json` check → credential gate (`NeedsCredentialSetup()`) → engine dispatch with signal handling |
-| `initCmd` / `updateCmd` | Subcommands for wiki regeneration. `updateCmd` is registered in package init to ensure availability alongside root command |
-| `RunSetupFlow` | Interactive setup: prompts model ID, Ollama Base URL, context size, ignore paths/extension, doc dir → writes `.code-reducer.yaml` |
+**Boundary:** All user-facing commands flow through a cobra-based CLI rooted at `RootCmd`. Non-zero exit codes propagate as status 1 from `main()`.
 
-**Data flow:** `RootCmd` → `executeCommand(mode)` → git validation → implicit setup (if missing) → configuration merge → `.metadata.json` check → `NeedsCredentialSetup()` gate → engine dispatch with signal handling.
+| Component | Behavior |
+|-----------|----------|
+| `main()` / `root.go` | Delegates to `cmd.RootCmd.Execute()`, enforces exit-on-error |
+| `setupCmd` (`setup.go`) | Interactive prompts collect LLM model ID, Ollama URL + context size, ignore lists (comma-separated), docs dir path; persists via `config.SaveConfig` |
+| `updateCmd` (`update.go`) | Detects changed files since last documented commit via git diff semantics; triggers incremental wiki page regeneration |
 
----
+**Setup Flow Detail:** `RunSetupFlow` orchestrates interactive prompts. `promptAndAppend` merges comma-separated stdin input against defaults or existing lists (preserves first-seen order). `promptString` reads single-line text, trims whitespace, falls back on empty/failed reads. All aggregated config persists via `config.SaveConfig`.
 
-## Module 2: `internal/config` — Configuration Resolution & Persistence
+### config — Configuration Resolution Pipeline
 
-**Boundary:** Single source of truth for pipeline configuration. Owns persistence, runtime overrides, and precedence merging. Consumed by every downstream module via the resolved `*Config`.
+**Boundary:** Single authoritative `*Config` value consumed by all downstream components. Never read individual sources after resolution.
 
-### Precedence Merge Order
-```
-system defaults (OllamaDefault*) < YAML config (.code-reducer.yaml) < environment variables (*_EnvKey) < CLI flags
-```
+| Source (lowest → highest priority) | Override Key / Mechanism |
+|---|---|
+| System defaults (`OllamaDefaultBaseURL`, `OllamaDefaultNumCtx`) | Hardcoded fallbacks |
+| YAML file (`.code-reducer.yaml`) | `LoadConfig` parses into populated struct; errors on missing/invalid file |
+| Environment variables | `CodeReducerModelIdEnvKey`, `OllamaBaseUrlEnvKey`, `OllamaNumCtxEnvKey`, `LangsmithApiKeyEnvKey`, `LangchainProjectEnvKey`, `LangchainTracingEnvKey` |
+| CLI flags (`modelIdFlag`, `numCtxFlag`) | Highest priority; overrides env + file + defaults |
 
-### Key Types & Contracts
+**Constants:** Filesystem name `.code-reducer.yaml`; write permissions enforced at `0600`.
 
-| Type | Contract |
-|------|----------|
-| `Config` | YAML-serializable; pointer semantics prevent zero-value marshaling for optional sections (model, tracing). Sole struct persisted to disk. |
-| `MetadataCache` | Maintains last documented commit ID + maps of cached files and modules |
+**Resolution Pipeline:** `ResolveConfig(repoRoot, modelIdFlag, numCtxFlag) *Config` orchestrates the full merge. Generic `MergeAndDeduplicate[T comparable]` preserves insertion order when combining default ignore lists with user overrides.
 
-### Persistence Functions
+### engine — AI-Powered Documentation Synthesis System
 
-| Function | Contract |
+**Boundary:** End-to-end pipeline: Configuration → Runner instantiation → repository discovery → DirNode tree construction → recursive `synthesizeNode` (LLM extraction + SHA256 cache lookup) → root summary → standard docs generation → metadata serialization via `MetadataCache`.
+
+#### LLM Client Abstraction (`client.go`)
+- `NewLLMClient(modelID, baseURL string, contextLength int)` — constructs client with model identifier, API endpoint, max context size
+- `CallLLM(messages []Message) (string, error)` — non-streaming HTTP request to Ollama backend; returns full text or error
+- `StreamLLM(messages []Message, handler func(string)) error` — streaming session; calls user-supplied function per content segment until complete
+- `GetDefaultSystemPrompt(mode string) string` — contextualized system prompt based on operation mode (code extraction, module synthesis, architecture docs)
+
+#### Caching Layer (`cache.go`)
+- `FileCacheEntry` stores SHA256 hash + facts string for individual files; enables change detection without re-reading source during updates
+- `MetadataCache` aggregates global state: last documented commit reference, file entries (path → FileCacheEntry mapping), module mappings
+- `loadMetadataCache(metadataPath)` — reads `.metadata.json` relative to docs dir or creates empty cache
+- `saveMetadataCache(metadataPath, cache)` — serializes as indented JSON to metadata path
+- `computeSHA256(fileContent []byte) string` — SHA256 hex digest for content from virtual file paths relative to repo root
+
+#### Directory Tree Representation (`tree.go`)
+- `DirNode` contains directory path, list of files (with SHA256 hashes), child nodes keyed by subdirectory name
+- `FileChange` holds Path + Status ("Added", "Modified", "Deleted") for incremental update cycles
+
+#### JSON Response Parsing (`json_parser.go`)
+- `StripOuterMarkdownFence(input)` — strips surrounding markdown/JSON code fences
+- `CleanJSONResponse(raw) (string, error)` — removes fences, uses brace/bracket matching to extract complete JSON object/array
+- `UnmarshalJSONResponse(raw, v interface{}) error` — cleans then deserializes into target
+
+#### Pipeline Orchestrator (`orchestrator.go`)
+- `Event` struct carries Type + Message strings for pipeline status callbacks
+- `GenerateStandardDocs(summary string, client *LLMClient) error` — generates global architecture and quickstart Markdown from root summary via LLM; writes safely to disk
+- `RunInit(client *LLMClient) error` — full Map-Reduce init: discover code → build DirNode tree → synthesize root summary hierarchically → regenerate standard docs → update AGENTS.md with AI agent guidelines
+- `RunUpdate(client *LLMClient, repoRoot string) error` — incremental op: SHA256 comparison against metadata cache detects file changes (added/modified/deleted) → determines affected directories via tree traversal → re-synthesizes summaries only where needed → conditionally regenerates architecture or quickstart docs
+
+#### Configuration and Runner (`runner.go`)
+- `NewRunner(cfg *Config) (*Runner, error)` — factory constructor; entry point for initializing the documentation generation system
+
+### security — Filesystem Isolation & Process Synchronization
+
+**Boundary:** All filesystem operations are gated by `repoRoot` absolute path as a constant security boundary. Path validation prevents traversal outside this root.
+
+| Function | Behavior |
 |----------|----------|
-| `ConfigExists(dir)` | Stat check only—no read. Returns bool for CLI entry points to prompt on first run |
-| `LoadConfig(dir)` | Read YAML → unmarshal into `Config`. Malformed returns zero-value + error |
-| `SaveConfig(cfg)` | Marshal YAML → write with 0600 permissions (owner-only) |
-| `ResolveConfig()` | 4-layer merge: defaults < yaml < env vars < CLI flags. Returns canonical config for all pipeline stages |
+| `SafeResolve(repoRoot, inputPath string) (string, error)` | Neutralizes relative references (`..`, single-dot), resolves against repoRoot, returns validated absolute path or error on traversal attempt |
+| `SimpleLock` struct — LockFilePath + FileHandle for process-level locking | `AcquireLock(repoRoot string)` opens `<repoRoot>/.code-reducer.lock` with O_EXCL; writes PID via atomic file semantics; returns `*SimpleLock` holding open handle. `Unlock(lock *SimpleLock) error` releases lock, removes lockfile from disk |
+| `EnsureGitignoreHasLockfile(repoRoot string) error` | Appends `.code-reducer.lock` to `.gitignore` if absent (creates file if nonexistent) |
 
-### Environment Variable Keys
-- `CodeReducerModelIdEnvKey` — runtime LLM model ID override
-- `OllamaBaseUrlEnvKey` — custom Ollama API base URL (default: `http://localhost:11434`)
-- `OllamaNumCtxEnvKey` — context window size in tokens
-- `LangsmithApiKeyEnvKey`, `LangchainProjectEnvKey`, `LangchainTracingEnvKey` — tracing config
+### tools — Repository Verification & Safe File I/O
 
-### Defaults
-- `DefaultIgnores`: `.git`, `node_modules`, `dist`, etc.
-- `DefaultIgnoredExtensions`: `.png`, `.zip`, `.pyc`, etc.
+**Boundary:** All functions operate within a verified git repository context established by `VerifyGitRepo`. Callers must invoke this before any repo-aware operation.
 
-These are merged with user-supplied entries during resolve and applied to file-system traversal downstream.
+#### Git Operations (`git_tools.go`)
+- `VerifyGitRepo(repoPath string) error` — validates git binary presence + running `rev-parse --is-inside-work-tree`; errors on either precondition failure
+- `RunGit(repoPath string, args ...string) (string, error)` — executes git commands scoped to working tree; captures stdout trimmed of trailing whitespace; propagates non-zero exit codes as errors
 
----
+#### Safe File I/O (`file_tools.go`)
+- `ReadFileSafely(repoPath string) ([]byte, error)` — resolves relative path to absolute, performs error-checked open/read/close cycle; returns complete payload or error
+- `WriteFileSafely(repoPath string, content []byte) error` — three safety measures: parent directory creation with mode preservation, symlink detection and rejection (prevents silent redirect attacks), TOCTOU-safe truncation via O_RDWR | O_CREATE | O_TRUNC
+- `IsBinaryFile(path string) bool` — scans first 1024 bytes for null byte `\x00`; returns true if binary detected; used as quick filter during code discovery
 
-## Module 3: `security` — Path Safety & Process Serialization
-
-**Boundary:** Two orthogonal safety guarantees—path containment enforcement and process serialization via file-based locking. All public functions operate against an absolute repository root derived at initialization; no downstream operation can escape the intended working directory.
-
-### Lock Lifecycle
-```
-EnsureGitignoreHasLockfile() → AcquireLock() → SimpleLock { path, *os.File } → Unlock(lock)
-```
-
-| Function | Contract |
-|----------|----------|
-| `AcquireLock()` | Opens `.code-reducer.lock` with `O_WRONLY \| O_CREATE \| O_EXCL`. Atomic: if held, open fails immediately. Writes PID, returns `SimpleLock` handle |
-| `Unlock(lock)` | Closes fd + `os.Remove` lockfile path. Prevents stale PID files from deadlocking subsequent acquires |
-| `EnsureGitignoreHasLockfile()` | Idempotently registers lock artifact in `.gitignore`. Ephemeral—never version-controlled |
-
-### Path Safety: `SafeResolve(path string) (string, error)`
-Canonicalizes input path to absolute representation relative to repo root. Performs strict containment check; rejects any traversal (`..`) detected pre-resolution. Returns error if resolved target lies outside boundary or symlink bypass is detected. All I/O operations must pass through this function.
-
----
-
-## Module 4: `internal/tools` — Repository Verification, Safe I/O, File Discovery
-
-**Boundary:** Low-level repository operations for higher-level analysis modules. Consistent pattern: verify environment → resolve paths safely → read/write with TOCTOU guards → filter against ignore rules. All functions operate on an absolute or virtual repo root resolved once per session.
-
-### Repository Verification
-| Function | Contract |
-|----------|----------|
-| `VerifyGitRepo(repoPath)` | Two preconditions: (1) `git` executable accessible via `$PATH`, (2) `.git/` exists and path resolves to it. Blocks downstream when callers assume git-backed repo |
-
-### Git Operations
-- `RunGit(repoPath, args...)` — executes git command inside `repoPath`; returns trimmed stdout + error; stderr discarded
-- `GetGitHead(repoPath)` — delegates to `RunGit("rev-parse", "HEAD")`, trims whitespace → current commit hash. Anchors state snapshots for discovery/hashing modules
-
-### Safe File I/O
-| Function | Contract |
-|----------|----------|
-| `ReadFileSafely(virtualPath)` | Resolves virtual (relative-to-repo-root) path to absolute on-disk location; normalizes separators so `./foo`, `../bar/baz`, and `baz` produce identical byte slices for same file |
-| `WriteFileSafely(absPath, data)` | TOCTOU-safe: verifies target is not a symlink via `os.Lstat()` before truncating. Returns error if symlink detected (prevents privilege escalation via symlink swap) |
-
-### Path Resolution & Hashing
-- `HashRepoRoot(path)` — SHA-256 hex digest of resolved absolute path. Deterministic fingerprint for current repo location; used for caching, diff detection, state anchoring
-
-### File Discovery & Ignore Logic
-| Function | Contract |
-|----------|----------|
-| `LoadGitignore(repoRoot)` | Reads `.gitignore`, parses line-by-line (skips comments + blank lines), returns active ignore patterns in original form (no glob expansion) |
-| `ShouldIgnoreFile(relPath)` | Evaluates: custom gitignore patterns, dot-prefixed components, known binary/extension suffixes (.exe, .so), common non-source extensions. Returns true if matched |
-| `DiscoverCodeFiles(repoRoot)` | Recursively walks tree collecting high-signal source files (.go, .py, .rs, etc.). Skips build directories (node_modules/, vendor/, __pycache__/), dependency paths by prefix, any entry matching ignore list. Returns flat sorted slice of relative file paths—primary input to analysis pipelines |
-
----
-
-## Module 5: `internal/engine` — Map-Reduce Pipeline Orchestration
-
-**Boundary:** Implements the three-phase pipeline for automated codebase documentation generation. Owns tree construction, synthesis, and reduction logic. Consumes resolved config (for LLM client instantiation) and operates within `SafeResolve` path safety boundary inherited from `security`.
-
-### Data Structures
-| Type | Contract |
-|----------|----------|
-| `DirNode { Path, Files, Children }` | Represents node in recursive directory tree. Holds absolute path, flat list of immediate files, child subtrees for nested directories |
-| `FileChange { Path, Status }` | Single file-change record produced by diffing current state against baseline snapshot. Status: "Added", "Modified", or "Deleted" |
-| `Event { Type, Message }` | Logging struct holding event category + human-readable description emitted during execution |
-
-### Tree Construction & Affected Propagation
-- `buildTree(filePaths)` — constructs root `*DirNode` from absolute file paths by parsing into directory components; recursively nests children under parent nodes
-- `determineAffected / propagateAffected` — walks tree marking directories as affected when any descendant is marked affected, a module doc is missing, or cache entries are empty. Recursive walker bubbles upward from leaf to root ensuring every ancestor of changed files inherits the affected flag
-
-### LLM Client & Communication Layer
-| Component | Contract |
-|----------|----------|
-| `LLMClient` / `NewLLMClient` | Aggregates connection settings + HTTP transport for Ollama-compatible endpoint. Initialized with model ID, base URL, context window size, default timeout |
-| `CallLLM / StreamLLM` | Synchronous non-streaming POST returns raw response string or error; streaming initiates request, parses chunks line-by-line, invokes callback per content segment |
-| `stripOuterMarkdownFence / CleanJSONResponse / UnmarshalJSONResponse` | Regex-based fence stripping for common LLM output artifacts. `UnmarshalJSONResponse` chains cleaning + unmarshaling with contextual parse-error wrapping |
-
-### Caching Layer
-- `FileCacheEntry & MetadataCache` — stores SHA256 hash + facts per file within cache structure; maintains last documented commit ID along with cached files and modules maps
-- `loadMetadataCache / saveMetadataCache` — reads metadata JSON from docs directory (returns initialized or parsed `*MetadataCache`); serializes into formatted JSON at specified metadata path
-- `computeSHA256(contentPath)` — SHA-256 hash of content at virtual path; returns hex-encoded string for deduplication across re-runs
-
-### Core Pipeline Functions
-| Function | Contract |
-|----------|----------|
-| `synthesizeNode(node, llmClient)` | Traverses directory tree node's children and files; extracts file facts through LLM analysis with SHA256 caching; hierarchically merges all components into consolidated summary. Each leaf analyzed independently; intermediate nodes aggregate descendants' summaries before returning upward |
-| `reduceInChunks(items, llmClient)` | Recursively batches code items by character limit; synthesizes via LLM calls to produce architecture summaries. Splits input set into chunks fitting within context window, processes each through `synthesizeNode`, merges results bottom-up until single root summary remains |
-
-### Runner & Orchestration
-| Function | Contract |
-|----------|----------|
-| `Runner / NewRunner(cfg)` | Struct holding engine configuration pointer; primary container for executing code-reduction pipelines |
-| `Run(mode, llmClient)` | Orchestrates full execution lifecycle: acquires lock → instantiates LLM client from config → dispatches to context-specific documentation pipeline based on repository root and command type |
-
----
-
-## Cross-Module Integration Map
-
-```
-cmd                    ── CLI surface & orchestration ──▶ internal/config
-internal/config        ── resolved Config contract ────▶ internal/engine (LLMClient)
-internal/config        ── DefaultIgnores/DefaultIgnoredExtensions ──▶ internal/tools (ShouldIgnoreFile)
-internal/tools         ── repo root verification + file discovery ──▶ internal/engine (buildTree input)
-security               ── SafeResolve path safety ────▶ ALL I/O in engine, tools
-security               ── AcquireLock/Unlock          ──▶ cmd (executeCommand lifecycle guard)
-internal/tools         ── git state queries (HEAD)    ──▶ internal/engine (MetadataCache anchoring)
-```
-
-**Key principle:** Every module's public contract is a struct or function signature defined in its boundary. No hidden dependencies—`config`, `security`, and `tools` are the three pillars that `cmd` and `engine` build upon.
+#### Code Discovery & Filtering (`file_tools.go`)
+- `LoadGitignore(repoRoot string) ([]string, error)` — reads `.gitignore`, strips comments and blank lines, returns active pattern set (nil if missing); patterns returned as-is for downstream matching
+- `ShouldIgnoreFile(relPath string) bool` — evaluates against .gitignore patterns, dot-prefixed directories (`.build`, `.cache`), known binary extensions, null-byte presence; returns true if any rule matches → skip during discovery
+- `DiscoverCodeFiles(repoRoot string) ([]string, error)` — recursively walks repoRoot collecting source files while skipping build dirs (`node_modules`, `.git`, `target`), .gitignore patterns, binary-flagged files; returns sorted slice of relative paths for deterministic consumption by analysis pipelines

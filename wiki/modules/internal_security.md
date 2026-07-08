@@ -1,40 +1,62 @@
-# Module: `security` (`security.go`)
+# Module Overview
 
-## Responsibility & Data Flow
+Enforces filesystem isolation and process synchronization primitives for repository-level operations. Centralizes path validation against an absolute root boundary, manages concurrent access via atomic file-based locking (PID-pinned), and maintains version control hygiene by integrating lock artifacts into `.gitignore`. All state transitions revolve around the `repoRoot` absolute path as a constant security boundary.
 
-The `security` package implements two orthogonal safety guarantees for the Code-Reducer execution environment: **path containment enforcement** and **process serialization via file-based locking**. All public functions operate against an absolute repository root derived at initialization, ensuring that no downstream operation can escape the intended working directory. The data flow follows a lifecycle pattern:
+## Path Validation and Traversal Protection
 
-1.  **Initialization:** `EnsureGitignoreHasLockfile` registers the lock artifact in `.gitignore` to prevent version control pollution.
-2.  **Serialization Entry:** `AcquireLock` atomically claims an exclusive process slot by writing the current PID into `LockFileName` (`.code-reducer.lock`) using `O_EXCL`, returning a `SimpleLock` handle.
-3.  **Execution Guardrail:** Any I/O operation must pass through `SafeResolve`, which canonicalizes relative paths and rejects any traversal attempt that would resolve outside the repository root.
-4.  **Serialization Exit:** `Unlock` closes the underlying file descriptor and unlinks the lockfile, releasing the process slot for the next iteration or concurrent worker.
+### SafeResolve
 
-## Path Safety: `SafeResolve`
+**Signature:** `SafeResolve(repoRoot, inputPath string) (string, error)`
 
-**Function:** `SafeResolve(path string) (string, error)`
+Resolves an arbitrary user-supplied `inputPath` against the canonical absolute `repoRoot`. Performs cleanup of the input string to neutralize relative references (`..`, single-dot), then resolves the resulting path against the repository root. Returns a fully qualified absolute path if the resolved target remains within the `repoRoot` boundary; otherwise, returns an error to signal a traversal attempt or invalidation.
 
-Canonicalizes an input path into its absolute representation relative to the repository root. Performs a strict containment check; returns an error if the resolved target lies outside the boundary or if any traversal component (`..`) is detected pre-resolution. This prevents directory escape vectors and symlink-based bypasses during file system operations.
+### Data Flow
 
-## Process Locking Protocol
+1.  **Input:** `inputPath` (untrusted string) + `repoRoot` (absolute, trusted constant).
+2.  **Sanitization:** `inputPath` is normalized to eliminate relative components and redundant separators.
+3.  **Resolution:** OS-level path resolution joins the sanitized input with `repoRoot`.
+4.  **Boundary Check:** The resolved string is compared against the prefix of `repoRoot`.
+5.  **Output:** Validated absolute path or error indicating traversal/invalidation failure.
 
-### Initialization & Cleanup
-**Function:** `EnsureGitignoreHasLockfile()`
+## File-Based Process Locking
 
-Idempotently appends `LockFileName` to the repository's `.gitignore`. If the entry does not exist, it creates a new line; if present, it is left untouched. Ensures the lock mechanism remains ephemeral and local to the working tree.
+### SimpleLock Struct
 
-**Function:** `Unlock(lock SimpleLock)`
+**Signature:** `type SimpleLock struct { ... }`
 
-Releases resources associated with an acquired `SimpleLock`. Closes the underlying file handle (`os.File`) and calls `os.Remove` on the lockfile path stored within the struct. This guarantees no stale PID files persist after process termination or intentional release, preventing deadlock conditions for subsequent acquire attempts.
+Encapsulates the state required to manage a single process-level lock:
 
-### Lock Acquisition
-**Function:** `AcquireLock()`
+*   **LockFilePath:** Absolute filesystem location of the lockfile (typically `<repoRoot>/.code-reducer.lock`).
+*   **FileHandle:** OS file descriptor representing an acquired exclusive hold on the lockfile.
 
-Establishes an exclusive process lock by opening `LockFileName` (`.code-reducer.lock`) with `O_WRONLY | O_CREATE | O_EXCL`. The `O_EXCL` flag enforces atomicity: if a previous instance holds the file, the open fails immediately. On success, the current PID is written to the file descriptor and flushed, then the handle is returned as a `SimpleLock`. This state represents the "locked" condition for the duration of the reduction task.
+### AcquireLock
 
-**Type:** `SimpleLock`
+**Signature:** `AcquireLock(repoRoot string) (*SimpleLock, error)`
 
-Struct wrapping the canonical lockfile path (`string`) and an associated `*os.File` handle. Represents the active ownership of the process slot. Functions `Unlock` and internal acquire logic consume this struct to manage lifecycle transitions between unlocked, locked, and closing states.
+Establishes a new process-level lock using atomic file semantics:
 
-**Constant:** `LockFileName`
+1.  Opens `<repoRoot>/.code-reducer.lock` with `O_EXCL` (exclusive creation).
+2.  Writes the current process PID (`os.Getpid()`) to the newly created file handle.
+3.  Returns a pointer to the resulting `SimpleLock`, holding the open file handle for subsequent lifecycle management.
 
-String constant defining the artifact name `.code-reducer.lock`. Serves as the sole input to path resolution during lock acquisition and cleanup.
+### Unlock
+
+**Signature:** `Unlock() error`
+
+Releases the acquired lock:
+
+1.  Flushes and closes the underlying OS file handle associated with the `SimpleLock`.
+2.  Removes the lockfile from disk via filesystem delete operation.
+3.  Returns an error if removal fails (e.g., permission denied, path not found).
+
+## Repository Configuration Maintenance
+
+### EnsureGitignoreHasLockfile
+
+**Signature:** `EnsureGitignoreHasLockfile(repoRoot string) error`
+
+Ensures the repository's `.gitignore` file tracks the lock artifact to prevent accidental version control inclusion:
+
+1.  Locates `<repoRoot>/.gitignore`.
+2.  Checks for existing content containing the entry `.code-reducer.lock`.
+3.  If absent, appends the entry to the file (creating it if nonexistent).

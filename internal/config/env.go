@@ -106,6 +106,28 @@ var DefaultIgnoredExtensions = []string{
 	".pyc",
 	".pyo",
 	".pyd",
+	"-lock.json",
+	".lock.yaml",
+	"pnpm-lock.yaml",
+}
+
+// MergeAndDeduplicate merges two slices and removes duplicates.
+func MergeAndDeduplicate[T comparable](a, b []T) []T {
+	seen := make(map[T]bool)
+	var result []T
+	for _, item := range a {
+		if !seen[item] {
+			seen[item] = true
+			result = append(result, item)
+		}
+	}
+	for _, item := range b {
+		if !seen[item] {
+			seen[item] = true
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 // ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
@@ -117,19 +139,11 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 		cfg = &Config{}
 	}
 
-	var resolvedIgnore []string
-	if cfg.Ignore != nil {
-		resolvedIgnore = cfg.Ignore
-	} else {
-		resolvedIgnore = DefaultIgnores
-	}
+	// Deduplicate ignores: start with default ignores, then add user config ignores
+	resolvedIgnore := MergeAndDeduplicate(DefaultIgnores, cfg.Ignore)
 
-	var resolvedExtensions []string
-	if cfg.IgnoreExtensions != nil {
-		resolvedExtensions = cfg.IgnoreExtensions
-	} else {
-		resolvedExtensions = DefaultIgnoredExtensions
-	}
+	// Deduplicate extensions: start with default extensions, then add user config extensions
+	resolvedExtensions := MergeAndDeduplicate(DefaultIgnoredExtensions, cfg.IgnoreExtensions)
 
 	resolved := &Config{
 		Ignore:           resolvedIgnore,
@@ -199,8 +213,6 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 		resolved.LangchainTracingV2 = cfg.LangchainTracingV2
 	}
 
-
-
 	// 5. Resolve DocsDir: YAML > Default
 	if cfg.DocsDir != "" {
 		resolved.DocsDir = cfg.DocsDir
@@ -210,4 +222,3 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 
 	return resolved
 }
-

@@ -45,8 +45,8 @@ func (l *SimpleLock) Unlock() error {
 }
 
 // AcquireLock acquires a simple file lock in the repoRoot.
-// It ignores the exclusive flag for simplicity and always uses O_EXCL.
-func AcquireLock(repoRoot string, exclusive bool) (*SimpleLock, error) {
+// It uses O_EXCL to ensure atomicity.
+func AcquireLock(repoRoot string) (*SimpleLock, error) {
 	lockPath, err := SafeResolve(repoRoot, LockFileName)
 	if err != nil {
 		return nil, err
@@ -82,7 +82,6 @@ func EnsureGitignoreHasLockfile(repoRoot string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open .gitignore: %w", err)
 	}
-	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
 	found := false
@@ -94,8 +93,11 @@ func EnsureGitignoreHasLockfile(repoRoot string) error {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading .gitignore: %w", err)
+	scanErr := scanner.Err()
+	file.Close()
+
+	if scanErr != nil {
+		return fmt.Errorf("error reading .gitignore: %w", scanErr)
 	}
 
 	if !found {

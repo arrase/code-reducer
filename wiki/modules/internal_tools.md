@@ -1,87 +1,63 @@
-# internal/tools — Repository Infrastructure Package
+# Internal Tools Module — Architecture Reference
 
-## Module Responsibility and Data Flow
+## 1. Repository Verification & Git Operations
 
-This package provides low-level repository operations required by higher-level analysis modules: safe file I/O, git state queries, path hashing, and recursive source-file discovery. The data flow follows a consistent pattern—**verify the environment → resolve paths safely → read/write with TOCTOU guards → filter against ignore rules**. All functions operate on an absolute or virtual repository root that is resolved once per session; subsequent operations reference this canonical location internally.
+**`git_tools.go`** provides the foundational layer for interacting with git repositories. These functions establish a verified working tree before any subsequent file operations occur, ensuring that all downstream utilities operate within a valid repository context.
 
----
+### `VerifyGitRepo(repoPath string) error`
+Validates that:
+- The `git` binary is present on the system PATH.
+- The specified directory is a recognized git working tree by executing `rev-parse --is-inside-work-tree`.
 
-## Repository Verification and Git Operations
+Returns an error if either precondition fails. This function serves as a gatekeeper; callers should invoke it before any repository-aware operation.
 
-### `git_tools.go`
+### `RunGit(repoPath string, args ...string) (string, error)`
+Executes arbitrary git commands scoped to the verified working tree. The implementation:
+- Captures stdout and trims trailing whitespace.
+- Propagates non-zero exit codes as errors.
 
-#### `VerifyGitRepo(repoPath string) error`
-
-Confirms two preconditions before any git or filesystem operation proceeds:
-
-1. The host system has a `git` executable accessible via `$PATH`.
-2. `repoPath` is inside a valid git working tree (i.e., `.git/` exists and the path resolves to it).
-
-Returns an error if either check fails, preventing silent misbehavior downstream when callers assume a git-backed repository.
-
-#### `GetGitHead(repoPath string) (string, error)`
-
-Delegates to `RunGit("rev-parse", "HEAD")`, trims whitespace from stdout, and returns the current commit hash. Used by discovery and hashing modules to anchor state snapshots.
-
-#### `RunGit(repoPath string, args ...string) (string, error)`
-
-Executes a git command inside `repoPath`. Returns the trimmed stdout string plus any error; stderr is discarded in this wrapper because higher-level callers typically only need success output or a failure signal.
+Used for lightweight queries such as resolving relative paths, checking branch state, or retrieving repository metadata without requiring manual shell invocation by callers.
 
 ---
 
-## Safe File I/O Operations
+## 2. Safe File I/O Operations
 
-### `file_tools.go` — Read Pathway
+**`file_tools.go`** handles read/write primitives with security-focused semantics: path resolution, TOCTOU mitigation, and symlink awareness.
 
-#### `ReadFileSafely(virtualPath string) ([]byte, error)`
+### `ReadFileSafely(repoPath string) ([]byte, error)`
+Resolves a virtual repository-relative path to its absolute filesystem location and returns raw byte content. The implementation performs an error-checked open/read/close cycle, returning the complete file payload or an error if the operation cannot be completed within expected bounds.
 
-Resolves a virtual (relative-to-repo-root) path to its absolute on-disk location and reads the content into memory. The resolver normalizes separators and canonicalizes the result so that `./foo`, `../bar/baz`, and `baz` all produce identical byte slices for the same file.
+### `WriteFileSafely(repoPath string, content []byte) error`
+Writes arbitrary content to a resolved repository path with three safety measures:
+- **Directory creation**: Parent directories are created if absent (with appropriate mode preservation).
+- **Symlink detection**: Existing symlinks at the target path are detected and rejected to prevent silent redirect attacks.
+- **TOCTOU-safe truncation**: The file is opened in exclusive-truncate mode (`O_RDWR | O_CREATE | O_TRUNC`) to eliminate race conditions between read and write phases.
 
-### `file_tools.go` — Write Pathway
-
-#### `WriteFileSafely(absPath string, data []byte) error`
-
-Writes file content using a **TOCTOU-safe pattern**: before truncating the target, it verifies that `absPath` is not a symlink (via `os.Lstat()`). If the path is a symlink, the function returns an error rather than silently following the link and overwriting its destination. This prevents privilege escalation vectors where an attacker replaces a file with a symlink pointing to `/etc/passwd`.
-
----
-
-## Path Resolution and Hashing
-
-### `registry.go` — Root Fingerprint
-
-#### `HashRepoRoot(path string) string`
-
-Computes the SHA-256 hex digest of the resolved absolute path of the repository root. The input `path` may be relative or absolute; internal resolution normalizes it before hashing. This produces a deterministic fingerprint for the current repo location, useful for caching, diff detection, and state anchoring across runs.
+### `IsBinaryFile(path string) bool`
+Scans the first 1024 bytes of a file for null byte (`\x00`) presence. Returns `true` if binary content is detected within that boundary. Used as a quick heuristic filter during code discovery to exclude non-source artifacts (images, compiled binaries, etc.) without loading entire files into memory.
 
 ---
 
-## File Discovery and Ignore Logic
+## 3. Code Discovery & Filtering Pipeline
 
-### `file_tools.go` — Ignore Rules Engine
+**`file_tools.go`** also contains higher-level utilities for walking the repository tree and applying exclusion rules derived from `.gitignore` semantics. These functions compose to produce a final list of source code files suitable for downstream processing (linting, analysis, migration).
 
-#### `LoadGitignore(repoRoot string) ([]string, error)`
+### `LoadGitignore(repoRoot string) ([]string, error)`
+Reads `.gitignore` from the given repository root, strips comment lines (`#`) and blank lines, and returns the active pattern set. Returns `nil` if the file does not exist or cannot be parsed. Patterns are returned as-is for downstream evaluation; callers should match them against relative paths using standard gitignore matching semantics.
 
-Reads `.gitignore` from `repoRoot`, parses line-by-line, skips comments (`#`) and blank lines, and returns the list of active ignore patterns. Patterns are returned in their original form (no glob expansion); callers apply them against relative paths using standard path-matching semantics.
+### `ShouldIgnoreFile(relPath string) bool`
+Determines whether a given relative path matches any exclusion rule by evaluating:
+- Active `.gitignore` patterns from `LoadGitignore`.
+- Dot-prefixed directory components (e.g., `.build`, `.cache`).
+- Known binary file extensions (detected via `IsBinaryFile` or extension whitelist).
+- Null-byte presence in the path string.
 
-#### `ShouldIgnoreFile(relPath string) bool`
+Returns `true` if any exclusion rule matches, indicating the file should be skipped during discovery.
 
-Determines whether a relative file path should be excluded from processing by evaluating:
+### `DiscoverCodeFiles(repoRoot string) ([]string, error)`
+Recursively walks the codebase rooted at `repoRoot`, collecting source files while skipping:
+- Build directories (e.g., `node_modules`, `.git`, `target`).
+- Paths matching any active `.gitignore` pattern from `LoadGitignore`.
+- Files flagged as binary by `IsBinaryFile`.
 
-- Custom patterns loaded via `LoadGitignore`.
-- Dot-prefixed components (`.` prefix at any level).
-- Known binary/extension suffixes (e.g., `.exe`, `.so`).
-- Suffix-based rules for common non-source extensions.
-
-Returns `true` if the file matches any ignore criterion; otherwise `false`.
-
-### `file_tools.go` — Source Discovery
-
-#### `DiscoverCodeFiles(repoRoot string) ([]string, error)`
-
-Recursively walks the repository tree to collect high-signal source files (`.go`, `.py`, `.rs`, etc.). Skips:
-
-- Build directories (`node_modules/`, `vendor/`, `__pycache__/`, etc.).
-- Dependency paths identified by common prefixes.
-- Any entry matching the ignore list produced by `ShouldIgnoreFile`.
-
-Returns a flat slice of relative file paths, sorted for deterministic output. Used as the primary input to analysis and transformation pipelines.
+Returns a sorted slice of relative path strings representing the discovered codebase. The walk order is deterministic; results are suitable for direct consumption by analysis or transformation pipelines.

@@ -1,134 +1,128 @@
-# internal/engine — Code Reduction Engine
+# Internal Engine: AI-Powered Documentation Synthesis System
 
-## Module Responsibility & Data Flow
+## Module Responsibility
 
-The `internal/engine` module implements the Map-Reduce pipeline for automated codebase documentation generation. It orchestrates three phases: **discover** (file-system traversal and tree construction), **synthesize** (LLM-driven hierarchical content aggregation with SHA256 caching), and **reduce** (global architecture summary assembly). The runner exposes a single entry point that acquires the lock, instantiates the LLM client, and dispatches to context-specific pipelines.
+This module implements an end-to-end pipeline for generating and maintaining Markdown architecture documentation from code repositories using large language model (LLM) inference. The system performs recursive directory traversal with SHA256-based caching, incremental change detection via metadata persistence, and LLM-driven synthesis of per-node summaries that are aggregated into global architecture files.
 
----
-
-## File System Traversal & Tree Construction
-
-### DirNode
-
-```go
-type DirNode struct {
-    Path     string
-    Files    []string   // direct files within this directory
-    Children []*DirNode // subdirectories
-}
-```
-
-Represents a node in the recursive directory tree. Each `DirNode` holds its absolute path, a flat list of immediate file paths, and child subtrees for nested directories.
-
-### buildTree
-
-Constructs a root `*DirNode` from a slice of absolute file paths by parsing each path into directory components, then recursively nesting children under their parent nodes.
-
-### FileChange
-
-```go
-type FileChange struct {
-    Path   string // relative file path
-    Status string // "Added", "Modified", or "Deleted"
-}
-```
-
-A single file-change record produced by diffing the current state against the baseline repository snapshot.
-
-### determineAffected / propagateAffected
-
-`determineAffected` walks the directory tree and marks directories as **affected** when any descendant is marked affected, a module doc is missing, or cache entries are empty. `propagateAffected` is the recursive walker that bubbles upward from leaf nodes to ancestors, ensuring every ancestor of a changed file inherits the affected flag.
-
-### isAllowedFile
-
-Returns `true` when the relative path passes ignore rules defined by `*security.ShouldIgnoreFile`. Paths failing this check are excluded from tree construction and subsequent synthesis.
+**Data Flow:** Configuration → `Runner` instantiation → repository discovery → `DirNode` tree construction → recursive `synthesizeNode` (LLM extraction + cache lookup) → root summary → standard docs generation → metadata serialization via `MetadataCache`.
 
 ---
 
-## LLM Client & Communication Layer
+## LLM Client Abstraction (`client.go`)
 
-### Message
+The core inference interface wraps HTTP communication with an Ollama-compatible backend.
+
+### Message Struct
 
 ```go
 type Message struct {
-    Role   string // role identifier (system / user)
-    Content string // text payload for prompt construction
+    Role   string // "system", "user", "assistant"
+    Content string
 }
 ```
 
-Represents a single turn in an LLM interaction record used to construct the full prompt input.
+Stores a single turn in the conversation payload for serialization into API requests.
 
-### LLMClient & NewLLMClient
+### LLMClient
 
-Aggregates connection settings and HTTP transport required to communicate with an Ollama-compatible endpoint. `NewLLMClient` instantiates a new client initialized with model ID, base URL, context window size, and default timeout.
+Holds configuration parameters (`modelID`, `baseURL`, `contextLength`) alongside an HTTP client used to communicate with the Ollama backend.
 
-### CallLLM / StreamLLM
-
-- **CallLLM** — Executes a synchronous non-streaming HTTP POST to the configured Ollama API endpoint; returns the raw response string or an error.
-- **StreamLLM** — Initiates a streaming HTTP request, parses incoming chunks line-by-line, and invokes the supplied callback for each content segment.
-
-### stripOuterMarkdownFence / CleanJSONResponse / UnmarshalJSONResponse
-
-`stripOuterMarkdownFence` strips surrounding markdown code fences from input strings using regex to clean common LLM output artifacts. `CleanJSONResponse` extends this by stripping fences and isolating the first/last JSON delimiters when fences are absent. `UnmarshalJSONResponse` chains both: cleans the raw response then unmarshals into a target interface, wrapping parse errors with context.
-
-### GetDefaultSystemPrompt / LoadSystemPrompt
-
-`GetDefaultSystemPrompt` returns a context-specific system prompt string based on command type, defining the AI persona and task instructions for each analysis mode. `LoadSystemPrompt` delegates directly without additional error handling.
+- **NewLLMClient** — Constructs and returns a new `LLMClient` instance initialized with provided model identifier, API endpoint, and maximum context size.
+- **CallLLM** — Sends a non-streaming request to the language model via HTTP; returns the full text response or an error upon failure.
+- **StreamLLM** — Initiates a streaming session; processes incoming chunks by calling a user-defined function for each content segment until the stream completes.
+- **GetDefaultSystemPrompt** — Returns a contextualized system prompt string based on current operation mode, supporting tasks like code extraction, module synthesis, and architecture documentation.
 
 ---
 
-## Caching Layer
+## Caching Layer (`cache.go`)
 
-### FileCacheEntry & MetadataCache
+Provides persistent state management for incremental updates by storing file-level integrity hashes and global cache metadata.
 
-- **FileCacheEntry** — Stores the SHA256 hash and associated facts for a single file within the cache structure.
-- **MetadataCache** — Maintains the last documented commit identifier along with maps of cached files and modules.
+### FileCacheEntry
 
-### loadMetadataCache / saveMetadataCache
+Stores the SHA256 hash and facts string for individual files within the cache. Enables detection of content changes without re-reading source files during update cycles.
 
-`loadMetadataCache` reads a metadata JSON from the docs directory, returning an initialized or parsed `*MetadataCache`. `saveMetadataCache` serializes the provided instance into a formatted JSON file at the specified metadata path.
+### MetadataCache
 
-### computeSHA256
+Aggregates global cache state including:
+- Last documented commit reference
+- File entries (path → `FileCacheEntry` mapping)
+- Module mappings
 
-Calculates the SHA256 hash of content located at a given virtual path and returns the hex-encoded string. Used to deduplicate synthesis results across re-runs.
+### Cache Operations
 
----
-
-## Core Engine Pipeline
-
-### synthesizeNode
-
-Traverses a directory tree node's children and files, extracts file facts through LLM analysis with SHA256 caching, then hierarchically merges all components into a consolidated summary. Each leaf is analyzed independently; intermediate nodes aggregate their descendants' summaries before returning upward.
-
-### reduceInChunks
-
-Recursively batches code items by character limit and synthesizes them via LLM calls to produce architecture summaries, truncating oversized content when needed. Splits the input set into chunks that fit within the context window, processes each chunk through `synthesizeNode`, then merges results bottom-up until a single root summary remains.
-
-### RunInit (method on *LLMClient)
-
-Executes the full Map-Reduce pipeline: discovers code files, builds the hierarchical directory tree, performs recursive synthesis via `reduceInChunks`, and generates global architecture documentation plus a quickstart guide. Returns an `Event` struct holding Type and Message for logging emitted during execution.
+- **loadMetadataCache** — Loads or creates an empty `MetadataCache` by reading from a `.metadata.json` file path relative to the docs directory.
+- **saveMetadataCache** — Serializes the provided `MetadataCache` into indented JSON and writes it to the specified metadata cache path.
+- **computeSHA256** — Computes the SHA256 hex digest of content read from a virtual file path relative to the repository root.
 
 ---
 
-## Orchestration & Runner
+## Directory Tree Representation (`tree.go`)
 
-### Runner / NewRunner / Run
+Encodes the discovered code structure as a navigable tree for recursive processing.
 
-- **Runner** — Struct holding an engine configuration pointer; primary container for executing code-reduction pipelines.
-- **NewRunner** — Initializes a new `*Runner` by accepting a config pointer and storing it within the struct fields.
-- **Run** — Orchestrates the full execution lifecycle: acquires lock, instantiates LLM client from config, dispatches to context-specific documentation pipeline based on repository root and command type.
+### FileChange
+
+A struct holding `Path` and `Status` fields representing a single file change operation ("Added", "Modified", or "Deleted"). Used during incremental update cycles to report detected differences.
+
+### DirNode
+
+Tree node struct containing:
+- Directory path
+- List of files (with their SHA256 hashes)
+- Child nodes keyed by subdirectory name
 
 ---
 
-## Event Logging
+## Synthesis Engine (`synthesize.go`)
 
-### Event
+Implements the recursive directory traversal that synthesizes Markdown summaries for code modules. The sole function `synthesizeNode` is unexported and processes child directories and files with LLM extraction, caching results via SHA256 hashing to avoid redundant work on unchanged nodes.
 
-```go
-type Event struct {
-    Type    string // event category identifier
-    Message string // human-readable description of the emitted event
-}
-```
+---
 
-Struct holding a Type string and Message string used for logging events emitted during engine execution.
+## JSON Response Parsing (`json_parser.go`)
+
+Strips markdown/JSON code fences from raw LLM responses before deserialization.
+
+- **StripOuterMarkdownFence** — Strips surrounding markdown or JSON code fences from input strings; returns the inner content.
+- **CleanJSONResponse** — Removes markdown code fences, then uses brace/bracket matching to extract a complete JSON object or array from remaining text.
+- **UnmarshalJSONResponse** — Cleans raw response string with `CleanJSONResponse` and deserializes it into provided target interface value.
+
+---
+
+## Pipeline Orchestrator (`orchestrator.go`)
+
+Coordinates the full Map-Reduce pipeline for repository initialization and incremental updates.
+
+### Event Struct
+
+Lightweight struct carrying `Type` (string) and `Message` (string), used to pass pipeline status updates back through callback interfaces.
+
+### GenerateStandardDocs
+
+Exported method on `*LLMClient` that generates global architecture and quickstart Markdown files from a root summary via LLM calls; writes results safely to disk.
+
+### RunInit
+
+Exported method on `*LLMClient` executing the full Map-Reduce pipeline for repository initialization:
+1. Discovers code
+2. Builds directory tree (`DirNode`)
+3. Synthesizes root summary through hierarchical merging
+4. Regenerates standard docs
+5. Updates AGENTS.md with AI agent guidelines
+
+### RunUpdate
+
+Exported method on `*LLMClient` for incremental operation:
+1. Detects file changes (added/modified/deleted) by SHA256 comparison against metadata cache
+2. Determines affected directories via tree traversal
+3. Re-synthesizes summaries only where needed
+4. Conditionally regenerates architecture or quickstart docs
+
+---
+
+## Configuration and Runner (`runner.go`)
+
+### NewRunner
+
+Factory constructor that instantiates and returns a new `*Runner` with provided configuration pointer. Serves as the entry point for initializing the documentation generation system.

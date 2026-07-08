@@ -7,6 +7,7 @@ import (
 
 	"github.com/arrase/code-reducer/internal/security"
 	"github.com/arrase/code-reducer/internal/tools"
+	ignore "github.com/sabhiram/go-gitignore"
 )
 
 type FileChange struct {
@@ -14,8 +15,8 @@ type FileChange struct {
 	Status string // "Added", "Modified", "Deleted"
 }
 
-func isAllowedFile(repoRoot, relPath string, ignores []string, ignoredExtensions []string) bool {
-	return !tools.ShouldIgnoreFile(repoRoot, relPath, ignores, ignoredExtensions)
+func isAllowedFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ignoredExtensions []string) bool {
+	return !tools.ShouldIgnoreFile(repoRoot, relPath, gitIgnore, ignoredExtensions)
 }
 
 func propagateAffected(node *DirNode, affectedDirs map[string]bool) bool {

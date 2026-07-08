@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -57,23 +56,14 @@ type ollamaChunk struct {
 }
 
 // CallLLM invokes the LLM via HTTP failing fast without retries.
-func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error) {
-	baseURL := c.BaseURL
-	if baseURL == "" {
-		baseURL = "http://localhost:11434"
-	}
-	url := strings.TrimSuffix(baseURL, "/") + "/api/chat"
-
-	options := &ollamaOptions{NumCtx: c.NumCtx}
-	if options.NumCtx <= 0 {
-		options.NumCtx = 8192
-	}
+func (c *LLMClient) prepareOllamaRequest(ctx context.Context, systemPrompt string, messages []Message, stream bool, jsonFormat bool) (*http.Request, error) {
+	url := strings.TrimSuffix(c.BaseURL, "/") + "/api/chat"
 
 	reqBody := ollamaRequest{
 		Model:    c.ModelID,
 		Messages: append([]Message{{Role: "system", Content: systemPrompt}}, messages...),
-		Stream:   false,
-		Options:  options,
+		Stream:   stream,
+		Options:  &ollamaOptions{NumCtx: c.NumCtx},
 	}
 	if jsonFormat {
 		reqBody.Format = "json"
@@ -81,18 +71,25 @@ func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages [
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return "", err
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	return req, nil
+}
+
+// CallLLM invokes the LLM via HTTP failing fast without retries.
+func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error) {
+
+	req, err := c.prepareOllamaRequest(ctx, systemPrompt, messages, false, jsonFormat)
+	if err != nil {
+		return "", err
+	}
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -119,34 +116,10 @@ func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages [
 
 // StreamLLM streams responses in real time from the LLM.
 func (c *LLMClient) StreamLLM(ctx context.Context, systemPrompt string, messages []Message, onChunk func(string)) error {
-	baseURL := c.BaseURL
-	if baseURL == "" {
-		baseURL = "http://localhost:11434"
-	}
-	url := strings.TrimSuffix(baseURL, "/") + "/api/chat"
-
-	options := &ollamaOptions{NumCtx: c.NumCtx}
-	if options.NumCtx <= 0 {
-		options.NumCtx = 8192
-	}
-
-	reqBody := ollamaRequest{
-		Model:    c.ModelID,
-		Messages: append([]Message{{Role: "system", Content: systemPrompt}}, messages...),
-		Stream:   true,
-		Options:  options,
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	req, err := c.prepareOllamaRequest(ctx, systemPrompt, messages, true, false)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -189,16 +162,6 @@ func (c *LLMClient) StreamLLM(ctx context.Context, systemPrompt string, messages
 	return nil
 }
 
-var markdownFenceRe = regexp.MustCompile("(?s)^\\x60{3,}(?:markdown|json)?\\s*(.*?)\\s*\\x60{3,}$")
-
-func stripOuterMarkdownFence(content string) string {
-	trimmed := strings.TrimSpace(content)
-	if matches := markdownFenceRe.FindStringSubmatch(trimmed); len(matches) > 1 {
-		return strings.TrimSpace(matches[1])
-	}
-	return trimmed
-}
-
 func (c *LLMClient) GetDefaultSystemPrompt(command string) string {
 	basePrompt := "You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.\n"
 	switch command {
@@ -211,8 +174,4 @@ func (c *LLMClient) GetDefaultSystemPrompt(command string) string {
 	default:
 		return basePrompt
 	}
-}
-
-func (c *LLMClient) LoadSystemPrompt(command string) (string, error) {
-	return c.GetDefaultSystemPrompt(command), nil
 }
