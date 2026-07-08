@@ -18,7 +18,6 @@ Standard LLMs fail when fed massive codebases due to context window limits, prom
 Code-Reducer is optimized for local execution using Ollama:
 - Generates high-quality documentation using small models (such as `ornith:9b` or `gemma4:26b-a4b-it-qat`).
 - Avoids the need for expensive API subscriptions or sending proprietary code to third-party cloud LLM providers.
-- **Dynamic Context Scaling**: Automatically detects the host machine's total memory (RAM) and scales the Ollama context window (`num_ctx`) dynamically between 4,096 and 32,768 tokens to maximize throughput without crashing the local server.
 
 ### 3. Enterprise-Grade Security & Robustness
 - **Symlink & Path Traversal Prevention**: Resolves paths using a safe path traversal sanitizer (`SafeResolve`) that validates paths and ensures symlinks never point outside the repository boundaries (mitigating TOCTOU attacks).
