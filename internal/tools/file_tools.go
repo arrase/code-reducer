@@ -26,7 +26,7 @@ func ReadFileSafely(repoRoot, virtualPath string) ([]byte, error) {
 }
 
 // WriteFileSafely resolves the virtual path inside the repository and writes content.
-// It ensures that directories are created.
+// It ensures that directories are created and uses a TOCTOU-safe write pattern.
 func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
 	safePath, err := security.SafeResolve(repoRoot, virtualPath)
 	if err != nil {
@@ -38,17 +38,35 @@ func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Open the file
-	f, err := os.OpenFile(safePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	// Open the file without truncating first to prevent truncating a followed symlink target
+	f, err := os.OpenFile(safePath, os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open file for writing: %w", err)
 	}
 	defer f.Close()
 
-	// TOCTOU mitigation: verify the file path is not a symlink after open
-	fi, err := os.Lstat(safePath)
-	if err == nil && (fi.Mode()&os.ModeSymlink != 0) {
-		return fmt.Errorf("security violation: TOCTOU symlink detected on write: %s", safePath)
+	// TOCTOU mitigation: verify the file path is not a symlink
+	fiLstat, err := os.Lstat(safePath)
+	if err != nil {
+		return fmt.Errorf("failed to lstat file: %w", err)
+	}
+	if fiLstat.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("security violation: symlink detected on write: %s", safePath)
+	}
+
+	fiFstat, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to fstat file: %w", err)
+	}
+
+	// Verify the file descriptor points to the exact same file path check
+	if !os.SameFile(fiLstat, fiFstat) {
+		return fmt.Errorf("security violation: TOCTOU symlink race detected on write: %s", safePath)
+	}
+
+	// Truncate safely only after verifying it is not a symlink
+	if err := f.Truncate(0); err != nil {
+		return fmt.Errorf("failed to truncate file: %w", err)
 	}
 
 	if _, err := f.Write(content); err != nil {

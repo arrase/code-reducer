@@ -12,7 +12,6 @@ import (
 
 	"github.com/arrase/code-reducer/internal/config"
 	"github.com/arrase/code-reducer/internal/engine"
-	"github.com/arrase/code-reducer/internal/security"
 )
 
 var (
@@ -39,17 +38,6 @@ func executeCommand(userMessage string) {
 		os.Exit(1)
 	}
 
-	// Load configuration file and apply to process environment
-	_ = config.LoadAndApplyConfig(repoRoot)
-
-	// Apply flag overrides to environment variables
-	if modelIdFlag != "" {
-		_ = os.Setenv(config.CodeReducerModelIdEnvKey, modelIdFlag)
-	}
-	if numCtxFlag != "" {
-		_ = os.Setenv(config.OllamaNumCtxEnvKey, numCtxFlag)
-	}
-
 	needsSetup := !config.ConfigExists(repoRoot)
 	isTTY := isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
 
@@ -61,37 +49,16 @@ func executeCommand(userMessage string) {
 
 		// Run implicit setup flow
 		RunSetupFlow(repoRoot)
-
-		// Load and apply the newly created configuration
-		_ = config.LoadAndApplyConfig(repoRoot)
-
-		// Re-apply flag overrides to make sure they override the newly created file values
-		if modelIdFlag != "" {
-			_ = os.Setenv(config.CodeReducerModelIdEnvKey, modelIdFlag)
-		}
-		if numCtxFlag != "" {
-			_ = os.Setenv(config.OllamaNumCtxEnvKey, numCtxFlag)
-		}
 	}
 
-	// Acquire exclusive repository lock
-	lock, err := security.AcquireLock(repoRoot, true)
-	if err != nil {
-		fmt.Printf("Error acquiring repository lock: %v\n", err)
-		os.Exit(1)
-	}
-	defer lock.Unlock()
+	// Resolve the merged configuration
+	cfg := config.ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	modelId := os.Getenv(config.CodeReducerModelIdEnvKey)
-	baseURL := os.Getenv(config.OllamaBaseUrlEnvKey)
-	numCtx := config.GetOllamaContextSize(numCtxFlag)
-
-	client := engine.NewLLMClient(modelId, baseURL, numCtx)
-
-	err = client.RunInit(ctx, repoRoot, userMessage, func(ev engine.Event) {
+	runner := engine.NewRunner(cfg)
+	err = runner.Run(ctx, repoRoot, userMessage, func(ev engine.Event) {
 		if ev.Type == "status" {
 			fmt.Println(ev.Message)
 		} else if ev.Type == "error" {
@@ -109,5 +76,10 @@ func executeCommand(userMessage string) {
 
 // NeedsCredentialSetup checks if critical configuration is missing
 func NeedsCredentialSetup() bool {
-	return os.Getenv(config.CodeReducerModelIdEnvKey) == ""
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		return true
+	}
+	cfg := config.ResolveConfig(repoRoot, "", "")
+	return cfg.ModelID == ""
 }

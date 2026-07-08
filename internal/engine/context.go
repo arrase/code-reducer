@@ -24,11 +24,12 @@ type Document struct {
 	TokenCount int
 }
 
+var tokenizeRe = regexp.MustCompile(`[a-zA-Z0-9]+`)
+
 // Tokenize splits a string into lowercase alphanumeric tokens.
 func Tokenize(text string) []string {
 	// Simple regex tokenizer for alphanumeric words
-	re := regexp.MustCompile(`[a-zA-Z0-9]+`)
-	matches := re.FindAllString(strings.ToLower(text), -1)
+	matches := tokenizeRe.FindAllString(strings.ToLower(text), -1)
 	return matches
 }
 

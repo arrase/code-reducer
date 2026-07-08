@@ -1,12 +1,10 @@
 package config
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -70,85 +68,100 @@ func SaveConfig(cwd string, cfg *Config) error {
 	return nil
 }
 
-// LoadAndApplyConfig loads the configuration and sets the corresponding environment variables
-// in the current process (only if they are not already set in the parent environment).
-func LoadAndApplyConfig(cwd string) error {
-	cfg, err := LoadConfig(cwd)
+// ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
+// It returns a fully resolved Config struct ready to be used by the pipeline runner and LLM client.
+// It also sets required external environment variables (such as Langchain/Langsmith tracing variables).
+func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
+	cfg, err := LoadConfig(repoRoot)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
+		cfg = &Config{}
 	}
 
-	if cfg.ModelID != "" && os.Getenv(CodeReducerModelIdEnvKey) == "" {
-		_ = os.Setenv(CodeReducerModelIdEnvKey, cfg.ModelID)
-	}
-	if cfg.OllamaBaseURL != "" && os.Getenv(OllamaBaseUrlEnvKey) == "" {
-		_ = os.Setenv(OllamaBaseUrlEnvKey, cfg.OllamaBaseURL)
-	}
-	if cfg.OllamaNumCtx > 0 && os.Getenv(OllamaNumCtxEnvKey) == "" {
-		_ = os.Setenv(OllamaNumCtxEnvKey, strconv.Itoa(cfg.OllamaNumCtx))
-	}
-	if cfg.LangsmithAPIKey != "" && os.Getenv(LangsmithApiKeyEnvKey) == "" {
-		_ = os.Setenv(LangsmithApiKeyEnvKey, cfg.LangsmithAPIKey)
-	}
-	if cfg.LangchainProject != "" && os.Getenv(LangchainProjectEnvKey) == "" {
-		_ = os.Setenv(LangchainProjectEnvKey, cfg.LangchainProject)
-	}
-	if cfg.LangchainTracingV2 != "" && os.Getenv(LangchainTracingEnvKey) == "" {
-		_ = os.Setenv(LangchainTracingEnvKey, cfg.LangchainTracingV2)
+	resolved := &Config{
+		Ignore: cfg.Ignore,
 	}
 
-	return nil
-}
+	// 1. Resolve Model ID: Flag > Env > YAML > Default
+	if modelIdFlag != "" {
+		resolved.ModelID = modelIdFlag
+	} else if envVal := os.Getenv(CodeReducerModelIdEnvKey); envVal != "" {
+		resolved.ModelID = envVal
+	} else if cfg.ModelID != "" {
+		resolved.ModelID = cfg.ModelID
+	} else {
+		resolved.ModelID = "gemma4:26b-a4b-it-qat"
+	}
 
-// GetDatabasePath returns the standard path for the database file.
-func GetDatabasePath() (string, error) {
-	return "code-reducer.sqlite", nil
-}
+	// 2. Resolve Ollama Base URL: Env > YAML > Default
+	if envVal := os.Getenv(OllamaBaseUrlEnvKey); envVal != "" {
+		resolved.OllamaBaseURL = envVal
+	} else if cfg.OllamaBaseURL != "" {
+		resolved.OllamaBaseURL = cfg.OllamaBaseURL
+	} else {
+		resolved.OllamaBaseURL = OllamaDefaultBaseURL
+	}
 
-// GetOllamaContextSize returns the configured context size for Ollama, falling back to dynamic scaling.
-func GetOllamaContextSize(flagVal string) int {
-	if flagVal != "" {
-		if n, err := strconv.Atoi(flagVal); err == nil && n > 0 {
-			return n
+	// 3. Resolve Ollama Context Size: Flag > Env > YAML > Default
+	var numCtx int
+	if numCtxFlag != "" {
+		if n, err := strconv.Atoi(numCtxFlag); err == nil && n > 0 {
+			numCtx = n
 		}
 	}
-	if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
-		if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
-			return n
-		}
-	}
-
-	// Dynamic scaling based on host total memory
-	mem := getHostTotalMemoryBytes()
-	if mem > 32*1024*1024*1024 {
-		return 32768
-	} else if mem > 16*1024*1024*1024 {
-		return 16384
-	} else if mem > 8*1024*1024*1024 {
-		return 8192
-	}
-	return 4096
-}
-
-func getHostTotalMemoryBytes() uint64 {
-	file, err := os.Open("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "MemTotal:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				val, _ := strconv.ParseUint(fields[1], 10, 64)
-				return val * 1024 // meminfo is in kB
+	if numCtx == 0 {
+		if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
+			if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
+				numCtx = n
 			}
 		}
 	}
-	return 0
+	if numCtx == 0 {
+		if cfg.OllamaNumCtx > 0 {
+			numCtx = cfg.OllamaNumCtx
+		}
+	}
+	if numCtx == 0 {
+		numCtx = OllamaDefaultNumCtx
+	}
+	resolved.OllamaNumCtx = numCtx
+
+	// 4. Resolve Langsmith API Key, Langchain Project, and Langchain Tracing V2
+	if envVal := os.Getenv(LangsmithApiKeyEnvKey); envVal != "" {
+		resolved.LangsmithAPIKey = envVal
+	} else {
+		resolved.LangsmithAPIKey = cfg.LangsmithAPIKey
+	}
+
+	if envVal := os.Getenv(LangchainProjectEnvKey); envVal != "" {
+		resolved.LangchainProject = envVal
+	} else {
+		resolved.LangchainProject = cfg.LangchainProject
+	}
+
+	if envVal := os.Getenv(LangchainTracingEnvKey); envVal != "" {
+		resolved.LangchainTracingV2 = envVal
+	} else {
+		resolved.LangchainTracingV2 = cfg.LangchainTracingV2
+	}
+
+	// Propagate only necessary tracing variables to external process environment
+	if resolved.LangsmithAPIKey != "" {
+		_ = os.Setenv(LangsmithApiKeyEnvKey, resolved.LangsmithAPIKey)
+	}
+	if resolved.LangchainProject != "" {
+		_ = os.Setenv(LangchainProjectEnvKey, resolved.LangchainProject)
+	}
+	if resolved.LangchainTracingV2 != "" {
+		_ = os.Setenv(LangchainTracingEnvKey, resolved.LangchainTracingV2)
+	}
+
+	// 5. Resolve DocsDir: YAML > Default
+	if cfg.DocsDir != "" {
+		resolved.DocsDir = cfg.DocsDir
+	} else {
+		resolved.DocsDir = "wiki"
+	}
+
+	return resolved
 }
+

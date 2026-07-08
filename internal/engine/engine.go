@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/arrase/code-reducer/internal/config"
-	"github.com/arrase/code-reducer/internal/security"
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
@@ -25,16 +24,18 @@ type Message struct {
 }
 
 type LLMClient struct {
-	ModelID string
-	BaseURL string
-	NumCtx  int
+	ModelID    string
+	BaseURL    string
+	NumCtx     int
+	HTTPClient *http.Client
 }
 
 func NewLLMClient(modelID, baseURL string, numCtx int) *LLMClient {
 	return &LLMClient{
-		ModelID: modelID,
-		BaseURL: baseURL,
-		NumCtx:  numCtx,
+		ModelID:    modelID,
+		BaseURL:    baseURL,
+		NumCtx:     numCtx,
+		HTTPClient: &http.Client{Timeout: 10 * time.Minute},
 	}
 }
 
@@ -60,7 +61,7 @@ type ollamaChunk struct {
 	Done    bool    `json:"done"`
 }
 
-// CallLLM invokes the LLM via HTTP.
+// CallLLM invokes the LLM via HTTP with retry logic for transient errors.
 func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error) {
 	baseURL := c.BaseURL
 	if baseURL == "" {
@@ -88,34 +89,77 @@ func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages [
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	const maxAttempts = 3
+	var lastErr error
+	backoff := 1 * time.Second
 
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 
-	if resp.StatusCode != http.StatusOK {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			lastErr = err
+			// Check if context was canceled/timed out - if so, don't retry
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			// Wait and retry
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(backoff):
+				backoff *= 2
+				continue
+			}
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			respData, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return "", err
+			}
+
+			var result ollamaResponse
+			if err := json.Unmarshal(respData, &result); err != nil {
+				return "", fmt.Errorf("failed to parse response: %w", err)
+			}
+			return result.Message.Content, nil
+		}
+
+		// Handle HTTP status errors
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return "", fmt.Errorf("ollama api error: status %d, response: %s", resp.StatusCode, string(body))
+		resp.Body.Close()
+		lastErr = fmt.Errorf("ollama api error: status %d, response: %s", resp.StatusCode, string(body))
+
+		// Only retry on transient HTTP status codes (e.g. 429, 500, 502, 503, 504)
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusInternalServerError ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(backoff):
+				backoff *= 2
+				continue
+			}
+		}
+
+		// Permanent error, return immediately
+		return "", lastErr
 	}
 
-	respData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var result ollamaResponse
-	if err := json.Unmarshal(respData, &result); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-	return result.Message.Content, nil
+	return "", fmt.Errorf("after %d attempts, request failed: %w", maxAttempts, lastErr)
 }
 
 // StreamLLM streams responses in real time from the LLM.
@@ -149,8 +193,7 @@ func (c *LLMClient) StreamLLM(ctx context.Context, systemPrompt string, messages
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Do(req)
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -196,10 +239,11 @@ type Event struct {
 	Message string
 }
 
+var markdownFenceRe = regexp.MustCompile("(?s)^\\x60{3,}(?:markdown|json)?\\s*(.*?)\\s*\\x60{3,}$")
+
 func stripOuterMarkdownFence(content string) string {
 	trimmed := strings.TrimSpace(content)
-	re := regexp.MustCompile("(?s)^\\x60{3,}(?:markdown|json)?\\s*(.*?)\\s*\\x60{3,}$")
-	if matches := re.FindStringSubmatch(trimmed); len(matches) > 1 {
+	if matches := markdownFenceRe.FindStringSubmatch(trimmed); len(matches) > 1 {
 		return strings.TrimSpace(matches[1])
 	}
 	return trimmed
@@ -257,19 +301,18 @@ func buildTree(files []string) *DirNode {
 	return root
 }
 
-func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []string, maxBatchSize int, logEvent func(string, string)) string {
+func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []string, maxBatchSize int, logEvent func(string, string)) (string, error) {
 	if len(items) == 0 {
-		return ""
+		return "", nil
 	}
 	if len(items) <= maxBatchSize {
 		prompt := fmt.Sprintf("Synthesize architecture for %s:\n%s", nodePath, strings.Join(items, "\n\n"))
 		logEvent("status", fmt.Sprintf("➜ LLM Synthesizing chunk for %s (%d items)", nodePath, len(items)))
 		res, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("module_synthesis"), []Message{{Role: "user", Content: prompt}}, false)
 		if err != nil {
-			logEvent("error", fmt.Sprintf("LLM Error: %v", err))
-			return ""
+			return "", fmt.Errorf("LLM error during synthesis: %w", err)
 		}
-		return stripOuterMarkdownFence(res)
+		return stripOuterMarkdownFence(res), nil
 	}
 
 	var intermediate []string
@@ -278,7 +321,11 @@ func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []
 		if end > len(items) {
 			end = len(items)
 		}
-		intermediate = append(intermediate, reduceInChunks(ctx, c, nodePath, items[i:end], maxBatchSize, logEvent))
+		chunkRes, err := reduceInChunks(ctx, c, nodePath, items[i:end], maxBatchSize, logEvent)
+		if err != nil {
+			return "", err
+		}
+		intermediate = append(intermediate, chunkRes)
 	}
 	return reduceInChunks(ctx, c, nodePath, intermediate, maxBatchSize, logEvent)
 }
@@ -317,8 +364,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 		userMsg := fmt.Sprintf("Analyze this file: %s\n\n```\n%s\n```\n\nOutput ONLY a Markdown list of exported functions, classes, and data structures with a 1-sentence technical description for each. No fluff.", f, contentStr)
 		facts, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("extract_file"), []Message{{Role: "user", Content: userMsg}}, false)
 		if err != nil {
-			logEvent("error", fmt.Sprintf("LLM Error extracting %s: %v", f, err))
-			continue
+			return "", fmt.Errorf("LLM error extracting %s: %w", f, err)
 		}
 		components = append(components, fmt.Sprintf("### File: %s\n%s", filepath.Base(f), stripOuterMarkdownFence(facts)))
 	}
@@ -332,19 +378,24 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	}
 
 	logEvent("status", fmt.Sprintf("➜ Synthesizing directory: %s (%d total components)", node.Path, len(components)))
-	finalSum := reduceInChunks(ctx, c, node.Path, components, 5, logEvent)
+	finalSum, err := reduceInChunks(ctx, c, node.Path, components, 5, logEvent)
+	if err != nil {
+		return "", err
+	}
 
 	safeName := strings.ReplaceAll(node.Path, string(filepath.Separator), "_")
 	if safeName == "." || safeName == "" {
 		safeName = "root"
 	}
 	modulePath := filepath.Join(docsDir, "modules", safeName+".md")
-	tools.WriteFileSafely(repoRoot, modulePath, []byte(finalSum))
+	if err := tools.WriteFileSafely(repoRoot, modulePath, []byte(finalSum)); err != nil {
+		return "", fmt.Errorf("failed to write module documentation for %s: %w", node.Path, err)
+	}
 
 	return finalSum, nil
 }
 
-func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, userMessage string, onEvent func(Event)) error {
+func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Config, userMessage string, onEvent func(Event)) error {
 	logEvent := func(t, m string) {
 		if onEvent != nil {
 			onEvent(Event{Type: t, Message: m})
@@ -353,18 +404,9 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, userMessage st
 
 	logEvent("status", "Starting Code-Reducer V3 Map-Reduce pipeline: init")
 
-	_ = security.EnsureGitignoreHasLockfile(repoRoot)
-
 	logEvent("status", "Step 1: Code Discovery & Building Tree...")
-	var ignores []string
-	docsDir := "wiki"
-	if cfg, err := config.LoadConfig(repoRoot); err == nil && cfg != nil {
-		ignores = cfg.Ignore
-		if cfg.DocsDir != "" {
-			docsDir = cfg.DocsDir
-		}
-	}
-	ignores = append(ignores, docsDir)
+	docsDir := cfg.DocsDir
+	ignores := append(cfg.Ignore, docsDir)
 
 	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
 	if err != nil {
@@ -373,7 +415,9 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, userMessage st
 
 	tree := buildTree(codeFiles)
 	modulesDir := filepath.Join(repoRoot, docsDir, "modules")
-	os.MkdirAll(modulesDir, 0755)
+	if err := os.MkdirAll(modulesDir, 0755); err != nil {
+		return fmt.Errorf("failed to create modules directory: %w", err)
+	}
 
 	logEvent("status", "Step 2: Hierarchical Tree-Merging (Map-Reduce)...")
 	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, docsDir, logEvent)
@@ -384,15 +428,21 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, userMessage st
 	logEvent("status", "Step 3: Global Architecture Synthesis...")
 	archMsg := fmt.Sprintf("Write the global architecture overview (%s/architecture.md) based on the root summary.\n\n%s", docsDir, rootSum)
 	archDoc, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("architecture"), []Message{{Role: "user", Content: archMsg}}, false)
-	if err == nil {
-		tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, "architecture.md"), []byte(stripOuterMarkdownFence(archDoc)))
+	if err != nil {
+		return fmt.Errorf("failed to generate global architecture: %w", err)
+	}
+	if err := tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, "architecture.md"), []byte(stripOuterMarkdownFence(archDoc))); err != nil {
+		return fmt.Errorf("failed to write architecture.md: %w", err)
 	}
 
 	logEvent("status", "Step 4: Generating Quickstart...")
 	qsMsg := fmt.Sprintf("Write the %s/quickstart.md page based on this architecture.\n\n%s", docsDir, rootSum)
 	qsDoc, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("architecture"), []Message{{Role: "user", Content: qsMsg}}, false)
-	if err == nil {
-		tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, "quickstart.md"), []byte(stripOuterMarkdownFence(qsDoc)))
+	if err != nil {
+		return fmt.Errorf("failed to generate quickstart documentation: %w", err)
+	}
+	if err := tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, "quickstart.md"), []byte(stripOuterMarkdownFence(qsDoc))); err != nil {
+		return fmt.Errorf("failed to write quickstart.md: %w", err)
 	}
 
 	logEvent("status", "Step 5: Updating AGENT.md...")
