@@ -148,20 +148,8 @@ func FilterFilesBM25(repoRoot string, files []string, query string, topK int) ([
 	return result, nil
 }
 
-// EstimateTokens counts tokens approximately based on characters (1 token ~ 4 characters).
-func EstimateTokens(text string) int {
-	return len(text) / 4
-}
-
 // WrapInXmlDelimiter wraps file content in strict XML-like tags to prevent prompt injection.
 func WrapInXmlDelimiter(filePath string, content string) string {
 	return "\n<file_content path=\"" + filePath + "\">\n" + content + "\n</file_content>\n"
 }
 
-// AutoScaleContext limits the maximum characters of context provided to LLM based on system memory or parameters.
-func AutoScaleContext(maxCtx int) int {
-	if maxCtx <= 0 {
-		return 8192 // Safe default
-	}
-	return maxCtx
-}

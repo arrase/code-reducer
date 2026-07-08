@@ -227,22 +227,12 @@ func Tokenize(input string) []string
 Splits an input string into lowercase alphanumeric tokens via a compiled regular expression. Provides the foundational token stream used for subsequent frequency analysis without character-level noise.
 
 ```go
-func EstimateTokens(content string) int
-```
-
-Approximates LLM token counts by dividing character length by four. Avoids expensive tokenizer overhead during context budget calculations while maintaining sufficient accuracy for clamping logic.
-
-```go
 func WrapInXmlDelimiter(content, filePath string) string
 ```
 
 Encapsulates provided file content in strict XML-like tags with the embedded file path. Structural wrapper mitigates prompt injection risks by isolating user-controlled data from system instructions within the LLM context window.
 
-```go
-func AutoScaleContext(maxSize int) int
-```
 
-Validates and clamps the maximum context size for an LLM operation. If the input is non-positive, returns a safe default of 8192 characters.
 
 ```go
 func FilterFilesBM25(query string, files []string) ([]string, error)

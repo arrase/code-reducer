@@ -180,11 +180,9 @@ The execution flow terminates at the `Runner` orchestrator, which acquires a loc
 
 **`Tokenize(input string) []string`** splits an input string into lowercase alphanumeric tokens via a compiled regular expression. It provides the foundational token stream used for subsequent frequency analysis without character-level noise.
 
-**`EstimateTokens(content string) int`** approximates LLM token counts by dividing character length by four. This heuristic avoids expensive tokenizer overhead during context budget calculations while maintaining sufficient accuracy for clamping logic.
 
 **`WrapInXmlDelimiter(content, filePath string) string`** encapsulates provided file content in strict XML-like tags with the embedded file path. This structural wrapper mitigates prompt injection risks by isolating user-controlled data from system instructions within the LLM context window.
 
-**`AutoScaleContext(maxSize int) int`** validates and clamps the maximum context size for an LLM operation. If the input is non-positive, it returns a safe default of 8192 characters.
 
 **`FilterFilesBM25(query string, files []string) ([]string, error)`** ranks repository files by relevance to a query using the BM25 ranking algorithm. It accepts a query string and returns a slice of top-K file paths ordered by inverse document frequency weighted term scores.
 

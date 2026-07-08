@@ -96,11 +96,6 @@ Code-Reducer implements a four-tier configuration resolution chain in `internal/
 #### Side-Effect Environmental Propagation
 On resolution, tracing parameters (`LANGSMITH_API_KEY`, `LANGCHAIN_PROJECT`, `LANGCHAIN_TRACING_V2`) are injected into the active OS process environment via `os.Setenv`. This guarantees that downstream library clients (like LangChain/LangSmith tracing SDKs) capture and hook into active runs without introducing explicit imports or circular packages.
 
-#### Context Scaling Heuristic
-The scaling function `AutoScaleContext(maxCtx int) int` acts as a safety validator: if the context size is non-positive (`<= 0`), it defaults to `8192`. Inside the engine, tokens are approximated using a linear length heuristic:
-$$\text{Tokens} \approx \frac{\text{Character Count}}{4}$$
-This prevents prompt buffer overflows during LLM calls without incurring external tokenizer execution latency.
-
 ---
 
 ### 3. File Discovery, Binary, and Ignore Filters
