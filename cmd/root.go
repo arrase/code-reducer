@@ -1,13 +1,10 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/mattn/go-isatty"
@@ -24,7 +21,6 @@ var (
 	printFlag   bool
 	initFlag    bool
 	updateFlag  bool
-	dryRunFlag  bool
 )
 
 var RootCmd = &cobra.Command{
@@ -33,8 +29,14 @@ var RootCmd = &cobra.Command{
 	Long:  `A pure Go port of Code-Reducer CLI, optimized for performance and local LLM execution.`,
 	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		// Load existing environment variables
-		_, _ = config.LoadEnv()
+		repoRoot, err := os.Getwd()
+		if err != nil {
+			fmt.Printf("Error getting current working directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Load existing configuration if any
+		_ = config.LoadAndApplyConfig(repoRoot)
 
 		userMessage := ""
 		if len(args) > 0 {
@@ -58,7 +60,6 @@ func init() {
 	RootCmd.PersistentFlags().BoolVarP(&printFlag, "print", "p", false, "Run once and print the final assistant output (non-interactive)")
 	RootCmd.PersistentFlags().BoolVar(&initFlag, "init", false, "Initialize project documentation")
 	RootCmd.PersistentFlags().BoolVar(&updateFlag, "update", false, "Update existing project documentation")
-	RootCmd.PersistentFlags().BoolVar(&dryRunFlag, "dry-run", false, "Show plan without invoking agent")
 }
 
 func executeCommand(command string, userMessage string) {
@@ -68,6 +69,9 @@ func executeCommand(command string, userMessage string) {
 		os.Exit(1)
 	}
 
+	// Load configuration file and apply to process environment
+	_ = config.LoadAndApplyConfig(repoRoot)
+
 	// Apply flag overrides to environment variables
 	if modelIdFlag != "" {
 		_ = os.Setenv(config.CodeReducerModelIdEnvKey, modelIdFlag)
@@ -76,60 +80,30 @@ func executeCommand(command string, userMessage string) {
 		_ = os.Setenv(config.OllamaNumCtxEnvKey, numCtxFlag)
 	}
 
-	needsSetup := NeedsCredentialSetup()
+	needsSetup := !config.ConfigExists(repoRoot)
 	isTTY := isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
 
 	if needsSetup {
 		if !isTTY {
-			fmt.Println("Error: Credentials/Model ID not configured. Please set the model ID using --model-id or the CODE_REDUCER_MODEL_ID environment variable.")
+			fmt.Printf("Error: Configuration file %s does not exist in the current directory. Please run 'code-reducer setup' to configure the application.\n", config.ConfigFileName)
 			os.Exit(1)
 		}
 
-		// Interactive CLI onboarding
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Println("Welcome to Code-Reducer CLI Setup")
-		fmt.Println("---------------------------------")
-		
-		fmt.Print("Enter LLM Model ID (e.g. gemma4:26b-a4b-it-qat): ")
-		modelInput, _ := reader.ReadString('\n')
-		modelInput = strings.TrimSpace(modelInput)
-		if modelInput == "" {
-			modelInput = "gemma4:26b-a4b-it-qat"
-		}
+		// Run implicit setup flow
+		RunSetupFlow(repoRoot)
 
-		fmt.Printf("Enter Ollama Base URL [%s]: ", config.OllamaDefaultBaseURL)
-		urlInput, _ := reader.ReadString('\n')
-		urlInput = strings.TrimSpace(urlInput)
-		if urlInput == "" {
-			urlInput = config.OllamaDefaultBaseURL
-		}
+		// Load and apply the newly created configuration
+		_ = config.LoadAndApplyConfig(repoRoot)
 
-		fmt.Printf("Enter Ollama Context Size [%d]: ", config.OllamaDefaultNumCtx)
-		ctxInput, _ := reader.ReadString('\n')
-		ctxInput = strings.TrimSpace(ctxInput)
-		if ctxInput == "" {
-			ctxInput = strconv.Itoa(config.OllamaDefaultNumCtx)
+		// Re-apply flag overrides to make sure they override the newly created file values
+		if modelIdFlag != "" {
+			_ = os.Setenv(config.CodeReducerModelIdEnvKey, modelIdFlag)
 		}
-
-		updates := map[string]string{
-			config.CodeReducerModelIdEnvKey: modelInput,
-			config.OllamaBaseUrlEnvKey:      urlInput,
-			config.OllamaNumCtxEnvKey:       ctxInput,
+		if numCtxFlag != "" {
+			_ = os.Setenv(config.OllamaNumCtxEnvKey, numCtxFlag)
 		}
-
-		err = config.SaveEnv(updates)
-		if err != nil {
-			fmt.Printf("Error saving configuration: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("Configuration successfully saved to local .env file.")
-		fmt.Println()
 	}
 
-	if dryRunFlag {
-		fmt.Println("Dry-run mode: configuration is verified, but agent was not executed.")
-		return
-	}
 
 	// Acquire exclusive repository lock
 	lock, err := security.AcquireLock(repoRoot, true)
@@ -168,4 +142,3 @@ func executeCommand(command string, userMessage string) {
 func NeedsCredentialSetup() bool {
 	return os.Getenv(config.CodeReducerModelIdEnvKey) == ""
 }
-

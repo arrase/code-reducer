@@ -4,167 +4,106 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
-	CodeReducerModelIdEnvKey  = "CODE_REDUCER_MODEL_ID"
-	OllamaBaseUrlEnvKey    = "OLLAMA_BASE_URL"
-	OllamaNumCtxEnvKey     = "OLLAMA_NUM_CTX"
-	LangsmithApiKeyEnvKey  = "LANGSMITH_API_KEY"
-	LangchainProjectEnvKey = "LANGCHAIN_PROJECT"
-	LangchainTracingEnvKey = "LANGCHAIN_TRACING_V2"
+	CodeReducerModelIdEnvKey = "CODE_REDUCER_MODEL_ID"
+	OllamaBaseUrlEnvKey      = "OLLAMA_BASE_URL"
+	OllamaNumCtxEnvKey       = "OLLAMA_NUM_CTX"
+	LangsmithApiKeyEnvKey    = "LANGSMITH_API_KEY"
+	LangchainProjectEnvKey   = "LANGCHAIN_PROJECT"
+	LangchainTracingEnvKey   = "LANGCHAIN_TRACING_V2"
 
 	OllamaDefaultBaseURL = "http://localhost:11434"
 	OllamaDefaultNumCtx  = 8192
+	ConfigFileName       = ".code-reducer.yaml"
 )
 
-var ManagedEnvKeys = []string{
-	CodeReducerModelIdEnvKey,
-	OllamaBaseUrlEnvKey,
-	OllamaNumCtxEnvKey,
-	LangsmithApiKeyEnvKey,
-	LangchainProjectEnvKey,
-	LangchainTracingEnvKey,
+// Config represents the schema of .code-reducer.yaml
+type Config struct {
+	ModelID            string `yaml:"model_id"`
+	OllamaBaseURL      string `yaml:"ollama_base_url"`
+	OllamaNumCtx       int    `yaml:"ollama_num_ctx"`
+	LangsmithAPIKey    string `yaml:"langsmith_api_key,omitempty"`
+	LangchainProject   string `yaml:"langchain_project,omitempty"`
+	LangchainTracingV2 string `yaml:"langchain_tracing_v2,omitempty"`
 }
 
-// GetConfigPaths returns standard config directory and configuration file path.
-func GetConfigPaths() (string, string) {
-	return ".", ".env"
+// ConfigExists checks if .code-reducer.yaml exists in the specified directory.
+func ConfigExists(cwd string) bool {
+	configPath := filepath.Join(cwd, ConfigFileName)
+	_, err := os.Stat(configPath)
+	return err == nil
+}
+
+// LoadConfig reads and parses .code-reducer.yaml from the specified directory.
+func LoadConfig(cwd string) (*Config, error) {
+	configPath := filepath.Join(cwd, ConfigFileName)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse yaml config: %w", err)
+	}
+	return &cfg, nil
+}
+
+// SaveConfig writes the configuration to .code-reducer.yaml in the specified directory.
+func SaveConfig(cwd string, cfg *Config) error {
+	configPath := filepath.Join(cwd, ConfigFileName)
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+	return nil
+}
+
+// LoadAndApplyConfig loads the configuration and sets the corresponding environment variables
+// in the current process (only if they are not already set in the parent environment).
+func LoadAndApplyConfig(cwd string) error {
+	cfg, err := LoadConfig(cwd)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	if cfg.ModelID != "" && os.Getenv(CodeReducerModelIdEnvKey) == "" {
+		_ = os.Setenv(CodeReducerModelIdEnvKey, cfg.ModelID)
+	}
+	if cfg.OllamaBaseURL != "" && os.Getenv(OllamaBaseUrlEnvKey) == "" {
+		_ = os.Setenv(OllamaBaseUrlEnvKey, cfg.OllamaBaseURL)
+	}
+	if cfg.OllamaNumCtx > 0 && os.Getenv(OllamaNumCtxEnvKey) == "" {
+		_ = os.Setenv(OllamaNumCtxEnvKey, strconv.Itoa(cfg.OllamaNumCtx))
+	}
+	if cfg.LangsmithAPIKey != "" && os.Getenv(LangsmithApiKeyEnvKey) == "" {
+		_ = os.Setenv(LangsmithApiKeyEnvKey, cfg.LangsmithAPIKey)
+	}
+	if cfg.LangchainProject != "" && os.Getenv(LangchainProjectEnvKey) == "" {
+		_ = os.Setenv(LangchainProjectEnvKey, cfg.LangchainProject)
+	}
+	if cfg.LangchainTracingV2 != "" && os.Getenv(LangchainTracingEnvKey) == "" {
+		_ = os.Setenv(LangchainTracingEnvKey, cfg.LangchainTracingV2)
+	}
+
+	return nil
 }
 
 // GetDatabasePath returns the standard path for the database file.
 func GetDatabasePath() (string, error) {
 	return "code-reducer.sqlite", nil
-}
-
-// LoadEnv reads standard config file and sets env variables in process if they are unset.
-func LoadEnv() (map[string]string, error) {
-	_, envPath := GetConfigPaths()
-	env, err := ReadEnvFile(envPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return make(map[string]string), nil
-		}
-		return nil, err
-	}
-
-	for k, v := range env {
-		// Only set if not already set in parent environment
-		if os.Getenv(k) == "" {
-			_ = os.Setenv(k, v)
-		}
-	}
-
-	return env, nil
-}
-
-// SaveEnv writes configuration variables to standard config file.
-func SaveEnv(updates map[string]string) error {
-	configDir, envPath := GetConfigPaths()
-
-	if configDir != "." {
-		// Ensure directory exists with 0700 permissions
-		if err := os.MkdirAll(configDir, 0700); err != nil {
-			return fmt.Errorf("failed to create config dir: %w", err)
-		}
-		_ = os.Chmod(configDir, 0700)
-	}
-
-	currentEnv, err := ReadEnvFile(envPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to read existing env file: %w", err)
-	}
-	if currentEnv == nil {
-		currentEnv = make(map[string]string)
-	}
-
-	// Apply updates
-	for k, v := range updates {
-		currentEnv[k] = v
-		// Also update the current process env
-		_ = os.Setenv(k, v)
-	}
-
-	// Format env file content
-	var lines []string
-	// First write managed keys in order
-	written := make(map[string]bool)
-	for _, key := range ManagedEnvKeys {
-		if val, ok := currentEnv[key]; ok {
-			lines = append(lines, fmt.Sprintf("%s=%s", key, formatEnvValue(val)))
-			written[key] = true
-		}
-	}
-	// Write any other keys
-	for k, v := range currentEnv {
-		if !written[k] {
-			lines = append(lines, fmt.Sprintf("%s=%s", k, formatEnvValue(v)))
-		}
-	}
-
-	content := strings.Join(lines, "\n") + "\n"
-	err = os.WriteFile(envPath, []byte(content), 0600)
-	if err != nil {
-		return fmt.Errorf("failed to write env file: %w", err)
-	}
-	_ = os.Chmod(envPath, 0600)
-
-	return nil
-}
-
-// ReadEnvFile parses a basic dotenv file.
-func ReadEnvFile(path string) (map[string]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	env := make(map[string]string)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-
-		// Validate key
-		if key == "" {
-			continue
-		}
-
-		env[key] = parseEnvValue(val)
-	}
-
-	return env, scanner.Err()
-}
-
-func parseEnvValue(val string) string {
-	if strings.HasPrefix(val, "\"") && strings.HasSuffix(val, "\"") {
-		v := val[1 : len(val)-1]
-		v = strings.ReplaceAll(v, "\\n", "\n")
-		v = strings.ReplaceAll(v, "\\\"", "\"")
-		v = strings.ReplaceAll(v, "\\\\", "\\")
-		return v
-	}
-	return val
-}
-
-func formatEnvValue(val string) string {
-	v := strings.ReplaceAll(val, "\\", "\\\\")
-	v = strings.ReplaceAll(v, "\"", "\\\"")
-	v = strings.ReplaceAll(v, "\n", "\\n")
-	return fmt.Sprintf("\"%s\"", v)
 }
 
 // GetOllamaContextSize returns the configured context size for Ollama, falling back to dynamic scaling.
@@ -179,14 +118,14 @@ func GetOllamaContextSize(flagVal string) int {
 			return n
 		}
 	}
-	
+
 	// Dynamic scaling based on host total memory
 	mem := getHostTotalMemoryBytes()
-	if mem > 32 * 1024 * 1024 * 1024 {
+	if mem > 32*1024*1024*1024 {
 		return 32768
-	} else if mem > 16 * 1024 * 1024 * 1024 {
+	} else if mem > 16*1024*1024*1024 {
 		return 16384
-	} else if mem > 8 * 1024 * 1024 * 1024 {
+	} else if mem > 8*1024*1024*1024 {
 		return 8192
 	}
 	return 4096
