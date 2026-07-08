@@ -693,8 +693,8 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 		return fmt.Errorf("failed to write quickstart.md: %w", err)
 	}
 
-	logEvent("status", "Step 5: Updating AGENT.md...")
-	agentFilePath := "AGENT.md"
+	logEvent("status", "Step 5: Updating AGENTS.md...")
+	agentFilePath := "AGENTS.md"
 	agentGuidelines := fmt.Sprintf(`# AI Agent Guidelines
 
 This repository contains automatically generated documentation under the %s directory to help AI coding agents understand the system architecture, design patterns, and module structure:
