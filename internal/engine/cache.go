@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/arrase/code-reducer/internal/tools"
@@ -24,17 +27,17 @@ func loadMetadataCache(repoRoot string, docsDir string) (*MetadataCache, error) 
 	metadataPath := filepath.Join(docsDir, ".metadata.json")
 	data, err := tools.ReadFileSafely(repoRoot, metadataPath)
 	if err != nil {
-		return &MetadataCache{
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return &MetadataCache{
+				Files:   make(map[string]FileCacheEntry),
+				Modules: make(map[string]string),
+			}, nil
+		}
+		return nil, fmt.Errorf("failed to read metadata cache: %w", err)
 	}
 	var cache MetadataCache
 	if err := json.Unmarshal(data, &cache); err != nil {
-		return &MetadataCache{
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}, nil
+		return nil, fmt.Errorf("failed to unmarshal metadata cache: %w", err)
 	}
 	if cache.Files == nil {
 		cache.Files = make(map[string]FileCacheEntry)

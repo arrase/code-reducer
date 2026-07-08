@@ -2,6 +2,7 @@ model_id: ornith:9b
 ollama_base_url: http://localhost:11434
 ollama_num_ctx: 15000
 ignore:
+    - .github
     - .git
     - node_modules
     - bower_components

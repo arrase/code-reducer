@@ -197,19 +197,18 @@ When writing documentation files to the filesystem:
 
 Repository scanning is executed using `filepath.WalkDir` coupled with multiple layers of evaluation:
 1. **Pruning Subtrees**: Common default dependency, cache, and build directories (`.git`, `node_modules`, `bower_components`, `dist`, `build`, `cache`, `__pycache__`, `venv`, `.venv`, and directory names ending in `.egg-info`) are skipped using `filepath.SkipDir` at the walk root, saving CPU cycles.
-2. **Ignore Matching Rules**: Ignores loaded from the project's `.gitignore` and specified in the YAML configuration are merged and resolved with `ShouldIgnorePath`. This evaluates four matching schemes:
-   * **Exact Match**: The relative cleaned path matches the ignore pattern.
-   * **Prefix Match**: The path resides within a subdirectory matching the ignore pattern.
-   * **Component-Level Match**: A folder name anywhere in the path matches the pattern.
-   * **Glob Match**: The pattern is evaluated using glob-style matching (`filepath.Match`).
-3. **Binary Classification (Null-Byte Scanner)**: Files with blacklisted extensions (e.g. `.png`, `.pdf`, `.zip`, `.exe`, `.so`) or lockfile suffixes (`*-lock.json`, `pnpm-lock.yaml`) are ignored. Unlabelled binaries are caught by checking the first `1024` bytes for a null byte (`0x00`). If a null byte is found, the file is classified as a binary and skipped.
+2. **Ignore Matching Rules**: Ignores loaded from the project's `.gitignore` and specified in the YAML configuration are merged and compiled using a dedicated Gitignore library (`go-gitignore`), ensuring 100% compliance with standard Git semantic rules (like negations and deep globs).
+3. **Binary Classification (Null-Byte Scanner & Fast-Path)**: 
+   * **Known Extensions**: Files with explicitly ignored extensions (e.g. `.png`, `.pdf`, `.zip`, `.exe`) or lockfile suffixes (`*-lock.json`, `pnpm-lock.yaml`) are ignored.
+   * **Text Fast-Path**: Common source code extensions (like `.go`, `.js`, `.py`, `.md`) are instantly classified as text, entirely bypassing I/O bottlenecks.
+   * **Fallback Null-Byte Scan**: Unlabelled files are caught by checking the first `1024` bytes for a null byte (`0x00`). If a null byte is found, the file is classified as a binary and skipped.
 
 ---
 
 ### 4. Git CLI and Hash-Based Incremental Rebuilds
 
 Instead of relying on external Git diff parsing during runtime, Code-Reducer implements a robust Git verification step combined with a filesystem hash-based comparison engine:
-* **`RunGit` Wrapper**: Executes `git` commands with the `--no-pager` option and captures combined output to verify that the workspace is a valid Git repository before running.
+* **`RunGit` Wrapper**: Executes `git` commands with the `--no-pager` option. It isolates `stdout` and `stderr` into separate streams, ensuring that Git warnings don't corrupt the actual command output used by the application.
 * **Platform-Independent Change Detection**: The update engine discovers candidate source files on the filesystem, computes their `SHA256` hash, and compares them directly to the hashes persisted in the `.metadata.json` cache file.
 * **State Classification**: 
   * **Added**: File is present in the workspace but missing from the cache.
@@ -239,6 +238,56 @@ Below is a hardware performance snapshot captured during the documentation synth
 ---
 
 ## 📂 Example Output
+
+### CLI Execution Log
+
+Here is an example of a successful Map-Reduce pipeline execution (`code-reducer init`):
+
+```bash
+$ code-reducer init
+Starting Map-Reduce pipeline: init
+Step 1: Code Discovery & Building Tree...
+Step 2: Hierarchical Tree-Merging (Map-Reduce)...
+➜ Extracting file: cmd/init.go
+➜ Extracting file: cmd/root.go
+➜ Extracting file: cmd/setup.go
+➜ Extracting file: cmd/update.go
+➜ Synthesizing directory: cmd (4 total components)
+➜ LLM Synthesizing chunk for cmd (4 items)
+➜ Extracting file: internal/config/env.go
+➜ Synthesizing directory: internal/config (1 total components)
+➜ LLM Synthesizing chunk for internal/config (1 items)
+➜ Extracting file: internal/engine/cache.go
+➜ Extracting file: internal/engine/chunking.go
+➜ Extracting file: internal/engine/client.go
+➜ Extracting file: internal/engine/json_parser.go
+➜ Extracting file: internal/engine/orchestrator.go
+➜ Extracting file: internal/engine/runner.go
+➜ Extracting file: internal/engine/synthesize.go
+➜ Extracting file: internal/engine/tree.go
+➜ Extracting file: internal/engine/utils.go
+➜ Synthesizing directory: internal/engine (9 total components)
+➜ LLM Synthesizing chunk for internal/engine (9 items)
+➜ Extracting file: internal/security/security.go
+➜ Synthesizing directory: internal/security (1 total components)
+➜ LLM Synthesizing chunk for internal/security (1 items)
+➜ Extracting file: internal/tools/file_tools.go
+➜ Extracting file: internal/tools/git_tools.go
+➜ Synthesizing directory: internal/tools (2 total components)
+➜ LLM Synthesizing chunk for internal/tools (2 items)
+➜ Synthesizing directory: internal (4 total components)
+➜ LLM Synthesizing chunk for internal (4 items)
+➜ Extracting file: go.mod
+➜ Extracting file: main.go
+➜ Synthesizing directory: . (4 total components)
+➜ LLM Synthesizing chunk for . (4 items)
+Step 3: Global Architecture Synthesis...
+Step 4: Generating Quickstart...
+Step 5: Updating AGENTS.md...
+Pipeline completed successfully!
+```
+
+### Generated Documentation
 
 You can inspect the actual documentation generated by Code-Reducer for this repository in the local [wiki/](file:///home/arrase/Develop/code-reducer/wiki) directory:
 

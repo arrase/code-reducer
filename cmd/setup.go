@@ -56,123 +56,33 @@ func RunSetupFlow(repoRoot string) {
 		}
 	}
 
-	fmt.Printf("Enter LLM Model ID [%s]: ", existingModel)
-	modelInput, _ := reader.ReadString('\n')
-	modelInput = strings.TrimSpace(modelInput)
-	if modelInput == "" {
-		modelInput = existingModel
-	}
-
-	fmt.Printf("Enter Ollama Base URL [%s]: ", existingBaseURL)
-	urlInput, _ := reader.ReadString('\n')
-	urlInput = strings.TrimSpace(urlInput)
-	if urlInput == "" {
-		urlInput = existingBaseURL
-	}
-
-	fmt.Printf("Enter Ollama Context Size [%d]: ", existingNumCtx)
-	ctxInput, _ := reader.ReadString('\n')
-	ctxInput = strings.TrimSpace(ctxInput)
+	modelInput := promptString(reader, "Enter LLM Model ID", existingModel)
+	urlInput := promptString(reader, "Enter Ollama Base URL", existingBaseURL)
+	
+	ctxInputStr := promptString(reader, "Enter Ollama Context Size", strconv.Itoa(existingNumCtx))
 	var numCtx int
-	if ctxInput == "" {
-		numCtx = existingNumCtx
+	if n, err := strconv.Atoi(ctxInputStr); err == nil && n > 0 {
+		numCtx = n
 	} else {
-		n, err := strconv.Atoi(ctxInput)
-		if err != nil || n <= 0 {
-			fmt.Printf("Invalid context size, using default [%d]\n", existingNumCtx)
-			numCtx = existingNumCtx
-		} else {
-			numCtx = n
-		}
+		numCtx = existingNumCtx
 	}
 
 	var ignores []string
-	if existingCfg == nil {
-		fmt.Print("Enter custom directories/files to ignore (in addition to standard defaults) []: ")
-		ignoreInput, _ := reader.ReadString('\n')
-		ignoreInput = strings.TrimSpace(ignoreInput)
-
-		ignores = append(ignores, config.DefaultIgnores...)
-		if ignoreInput != "" {
-			parts := strings.Split(ignoreInput, ",")
-			for _, part := range parts {
-				trimmed := strings.TrimSpace(part)
-				if trimmed != "" {
-					ignores = append(ignores, trimmed)
-				}
-			}
-		}
-	} else {
-		existingIgnore := strings.Join(existingCfg.Ignore, ", ")
-		fmt.Printf("Enter directories/files to ignore (comma-separated) [%s]: ", existingIgnore)
-		ignoreInput, _ := reader.ReadString('\n')
-		ignoreInput = strings.TrimSpace(ignoreInput)
-
-		if ignoreInput == "" {
-			ignores = existingCfg.Ignore
-		} else {
-			parts := strings.Split(ignoreInput, ",")
-			for _, part := range parts {
-				trimmed := strings.TrimSpace(part)
-				if trimmed != "" {
-					ignores = append(ignores, trimmed)
-				}
-			}
-			if ignores == nil {
-				ignores = []string{}
-			}
-		}
-	}
-
 	var ignoreExtensions []string
+
 	if existingCfg == nil {
-		fmt.Print("Enter custom file extensions to ignore (in addition to standard defaults) []: ")
-		extInput, _ := reader.ReadString('\n')
-		extInput = strings.TrimSpace(extInput)
-
-		ignoreExtensions = append(ignoreExtensions, config.DefaultIgnoredExtensions...)
-		if extInput != "" {
-			parts := strings.Split(extInput, ",")
-			for _, part := range parts {
-				trimmed := strings.TrimSpace(part)
-				if trimmed != "" {
-					ignoreExtensions = append(ignoreExtensions, trimmed)
-				}
-			}
-		}
+		ignores = promptAndAppend(reader, "Enter custom directories/files to ignore (in addition to standard defaults) []: ", nil, config.DefaultIgnores)
+		ignoreExtensions = promptAndAppend(reader, "Enter custom file extensions to ignore (in addition to standard defaults) []: ", nil, config.DefaultIgnoredExtensions)
 	} else {
-		existingExtensions := strings.Join(existingCfg.IgnoreExtensions, ", ")
-		fmt.Printf("Enter file extensions to ignore (comma-separated) [%s]: ", existingExtensions)
-		extInput, _ := reader.ReadString('\n')
-		extInput = strings.TrimSpace(extInput)
-
-		if extInput == "" {
-			ignoreExtensions = existingCfg.IgnoreExtensions
-		} else {
-			parts := strings.Split(extInput, ",")
-			for _, part := range parts {
-				trimmed := strings.TrimSpace(part)
-				if trimmed != "" {
-					ignoreExtensions = append(ignoreExtensions, trimmed)
-				}
-			}
-			if ignoreExtensions == nil {
-				ignoreExtensions = []string{}
-			}
-		}
+		ignores = promptAndAppend(reader, "Enter directories/files to ignore (comma-separated)", existingCfg.Ignore, nil)
+		ignoreExtensions = promptAndAppend(reader, "Enter file extensions to ignore (comma-separated)", existingCfg.IgnoreExtensions, nil)
 	}
 
 	existingDocsDir := "wiki"
 	if existingCfg != nil && existingCfg.DocsDir != "" {
 		existingDocsDir = existingCfg.DocsDir
 	}
-
-	fmt.Printf("Enter documentation directory [%s]: ", existingDocsDir)
-	docsDirInput, _ := reader.ReadString('\n')
-	docsDirInput = strings.TrimSpace(docsDirInput)
-	if docsDirInput == "" {
-		docsDirInput = existingDocsDir
-	}
+	docsDirInput := promptString(reader, "Enter documentation directory", existingDocsDir)
 
 	newCfg := &config.Config{
 		ModelID:          modelInput,
@@ -196,4 +106,66 @@ func RunSetupFlow(repoRoot string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Configuration successfully saved to local %s file.\n", config.ConfigFileName)
+}
+
+func promptAndAppend(reader *bufio.Reader, promptMsg string, existingList []string, defaults []string) []string {
+	var result []string
+	if existingList == nil {
+		fmt.Print(promptMsg)
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("\nWarning: error reading input (%v), using defaults.\n", err)
+			return defaults
+		}
+		input = strings.TrimSpace(input)
+		result = append(result, defaults...)
+		if input != "" {
+			parts := strings.Split(input, ",")
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					result = append(result, trimmed)
+				}
+			}
+		}
+	} else {
+		existingStr := strings.Join(existingList, ", ")
+		fmt.Printf("%s [%s]: ", promptMsg, existingStr)
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("\nWarning: error reading input (%v), keeping existing values.\n", err)
+			return existingList
+		}
+		input = strings.TrimSpace(input)
+
+		if input == "" {
+			result = existingList
+		} else {
+			parts := strings.Split(input, ",")
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					result = append(result, trimmed)
+				}
+			}
+			if result == nil {
+				result = []string{}
+			}
+		}
+	}
+	return result
+}
+
+func promptString(reader *bufio.Reader, promptMsg, existingVal string) string {
+	fmt.Printf("%s [%s]: ", promptMsg, existingVal)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Printf("\nWarning: error reading input (%v), using default: %s\n", err, existingVal)
+		return existingVal
+	}
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return existingVal
+	}
+	return input
 }

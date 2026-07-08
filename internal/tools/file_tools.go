@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/arrase/code-reducer/internal/security"
+	ignore "github.com/sabhiram/go-gitignore"
 )
 
 // ReadFileSafely resolves the virtual path inside the repository and reads the file content.
@@ -102,9 +103,9 @@ func LoadGitignore(repoRoot string) ([]string, error) {
 }
 
 // ShouldIgnoreFile checks if a file (specified by relative path) is ignored.
-func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string, ignoredExtensions []string) bool {
+func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ignoredExtensions []string) bool {
 	// 1. Check user-defined ignores (config + gitignore)
-	if ShouldIgnorePath(relPath, customIgnores) {
+	if gitIgnore != nil && gitIgnore.MatchesPath(relPath) {
 		return true
 	}
 
@@ -124,12 +125,21 @@ func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string, ignoredE
 		if !strings.HasPrefix(normIext, ".") {
 			normIext = "." + normIext
 		}
-		if ext == strings.ToLower(normIext) {
+		if ext == strings.ToLower(normIext) || strings.HasSuffix(strings.ToLower(name), strings.ToLower(normIext)) {
 			return true
 		}
 	}
-	if NameSuffixIgnored(name) {
-		return true
+	// 3.5 Check if it's a known text file to avoid IsBinaryFile I/O bottleneck
+	knownTextExts := map[string]bool{
+		".go": true, ".js": true, ".ts": true, ".py": true, ".md": true,
+		".txt": true, ".json": true, ".yaml": true, ".yml": true,
+		".html": true, ".css": true, ".java": true, ".c": true, ".cpp": true,
+		".h": true, ".hpp": true, ".rb": true, ".php": true, ".sh": true,
+		".rs": true, ".swift": true, ".kt": true, ".xml": true, ".sql": true,
+		".mod": true, ".sum": true,
+	}
+	if knownTextExts[ext] {
+		return false
 	}
 
 	// 4. Check if it's a binary file
@@ -144,6 +154,8 @@ func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string, ignoredE
 // It ignores build, dependency, and output files, as well as any paths in the custom ignores list.
 func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []string) ([]string, error) {
 	var files []string
+	gitIgnore := ignore.CompileIgnoreLines(ignores...)
+
 	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // Skip items with errors
@@ -160,13 +172,13 @@ func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []st
 
 		if d.IsDir() {
 			name := d.Name()
-			if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || ShouldIgnorePath(rel, ignores) {
+			if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || (gitIgnore != nil && gitIgnore.MatchesPath(rel)) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		if ShouldIgnoreFile(repoRoot, rel, ignores, ignoredExtensions) {
+		if ShouldIgnoreFile(repoRoot, rel, gitIgnore, ignoredExtensions) {
 			return nil
 		}
 
@@ -177,36 +189,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []st
 	return files, err
 }
 
-func ShouldIgnorePath(relPath string, ignores []string) bool {
-	relClean := filepath.Clean(relPath)
-	for _, pattern := range ignores {
-		patternClean := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(pattern, "/")))
-		if relClean == patternClean {
-			return true
-		}
-		prefix := patternClean + string(filepath.Separator)
-		if strings.HasPrefix(relClean, prefix) {
-			return true
-		}
-		components := strings.Split(relClean, string(filepath.Separator))
-		for _, comp := range components {
-			if comp == patternClean {
-				return true
-			}
-			if strings.ContainsAny(patternClean, "*?[]") {
-				if matched, _ := filepath.Match(patternClean, comp); matched {
-					return true
-				}
-			}
-		}
-		if strings.ContainsAny(patternClean, "*?[]") {
-			if matched, _ := filepath.Match(patternClean, relClean); matched {
-				return true
-			}
-		}
-	}
-	return false
-}
+
 
 // IsBinaryFile checks if a file is binary by scanning the first 1024 bytes for null bytes.
 func IsBinaryFile(path string) bool {
@@ -230,7 +213,3 @@ func IsBinaryFile(path string) bool {
 	return false
 }
 
-func NameSuffixIgnored(name string) bool {
-	lower := strings.ToLower(name)
-	return strings.HasSuffix(lower, "-lock.json") || strings.HasSuffix(lower, ".lock.yaml") || strings.HasSuffix(lower, "pnpm-lock.yaml")
-}

@@ -16,22 +16,12 @@ func RunGit(repoRoot string, args ...string) (string, error) {
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
-	output := stdout.String() + stderr.String()
-	trimmed := strings.TrimSpace(output)
+	trimmedOut := strings.TrimSpace(stdout.String())
 	if err != nil {
-		// Return output even on error as some git commands output error details on stdout/stderr
-		return trimmed, fmt.Errorf("git command failed: %v, output: %s", err, trimmed)
+		trimmedErr := strings.TrimSpace(stderr.String())
+		return trimmedOut, fmt.Errorf("git command failed: %v, stderr: %s", err, trimmedErr)
 	}
-	return trimmed, nil
-}
-
-// GetGitHead returns the current HEAD commit hash.
-func GetGitHead(repoRoot string) (string, error) {
-	head, err := RunGit(repoRoot, "rev-parse", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	return head, nil
+	return trimmedOut, nil
 }
 
 // VerifyGitRepo checks if git is available and the directory is a git repository.
@@ -45,5 +35,3 @@ func VerifyGitRepo(repoRoot string) error {
 	}
 	return nil
 }
-
-

@@ -1,47 +1,45 @@
-# cmd Package Documentation
+## Module: `cmd` — CLI Entry Point & Subcommand Registry
 
-## Module Responsibility
+**Responsibility:** Provides a cobra-based command-line interface with root invocation and two subcommands (`setup`, `update`). The module wires all commands into the shared `RootCmd` during package initialization in `init.go`. No exported types exist in that file.
 
-The `cmd` package implements the CLI command surface for code-reducer using Cobra. It provides three subcommands (`init`, `update`) and an interactive setup flow that drives repository scanning, wiki page generation, configuration management, and credential resolution. Data flow proceeds from root orchestration → initialization/credential validation → configuration resolution → engine execution.
+---
 
-## Root Command & Orchestration
+### Data Flow
 
-| Component | Location | Responsibility |
-|-----------|----------|-----------------|
-| `RootCmd` | `root.go` | Cobra root command instance; completion options disabled globally. |
-| `executeCommand(mode string)` | `root.go` | Orchestrates the full documentation workflow: validates git repository, runs implicit setup if needed, resolves merged configuration, checks initialization state via `.metadata.json`, and executes the engine while handling terminal signals. |
-| `NeedsCredentialSetup()` | `root.go` | Returns `true` when the resolved configuration lacks a critical LLM model ID; indicates credential setup is required before engine execution. |
+1. User invokes CLI → `RootCmd` dispatches to subcommand via cobra's standard command tree traversal.
+2. **setup** flow: prompts user interactively for LLM model ID, Ollama URL/context size, ignore lists, and docs directory; merges into default values or existing list state; persists resulting config through `config.SaveConfig`.
+3. **update** flow: detects changed files since the last documented commit (git diff-based), then triggers incremental wiki page regeneration against current source tree.
 
-**Data flow**: `RootCmd` → `executeCommand(mode)` → git validation → implicit setup (if missing) → configuration merge → `.metadata.json` check → `NeedsCredentialSetup()` gate → engine dispatch with signal handling.
+---
 
-## Initialization Subcommand
+### Root Command (`root.go`)
 
-| Component | Location | Responsibility |
-|-----------|----------|-----------------|
-| `initCmd` | `init.go` | Defines the CLI subcommand that triggers repository scanning and generates the initial set of wiki markdown pages when executed. |
+- **`RootCmd`** — cobra.Command instance configured with usage text and completion options; serves as the top-level entry point for all CLI invocations.
+- **`NeedsCredentialSetup()`** (package-level) — Inspects resolved configuration file state; returns `true` when a `ModelID` is absent, signaling that credential setup has not yet been completed.
 
-**Data flow**: `initCmd` → repository scan → wiki page generation → `.metadata.json` write-back (initialization state).
+---
 
-## Update Subcommand
+### Setup Subcommand (`setup.go`)
 
-| Component | Location | Responsibility |
-|-----------|----------|-----------------|
-| `updateCmd` | `update.go` | A cobra.Command variable that defines the "update" subcommand; scans changed files since the last documented commit and updates wiki pages. |
-| `init()` | `update.go` | Package-level init function registered at startup to register `updateCmd` with the root command (`RootCmd`). |
+#### Run Setup Flow
 
-**Data flow**: `init()` → Cobra registration → user invokes `update` subcommand → diff against last documented commit → wiki page regeneration → metadata refresh.
+- **`RunSetupFlow`** — Orchestrates the interactive configuration sequence:
+  - Prompts for LLM model ID and Ollama URL with optional context size parameter.
+  - Collects ignore lists via comma-separated input; merges user-supplied values against existing defaults or prior list state.
+  - Accepts docs directory path from stdin, falling back to an existing value on empty/failed reads.
+  - Persists the aggregated configuration through `config.SaveConfig`.
 
-## Setup Flow
+#### Prompt Utilities
 
-| Component | Location | Responsibility |
-|-----------|----------|-----------------|
-| `RunSetupFlow` | `setup.go` | Guides the user through an interactive setup flow to generate and save a `.code-reducer.yaml` configuration file by prompting for model ID, Ollama Base URL, context size, ignored directories/files, ignored extensions, and documentation directory. |
+- **`promptAndAppend`** — Reads comma-separated input from stdin; appends tokens to either a default slice or an existing list passed as parameter; returns merged `[]string`.
+- **`promptString`** — Reads single-line text from stdin, trims whitespace, and falls back to the provided existing value when input is empty or read fails.
 
-**Data flow**: CLI prompt → parameter collection (model ID, Ollama Base URL, context size, ignore paths/extension, doc dir) → `.code-reducer.yaml` generation → file write-back → configuration ready for `executeCommand`.
+#### Command Registration
 
-## Command Registration Order
+- **`setupCmd`** (package-level variable) — Holds the cobra.Command definition for the `setup` subcommand; wired into `RootCmd` during package initialization in `init.go`.
 
-1. Package init (`update.go`) registers `updateCmd` with `RootCmd`.
-2. User invokes `init`, `update`, or setup flow via CLI.
-3. Setup flow populates `.code-reducer.yaml` if absent; otherwise loads merged configuration.
-4. `executeCommand(mode)` validates state and dispatches engine.
+---
+
+### Update Subcommand (`update.go`)
+
+- **`updateCmd`** — Unexported cobra command registered with `RootCmd`; handles incremental wiki page updates by detecting changed files since the last documented commit and triggering regeneration against current source tree.

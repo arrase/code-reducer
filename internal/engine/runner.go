@@ -31,7 +31,7 @@ func (r *Runner) Run(ctx context.Context, repoRoot string, mode string, onEvent 
 	}
 
 	// 2. Acquire repository lock
-	lock, err := security.AcquireLock(repoRoot, true)
+	lock, err := security.AcquireLock(repoRoot)
 	if err != nil {
 		return fmt.Errorf("failed to acquire repository lock: %w", err)
 	}

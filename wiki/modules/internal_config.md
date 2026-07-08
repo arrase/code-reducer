@@ -1,95 +1,60 @@
-# `internal/config` Module
+# `internal/config` — Configuration Resolution Pipeline
 
-## Responsibility
+## Module Responsibility
 
-Central configuration management for the Code Reducer pipeline. This module handles persistence of user-defined settings (`.code-reducer.yaml`), runtime overrides via environment variables, defaults, and CLI flag merging through a single resolved configuration object consumed by downstream components (model providers, tracing integrations, file-system traversal).
+Centralizes all configuration sources for the Code Reducer application and resolves them into a single authoritative `Config` value through a deterministic merge pipeline. Sources are layered: system defaults (lowest priority) ← YAML file ← environment variables ← CLI flags (highest priority). All operations are idempotent where applicable; side-effecting writes enforce restricted permissions (mode `0600`).
 
-**Data Flow:**  
-`ConfigExists(dir)` → `LoadConfig(dir)` → `ResolveConfig()` → `SaveConfig(Config)`. The resolve step merges four precedence layers: **system defaults** < **YAML config** < **environment variables** < **CLI flags**. The final resolved struct is the canonical configuration passed to every pipeline stage.
+## Constants
 
----
-
-## Constants — Environment Variable Keys & Defaults
+Environment variable keys and fallback constants that govern external override behavior:
 
 | Constant | Purpose |
 |---|---|
-| `CodeReducerModelIdEnvKey` | Runtime override of LLM model ID without file edit. |
-| `OllamaBaseUrlEnvKey` | Custom Ollama API base URL (defaults to `http://localhost:11434`). |
-| `OllamaNumCtxEnvKey` | Ollama context window size in tokens. |
-| `LangsmithApiKeyEnvKey` | LangSmith tracing API key. |
-| `LangchainProjectEnvKey` | LangChain project name. |
-| `LangchainTracingEnvKey` | Toggle for LangChain v2 tracing. |
-| `OllamaDefaultBaseURL` | Hardcoded fallback Ollama base URL (`http://localhost:11434`). |
-| `OllamaDefaultNumCtx` | Hardcoded fallback context window size (8192 tokens). |
-| `ConfigFileName` | Path suffix for the user config file (`.code-reducer.yaml`). |
+| `CodeReducerModelIdEnvKey` | Runtime key for overriding the LLM model identifier. |
+| `OllamaBaseUrlEnvKey` | Runtime key for overriding the Ollama server address. |
+| `OllamaNumCtxEnvKey` | Runtime key for overriding the context/token count. |
+| `LangsmithApiKeyEnvKey` | Runtime key supplying a LangSmith API tracing credential. |
+| `LangchainProjectEnvKey` | Runtime key setting the LangChain project name. |
+| `LangchainTracingEnvKey` | Runtime key enabling/disabling LangChain v2 tracing. |
+| `OllamaDefaultBaseURL` | Fallback Ollama address when no env/config override is present. |
+| `OllamaDefaultNumCtx` | Default context size of 8192 tokens applied in the absence of overrides. |
+| `ConfigFileName` | Filesystem name `.code-reducer.yaml` used to locate the project configuration file. |
 
----
+## Types
 
-## Types — Config Struct
+### `Config`
 
-```go
-type Config struct {
-    // Model configuration: provider, model ID, temperature, etc.
-    Model   *ModelConfig     `yaml:"model,omitempty"`
-    Tracing *TracingConfig   `yaml:"tracing,omitempty"`
-    Ignore  []string         `yaml:"ignore,omitempty"`
-    DocsDir string           `yaml:"docsDir,omitempty"`
-}
-```
+Core application configuration schema aggregating: LLM model ID, Ollama server/connection settings (base URL, context size), LangSmith/LangChain tracing flags, ignored filesystem paths and extensions, and the docs directory path. Serves as the canonical resolved state consumed downstream by the analyzer pipeline.
 
-`Config` is the sole struct persisted to disk. All fields are YAML-serializable; pointer semantics prevent zero-value marshaling for optional sections (model, tracing).
+## Default Exclusions
 
----
+Package-level slices defining filesystem paths excluded from analysis:
 
-## Package-Level Defaults — Ignore Lists
+- `DefaultIgnores` — Directory name exclusions (e.g., `.git`, `node_modules`, build artifacts).
+- `DefaultIgnoredExtensions` — File extension exclusions (e.g., images, binaries, lock files).
 
-| Variable | Purpose |
-|---|---|
-| `DefaultIgnores` | Directory names excluded from analysis by default (`.git`, `node_modules`, `dist`). |
-| `DefaultIgnoredExtensions` | File extensions excluded from analysis by default (`.png`, `.zip`, `.pyc`). |
+## I/O Operations
 
-These lists are merged with user-supplied ignore entries during the resolve phase and applied to file-system traversal downstream.
+### `ConfigExists(cwd string) bool`
 
----
+Returns `true` when `.code-reducer.yaml` exists under the given working directory. Used as a gate for conditional config loading in the resolution pipeline.
 
-## Functions — Config Validation & Persistence
+### `LoadConfig(cwd string) (*Config, error)`
 
-### `ConfigExists(dir string) bool`
+Reads and parses `.code-reducer.yaml` from `cwd` into a populated `Config` struct. Returns an error on parse failure or missing file; callers must check existence via `ConfigExists` first to avoid spurious errors.
 
-Returns whether a valid `.code-reducer.yaml` exists at `dir/ConfigFileName`. Does not read contents—only checks filesystem presence. Used by CLI entry points to prompt users for initial configuration on first run.
+### `SaveConfig(cwd string, cfg *Config) error`
 
-**Data Flow:**  
-`dir` → OS.Stat(`dir + "/" + ConfigFileName`) → `true/false`.
+Serializes the provided configuration to `.code-reducer.yaml` under `cwd`. Writes with restricted file permissions (`0600`) to prevent unintended access by other users on shared filesystems.
 
----
+## Merge Utility
 
-### `LoadConfig(dir string) (Config, error)`
+### `MergeAndDeduplicate[T comparable](a, b []T) []T`
 
-Reads raw YAML bytes from `dir/ConfigFileName`, unmarshals into a `Config` struct. Returns an error if the file is missing or malformed.
+Generic slice concatenation and deduplication preserving insertion order. Applied when merging default ignore lists with user-provided overrides; preserves first-seen ordering to avoid reordering side effects in downstream path matching logic.
 
-**Data Flow:**  
-`dir + "/" + ConfigFileName` → OS.ReadFile → yaml.Unmarshal → `Config`. If unmarshal fails, returns zero-value `Config` and non-nil error.
+## Resolution Pipeline
 
----
+### `ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config`
 
-### `SaveConfig(cfg Config) error`
-
-Serializes a `Config` struct to YAML and writes it to the working directory's `.code-reducer.yaml` with **0600** permissions for security (read/write owner only).
-
-**Data Flow:**  
-`cfg` → yaml.Marshal → OS.OpenFile(`dir + "/" + ConfigFileName`, 0600) → OS.Write.
-
----
-
-### `ResolveConfig() (Config, error)`
-
-Merges four precedence layers into a single fully-resolved `Config`: **system defaults** (`OllamaDefault*` constants) < **YAML config** (from `LoadConfig`) < **environment variables** (`*_EnvKey` constants) < **CLI flags**. Returns the canonical configuration for pipeline consumption.
-
-**Data Flow:**  
-1. Load YAML from working directory via `LoadConfig`.
-2. Read each `_*EnvKey` environment variable; apply overrides where set.
-3. Apply CLI flag values (passed as function parameters).
-4. Fill missing fields with defaults (`OllamaDefaultBaseURL`, `OllamaDefaultNumCtx`).
-5. Merge `DefaultIgnores` and `DefaultIgnoredExtensions` into ignore lists.
-
-The resolved struct is the authoritative configuration consumed by model providers, tracing backends, and file-system traversal logic downstream in the pipeline.
+Orchestrates the full configuration resolution pipeline: merges CLI flags (`modelIdFlag`, `numCtxFlag`), environment variables (via the key constants above), YAML config (loaded by `LoadConfig`), and system defaults into a single resolved `Config`. Execution order enforces priority from lowest to highest: system defaults → YAML file → environment variables → CLI flags. The returned value is authoritative; downstream components read only this struct, never individual sources.
