@@ -1,51 +1,48 @@
-# cmd Package
+# Module: `cmd` — CLI Entry Point & Command Lifecycle
 
 ## Responsibility
 
-The `cmd` package implements the Cobra command hierarchy for Code-Reducer's CLI application. It defines the root entry point (`RootCmd`) and registers three subcommands—`init`, `setup`, and `update`—each responsible for a distinct phase of the tool lifecycle: initial registration, interactive configuration generation, and runtime updates respectively. Package-level `init()` functions wire all subcommands into the command tree during import.
+The `cmd` package implements the Cobra-based command-line interface for **code-reducer**. It manages the lifecycle from application bootstrap through credential validation, interactive setup, configuration loading, repository locking, and LLM engine execution with live event streaming. The module registers subcommands at package init time and delegates orchestration to a root command that enforces sequential state transitions.
 
 ## Data Flow
 
 ```
-RootCmd ──────────────┬── init (subcommand)
-                      ├── setup (RunSetupFlow → .code-reducer.yaml)
-                      └── update (subcommand)
+init.go (package init) 
+    ↓ registers "init" subcommand
+RootCmd (root.go — Cobra root)
+    ↓ executeCommand()
+NeedsCredentialSetup() → bool
+    ├─ false ───→ acquire lock → load config → run LLM engine + stream events
+    └─ true ────→ RunSetupFlow() → save .code-reducer.yaml → re-attempt executeCommand()
 ```
 
-- **`init()`** functions in both `init.go` and `update.go` execute during package initialization. The one in `init.go` registers the `init` subcommand; the one in `update.go` registers the `update` subcommand. Both are exported so the command tree is populated before any user invocation.
-- **`RootCmd`** serves as the top-level Cobra command. It holds global usage text and disables default completions to enforce explicit completion generation where needed.
-- **`NeedsCredentialSetup()`** inspects the current process environment for critical credential variables (e.g., `OLLAMA_HOST`, `LLM_MODEL_ID`). Returns `true` when one or more are absent, signaling that `setup` must be invoked before any authenticated operation.
-- **`RunSetupFlow(repoRoot string)`** drives an interactive setup sequence: it prompts the user for LLM model ID, Ollama connection parameters (host, port), context size, ignored path patterns, and documentation directory location. The collected values are serialized into `.code-reducer.yaml` at `repoRoot`.
+## Subcommand Registration
 
-## Subcommands
+### `init` (init.go)
 
-### init
+Executes at package initialization. Registers the `init` subcommand on the root Cobra command, enabling a self-healing bootstrap path where users can invoke `code-reducer init` to trigger interactive setup if credentials are absent.
 
-```go
-func init() { /* registers "init" subcommand with RootCmd */ } // init.go
-```
+## Root Command & Execution Orchestrator
 
-Registers the `init` subcommand under `RootCmd` during package initialization. The cobra command is bound to a run function that executes when the user invokes `code-reducer init`.
+### `RootCmd` (root.go)
 
-### setup
+The top-level Cobra command for the `code-reducer` CLI. Owns the application's command tree and serves as the entry point for all user-invoked operations. Delegates to `executeCommand()` on invocation; does not perform work directly.
 
-```go
-func RunSetupFlow(repoRoot string) { /* orchestrates interactive CLI setup */ } // setup.go
-```
+### `executeCommand` (root.go)
 
-Orchestrates an interactive configuration flow. Prompts sequentially for:
-1. **LLM model ID** — identifies the target large-language-model endpoint.
-2. **Ollama connection parameters** — host, port, and any TLS flags required to reach the local Ollama server.
-3. **Context size** — token budget passed to the model during inference.
-4. **Ignored paths** — glob patterns for directories/files excluded from analysis.
-5. **Documentation directory** — location where generated documentation is written.
+Orchestrates the main execution flow:
 
-The resulting configuration is persisted as `.code-reducer.yaml` at `repoRoot`. This step is a prerequisite when `NeedsCredentialSetup()` returns `true`.
+1. **Credential gating** — calls `NeedsCredentialSetup()`. If no `MODEL_ID` environment variable is set, the function returns `true`, signaling that critical credentials are missing.
+2. **Lock acquisition** — acquires a repository-level lock to serialize concurrent invocations and prevent state corruption during setup or engine execution.
+3. **Configuration loading** — reads `.code-reducer.yaml` from the working directory. If the file is absent, triggers `RunSetupFlow()` instead of proceeding.
+4. **LLM engine invocation** — runs the model inference pipeline with live event streaming for real-time output consumption by the caller.
 
-### update
+### `NeedsCredentialSetup` (root.go)
 
-```go
-func init() { /* registers "update" subcommand with RootCmd */ } // update.go
-```
+Boolean predicate that evaluates the absence of a required environment variable (`MODEL_ID`). Returns `true` when credentials are unconfigured, causing `executeCommand` to redirect into setup mode rather than execution.
 
-Registers the `update` subcommand under `RootCmd` during package initialization. The cobra command is bound to its run function and becomes available at the top level alongside `init`, `setup`.
+## Interactive Configuration Flow
+
+### `RunSetupFlow` (setup.go)
+
+Guides the user through an interactive configuration session. Prompts for missing values and writes a `.code-reducer.yaml` file to disk. Upon completion, returns control to `executeCommand`, which re-acquires the lock and reloads configuration before proceeding with engine execution.

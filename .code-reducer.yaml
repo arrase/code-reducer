@@ -7,4 +7,5 @@ ignore:
   - .code-reducer.yaml
   - .code-reducer.lock
   - code-reducer
+  - go.sum
 docs_dir: wiki

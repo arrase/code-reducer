@@ -25,16 +25,16 @@ type Message struct {
 }
 
 type LLMClient struct {
-	ModelID  string
-	BaseURL  string
-	NumCtx   int
+	ModelID string
+	BaseURL string
+	NumCtx  int
 }
 
 func NewLLMClient(modelID, baseURL string, numCtx int) *LLMClient {
 	return &LLMClient{
-		ModelID:  modelID,
-		BaseURL:  baseURL,
-		NumCtx:   numCtx,
+		ModelID: modelID,
+		BaseURL: baseURL,
+		NumCtx:  numCtx,
 	}
 }
 
@@ -237,7 +237,7 @@ func buildTree(files []string) *DirNode {
 			root.Files = append(root.Files, f)
 			continue
 		}
-		
+
 		parts := strings.Split(d, string(filepath.Separator))
 		curr := root
 		currPath := ""
@@ -312,7 +312,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 		if len(contentStr) > 8000 {
 			contentStr = contentStr[:8000] + "\n...(truncated)..."
 		}
-		
+
 		logEvent("status", fmt.Sprintf("➜ Extracting file: %s", f))
 		userMsg := fmt.Sprintf("Analyze this file: %s\n\n```\n%s\n```\n\nOutput ONLY a Markdown list of exported functions, classes, and data structures with a 1-sentence technical description for each. No fluff.", f, contentStr)
 		facts, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("extract_file"), []Message{{Role: "user", Content: userMsg}}, false)
@@ -344,15 +344,15 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	return finalSum, nil
 }
 
-func (c *LLMClient) RunInitOrUpdate(ctx context.Context, command string, repoRoot string, userMessage string, onEvent func(Event)) error {
+func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, userMessage string, onEvent func(Event)) error {
 	logEvent := func(t, m string) {
 		if onEvent != nil {
 			onEvent(Event{Type: t, Message: m})
 		}
 	}
 
-	logEvent("status", "Starting Code-Reducer V3 Map-Reduce pipeline: "+command)
-	
+	logEvent("status", "Starting Code-Reducer V3 Map-Reduce pipeline: init")
+
 	_ = security.EnsureGitignoreHasLockfile(repoRoot)
 
 	logEvent("status", "Step 1: Code Discovery & Building Tree...")
@@ -393,6 +393,37 @@ func (c *LLMClient) RunInitOrUpdate(ctx context.Context, command string, repoRoo
 	qsDoc, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("architecture"), []Message{{Role: "user", Content: qsMsg}}, false)
 	if err == nil {
 		tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, "quickstart.md"), []byte(stripOuterMarkdownFence(qsDoc)))
+	}
+
+	logEvent("status", "Step 5: Updating AGENT.md...")
+	agentFilePath := "AGENT.md"
+	agentGuidelines := fmt.Sprintf(`# AI Agent Guidelines
+
+This repository contains automatically generated documentation under the %s directory to help AI coding agents understand the system architecture, design patterns, and module structure:
+
+- **System Blueprint**: Refer to %s/architecture.md for a high-level system overview, module relationships, and boundary definitions.
+- **Developer Quickstart**: Refer to %s/quickstart.md for onboarding steps, coding patterns, and configuration settings.
+- **Module Details**: Explore %s/modules/ for directory-level summaries and API descriptions of internal packages.
+
+Before making changes, analyze these files to align with existing design choices and code structures.
+`, docsDir, docsDir, docsDir, docsDir)
+
+	agentFileBytes, err := tools.ReadFileSafely(repoRoot, agentFilePath)
+	if err != nil {
+		// File does not exist or read failed, write new
+		_ = tools.WriteFileSafely(repoRoot, agentFilePath, []byte(agentGuidelines))
+	} else {
+		content := string(agentFileBytes)
+		if !strings.Contains(content, "AI Agent Guidelines") {
+			separator := "\n\n"
+			if strings.HasSuffix(content, "\n\n") {
+				separator = ""
+			} else if strings.HasSuffix(content, "\n") {
+				separator = "\n"
+			}
+			newContent := content + separator + agentGuidelines
+			_ = tools.WriteFileSafely(repoRoot, agentFilePath, []byte(newContent))
+		}
 	}
 
 	logEvent("status", "Pipeline completed successfully!")

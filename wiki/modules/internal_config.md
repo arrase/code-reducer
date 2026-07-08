@@ -1,95 +1,63 @@
 # internal/config — Configuration Management Module
 
-## Responsibility and Data Flow
+## Responsibility & Data Flow
 
-The `internal/config` package provides centralized configuration persistence for Code Reducer. It abstracts three concerns: **file-backed YAML schema**, **process-environment variable propagation**, and **runtime parameter resolution** (CLI flags → environment variables → host-derived defaults). All configuration is persisted to `.code-reducer.yaml` in the working directory with `0600` permissions; an optional SQLite database (`code-reducer.sqlite`) is referenced by name only.
+The `internal/config` module centralizes application configuration resolution. It abstracts three concerns: persistent config file I/O (`*.yaml`, 0600 mode), environment variable injection, and runtime parameter discovery (CLI flags → env vars → dynamic host resource scaling). The canonical data flow is **load → parse → apply → persist**, with explicit short-circuit semantics at each stage (silent skip on missing file for `LoadAndApplyConfig`; fixed return value for `GetDatabasePath`).
 
-Configuration loading follows a precedence chain: CLI flag overrides apply first, then environment variables are consulted per key, and finally host-derived values (e.g., total memory) scale defaults like Ollama context size. The `LoadAndApplyConfig` function ties the two storage backends together: it loads from disk and conditionally mirrors selected fields into the parent process's environment only when absent, avoiding clobbering user-specified env vars.
+## Configuration Schema & File I/O
 
----
+**`internal/config/env.go`**
 
-## Constants
+### Structs
 
-```go
-// Environment variable keys
-CodeReducerModelIdEnvKey   // Model identifier for Code Reducer
-OllamaBaseUrlEnvKey        // Ollama HTTP base URL
-OllamaNumCtxEnvKey         // Ollama context size (token count)
-LangsmithApiKeyEnvKey      // LangSmith API authentication token
-LangchainProjectEnvKey     // LangChain project name
-LangchainTracingEnvKey     // Enable/disable LangChain v2 tracing
+- **`Config`** — schema for `.code-reducer.yaml`. Holds model, Ollama, LangSmith, and LangChain configuration fields plus optional ignore lists and docs directory path.
 
-// Default values
-OllamaDefaultBaseURL       // Fallback HTTP endpoint when user does not set OLLAMA_BASE_URL
-OllamaDefaultNumCtx        // 8192 — applied when neither flag nor env var specifies a context limit
+### Functions
 
-// Filesystem identifiers
-ConfigFileName             // `.code-reducer.yaml` — on-disk configuration schema name
-```
+- **`ConfigExists(cwd string) bool`**  
+  Returns `true` if a `.code-reducer.yaml` file exists in the specified working directory.
 
----
+- **`LoadConfig(cwd string) (*Config, error)`**  
+  Reads and parses `.code-reducer.yaml` from the given directory into a `*Config` value.
 
-## Configuration Schema (`Config`)
+- **`SaveConfig(cwd string, cfg *Config) error`**  
+  Marshals the `Config` to YAML and writes it to `.code-reducer.yaml` with mode 0600 in the specified directory.
 
-```go
-type Config struct {
-    // Model and inference settings
-    ModelId         string   `yaml:"model_id"`
-    OllamaBaseUrl   string   `yaml:"ollama_base_url"`
-    OllamaNumCtx    int      `yaml:"ollama_num_ctx"`
-    
-    // LangChain integration
-    LangsmithApiKey  string `yaml:"langsmith_api_key"`
-    LangchainProject string `yaml:"langchain_project_name"`
-    LangchainTracing bool   `yaml:"langchain_tracing_enabled"`
-    
-    // Operational paths and filters
-    IgnoreList      []string `yaml:"ignore_list,omitempty"`
-    DocsDir         string   `yaml:"docs_directory"`
-}
-```
+- **`LoadAndApplyConfig(cwd string) error`**  
+  Loads config (silently ignoring missing files), then sets corresponding environment variables only when they are not already present from the parent process.
 
-The struct is flattened from a YAML document via standard unmarshalling; zero-valued fields are preserved as defaults during load.
+### Constants
 
----
+- **`ConfigFileName`** — `.code-reducer.yaml`. Persisted configuration filename.
 
-## File I/O Operations
+## Environment Variable Resolution
 
-### `ConfigExists(dir string) bool`
+The module defines explicit env keys and defaults for downstream consumers:
 
-Performs an OS stat check on `<dir>/.code-reducer.yaml`; returns `true` if the file is present and readable. Used by callers that need to gate configuration loading or detect first-run state without error handling overhead.
+| Constant | Purpose |
+|---|---|
+| `CodeReducerModelIdEnvKey` | Code Reducer model identifier |
+| `OllamaBaseUrlEnvKey` | Ollama base URL |
+| `OllamaNumCtxEnvKey` | Ollama context size |
+| `LangsmithApiKeyEnvKey` | LangSmith API key |
+| `LangchainProjectEnvKey` | LangChain project name |
+| `LangchainTracingEnvKey` | LangChain tracing v2 enable/disable |
 
-### `LoadConfig(dir string) (cfg Config, err error)`
+### Defaults
 
-Reads `.code-reducer.yaml` from `dir`, parses via YAML unmarshaler, and returns the populated struct or an error if the file is missing/malformed. This is the primary entry point for deserialization.
+- **`OllamaDefaultBaseURL`** — `http://localhost:11434`. Default Ollama base URL.
+- **`OllamaDefaultNumCtx`** — 8192 tokens. Default Ollama context size.
 
-### `SaveConfig(cfg Config) error`
+## Database Path Resolution
 
-Marshals a `Config` to YAML using standard encoder settings and writes to `<working-dir>/.code-reducer.yaml`. File permissions are explicitly set to `0600` via `os.FileMode(0600)` after write; no other process can read the file.
+### Functions
 
-### `LoadAndApplyConfig() error`
+- **`GetDatabasePath() (string, error)`**  
+  Returns the fixed database file path `code-reducer.sqlite` with no error.
 
-Composite operation:
-1. Calls `LoadConfig(os.Getwd())` to populate a `Config`.
-2. Iterates over the subset of fields that have corresponding environment keys (`ModelId`, `OllamaBaseUrl`, `OllamaNumCtx`, `LangsmithApiKey`, `LangchainProject`, `LangchainTracing`).
-3. For each field, reads the matching `os.Getenv(key)` value; if non-empty and the process env does not already contain it, writes the value via `os.Setenv`.
+## Ollama Context Size Resolution
 
-This ensures disk state is authoritative while allowing users to override individual settings through environment variables without losing them on next load.
+### Functions
 
----
-
-## Runtime Parameter Resolution
-
-### `GetOllamaContextSize(flags []string) (int, error)`
-
-Determines Ollama context size by consulting the following precedence chain:
-
-1. **CLI flag** — scans provided flags for `-num-ctx` / `--num-ctx`; if found, returns that value.
-2. **Environment variable** — reads `OllamaNumCtxEnvKey`; if non-empty and valid integer, returns it.
-3. **Host-derived scaling** — falls back to a dynamic calculation based on the host's total memory; scales context size proportionally so larger machines receive higher token budgets without explicit user configuration.
-
-Returns the resolved count or an error if no source yields a usable value.
-
-### `GetDatabasePath() (string, error)`
-
-Returns the canonical SQLite database filename (`code-reducer.sqlite`) relative to the working directory. This is intended for callers that need only the filename; no filesystem access occurs and no error path exists.
+- **`GetOllamaContextSize(flagVal string) int`**  
+  Resolves the Ollama context size by checking a CLI flag first, then an environment variable, then dynamically scaling based on host RAM.

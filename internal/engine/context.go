@@ -17,11 +17,11 @@ const (
 
 // Document represents a file's content and its term frequency statistics.
 type Document struct {
-	Path           string
-	Content        string
-	Tokens         []string
-	TermFreqs      map[string]int
-	TokenCount     int
+	Path       string
+	Content    string
+	Tokens     []string
+	TermFreqs  map[string]int
+	TokenCount int
 }
 
 // Tokenize splits a string into lowercase alphanumeric tokens.
@@ -72,10 +72,10 @@ func FilterFilesBM25(repoRoot string, files []string, query string, topK int) ([
 		}
 
 		docs = append(docs, Document{
-			Path:      file,
-			Content:   content,
-			Tokens:    tokens,
-			TermFreqs: termFreqs,
+			Path:       file,
+			Content:    content,
+			Tokens:     tokens,
+			TermFreqs:  termFreqs,
 			TokenCount: len(tokens),
 		})
 		totalDocLength += len(tokens)
@@ -93,7 +93,7 @@ func FilterFilesBM25(repoRoot string, files []string, query string, topK int) ([
 	for _, term := range queryTokens {
 		df := float64(docFreqs[term])
 		// Smoothed IDF
-		idf := math.Log((N - df + 0.5) / (df + 0.5) + 1.0)
+		idf := math.Log((N-df+0.5)/(df+0.5) + 1.0)
 		if idf < 0 {
 			idf = 0.0001 // Prevent negative idf
 		}

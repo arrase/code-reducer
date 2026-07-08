@@ -14,7 +14,7 @@ var initCmd = &cobra.Command{
 		if len(args) > 0 {
 			userMessage = args[0]
 		}
-		executeCommand("init", userMessage)
+		executeCommand(userMessage)
 	},
 }
 

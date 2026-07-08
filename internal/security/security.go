@@ -84,7 +84,7 @@ func AcquireLock(repoRoot string, exclusive bool) (*flock.Flock, error) {
 // EnsureGitignoreHasLockfile ensures that the lockfile .code-reducer.lock is in the .gitignore.
 func EnsureGitignoreHasLockfile(repoRoot string) error {
 	gitignorePath := filepath.Join(repoRoot, ".gitignore")
-	
+
 	// If .gitignore doesn't exist, create it with the lockfile
 	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
 		return os.WriteFile(gitignorePath, []byte(LockFileName+"\n"), 0644)

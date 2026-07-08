@@ -1,148 +1,111 @@
-# Code Retrieval Engine — Architecture Documentation
+# internal/engine — Module Documentation
 
-## Module Responsibility & Data Flow
+## Module Responsibility
 
-This module orchestrates a code-retrieval pipeline: ingests repository files, ranks them by BM25 relevance to user queries, wraps selected context in XML-delimited containers for injection safety, serializes the request into an LLM call via an Ollama-compatible client, and deserializes the resulting JSON response.
-
-**Data Flow:** `Query String` → `FilterFilesBM25` (rank files) → `WrapInXmlDelimiter` (sanitize content) + `AutoScaleContext` (cap context length) → `LLMClient` (serialize request via `Message`) → LLM API → `CleanJSONResponse` / `UnmarshalJSONResponse` (deserialize response).
+The `internal/engine` package implements the orchestration layer for LLM-driven code analysis workflows. It manages document ingestion, BM25-based file ranking, directory tree construction, system prompt retrieval, recursive chunk batching with markdown fence stripping, Ollama API client configuration, and JSON response parsing. Data flows from raw repository contents through tokenization → BM25 scoring → XML-wrapped context → LLM calls → parsed responses.
 
 ---
 
-## 1. Core Data Structures & Configuration (`engine.go`)
+## Document Processing & BM25 Ranking
 
-### Message
+### `Document` (context.go)
 
-```
-type Message struct {
-    Role    string
-    Content string
-}
-```
+Represents a file's content with term frequency statistics pre-computed for BM25 indexing:
 
-Represents a single turn in an LLM conversation with JSON-serializable `Role` and `Content` fields. Used to construct the prompt payload sent to the model via `LLMClient`.
-
-### LLMClient
-
-```
-type LLMClient struct {
-    ModelID  string
-    BaseURL  string
-    NumCtx   int
-}
-```
-
-Holds Ollama-compatible API credentials: target model identifier, base URL for the inference endpoint, and maximum context window size. Constructed via `NewLLMClient(modelID, baseURL, numCtx)`.
-
-### Event
-
-```
-type Event struct {
-    Type    string
-    Message *Message
-}
-```
-
-Carries an event type label and optional payload message. Used to route internal processing events (e.g., completion signals, error flags).
-
-### DirNode
-
-```
-type DirNode struct {
-    Path      string
-    Files     []string
-    Children  []*DirNode
-}
-```
-
-Recursive directory tree node representing the repository layout: `Path` stores the absolute path, `Files` holds a list of files at this level (with relative paths), and `Children` contains nested `DirNode` slices for subdirectories. Used to represent file system structure consumed by BM25 retrieval.
-
----
-
-## 2. Context Processing Pipeline (`context.go`)
-
-### Document
-
-```
+```go
 type Document struct {
     Content       string
-    Tokens        []string
     TermFrequency map[string]int
-    TokenCount    int64
 }
 ```
 
-Encapsulates a parsed file's content along with its token list, term frequency table (for BM25 IDF computation), and total token count. Used as the internal representation for ranking and context window management.
+### `Tokenize` (context.go)
 
-### EstimateTokens
+Splits raw input text into lowercase alphanumeric tokens via regex matching. Produces the token stream consumed by subsequent frequency calculation and BM25 scoring stages.
 
-Approximates the token count from raw character length assuming a 4-character-per-token heuristic:
+### `EstimateTokens` (context.go)
 
-```go
-TokenCount = int64(len(content)) / 4
-```
+Approximates token count from character length under the assumption that one token ≈ 4 characters. Used for context size budgeting before LLM invocation.
 
-Used to pre-estimate budget before actual tokenization, avoiding unnecessary work on large files during ranking.
+### `FilterFilesBM25` (context.go)
 
-### Tokenize
-
-Splits input text into lowercase alphanumeric tokens using regex matching (`[a-z0-9]+`). Produces the `Tokens` slice and populates `TermFrequency`. Used by BM25 scoring to compute term frequencies per document.
-
-### FilterFilesBM25
-
-Ranks repository files by BM25 relevance score against a query string and returns the top-K file paths:
-
-```
-Score = (tf(t,d) * IDF(t)) / (dl + b * avgdl)
-```
-
-Returns `[]string` of ranked file paths. Drives the retrieval step that selects which files to include in the LLM prompt.
-
-### WrapInXmlDelimiter
-
-Wraps selected file content in strict XML-like tags with the file path embedded:
-
-```xml
-<file path="src/main.go">
-...content...
-</file>
-```
-
-Prevents prompt injection by constraining user-controlled content within deterministic delimiters and embedding provenance metadata.
-
-### AutoScaleContext
-
-Caps the maximum context size passed to an LLM, returning a safe default of **8192** when input is non-positive:
-
-```go
-if cap <= 0 { return 8192 }
-return cap
-```
-
-Applied after concatenating wrapped file contexts and user query to ensure total prompt length does not exceed the model's context window.
+Ranks repository files by relevance to a query string using the BM25 ranking algorithm; returns top-K results ordered by descending BM25 score. Input: raw file paths + corpus content. Output: ranked slice of `Document`.
 
 ---
 
-## 3. LLM Response Handling (`json_parser.go`)
+## LLM Client Management
 
-### CleanJSONResponse
+### `LLMClient` (engine.go)
 
-Extracts raw JSON content from a model response by stripping markdown code fences (`` ` ``` ``) and trimming outer delimiters:
+Holds configuration parameters required to connect to the Ollama API: model ID, base URL, context size limit. Serves as the transport layer singleton for all subsequent inference calls.
 
-```
-response = regexReplace(response, "```", "")
-response = trim(response)
-```
+### `NewLLMClient` (engine.go)
 
-Handles common LLM output patterns where models wrap responses in markdown-formatted code blocks.
+Factory constructor initializing and returning a new `*LLMClient` instance with provided settings. Called once per engine lifecycle to establish the client handle.
 
-### UnmarshalJSONResponse
+---
 
-Cleans a raw string response using `CleanJSONResponse` and deserializes the resulting JSON into a provided target interface:
+## Directory Tree Construction
+
+### `DirNode` (engine.go)
+
+Models a hierarchical directory tree node containing direct file paths, child subdirectory references:
 
 ```go
-var result interface{}
-json.Unmarshal(cleaned, &result)
-return result.(T)  // T = concrete type from caller
+type DirNode struct {
+    Files        []string
+    Subdirectories *DirNode
+}
 ```
 
-Type-asserts the deserialized value to the expected concrete type. Caller must supply a pointer of the correct struct; misuse panics on assertion failure.
+### `buildTree` (engine.go)
+
+Constructs a hierarchical directory tree from a list of file paths rooted at `"."`. Recursively partitions paths into parent directories and leaves. Used to structure context before chunked LLM synthesis.
+
+---
+
+## System Prompt Handling
+
+### `GetDefaultSystemPrompt` (engine.go)
+
+Returns task-specific system prompts for three workflow phases: file analysis, module synthesis, and architecture tasks. Selects the prompt based on current engine phase state.
+
+### `LoadSystemPrompt` (engine.go)
+
+Retrieves a default system prompt string with error handling; currently always returns successfully. Used as fallback when no task-specific prompt matches.
+
+---
+
+## Recursive Chunk Batching & Markdown Fence Stripping
+
+### `stripOuterMarkdownFence` (engine.go)
+
+Extracts content between triple-backtick markdown fences or JSON fences using regex matching. Strips surrounding markdown wrapper from raw LLM responses before further processing.
+
+### `reduceInChunks` (engine.go)
+
+Synthesizes architecture documentation by recursively batching items into LLM calls with markdown fence stripping applied post-response. Input: directory tree + accumulated results. Output: synthesized markdown document.
+
+---
+
+## Context Safety & Auto-scaling
+
+### `WrapInXmlDelimiter` (context.go)
+
+Wraps file content in XML-like delimiters tagged with the file path to prevent prompt injection attacks. Each wrapped entry is prefixed/suffixed with `<file path>` markers for safe LLM consumption.
+
+### `AutoScaleContext` (context.go)
+
+Caps context size at a safe default of 8192 when the provided maximum is non-positive; otherwise returns input unchanged. Guards against oversized context submissions to the LLM provider.
+
+---
+
+## Response Parsing Utilities
+
+### `CleanJSONResponse(response string) string` (json_parser.go)
+
+Extracts JSON content from markdown code fences, optionally trimming surrounding whitespace and text before or after the first opening brace/bracket to last closing brace/bracket. Handles raw Ollama responses that may embed JSON within markdown blocks.
+
+### `UnmarshalJSONResponse(rawResponse string, target interface{}) error` (json_parser.go)
+
+Pipelines response cleanup through `CleanJSONResponse`, then unmarshals the resulting JSON string into the provided `target` value via `encoding/json.Unmarshal`. Used to deserialize LLM-returned structured data into typed Go objects.

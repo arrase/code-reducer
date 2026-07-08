@@ -32,7 +32,7 @@ func init() {
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
 }
 
-func executeCommand(command string, userMessage string) {
+func executeCommand(userMessage string) {
 	repoRoot, err := os.Getwd()
 	if err != nil {
 		fmt.Printf("Error getting current working directory: %v\n", err)
@@ -74,7 +74,6 @@ func executeCommand(command string, userMessage string) {
 		}
 	}
 
-
 	// Acquire exclusive repository lock
 	lock, err := security.AcquireLock(repoRoot, true)
 	if err != nil {
@@ -92,7 +91,7 @@ func executeCommand(command string, userMessage string) {
 
 	client := engine.NewLLMClient(modelId, baseURL, numCtx)
 
-	err = client.RunInitOrUpdate(ctx, command, repoRoot, userMessage, func(ev engine.Event) {
+	err = client.RunInit(ctx, repoRoot, userMessage, func(ev engine.Event) {
 		if ev.Type == "status" {
 			fmt.Println(ev.Message)
 		} else if ev.Type == "error" {
