@@ -18,48 +18,18 @@ import (
 var (
 	modelIdFlag string
 	numCtxFlag  string
-	printFlag   bool
-	initFlag    bool
-	updateFlag  bool
 )
 
 var RootCmd = &cobra.Command{
-	Use:   "code-reducer [message]",
-	Short: "Code-Reducer is a documentation agent that writes and maintains a project wiki.",
-	Long:  `A pure Go port of Code-Reducer CLI, optimized for performance and local LLM execution.`,
-	Args:  cobra.MaximumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		repoRoot, err := os.Getwd()
-		if err != nil {
-			fmt.Printf("Error getting current working directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Load existing configuration if any
-		_ = config.LoadAndApplyConfig(repoRoot)
-
-		userMessage := ""
-		if len(args) > 0 {
-			userMessage = args[0]
-		}
-
-		// Determine command mode
-		commandMode := "update"
-		if initFlag {
-			commandMode = "init"
-		}
-
-		executeCommand(commandMode, userMessage)
-	},
+	Use:               "code-reducer",
+	Short:             "Code-Reducer is a documentation agent that writes and maintains a project wiki.",
+	Long:              `A pure Go port of Code-Reducer CLI, optimized for performance and local LLM execution.`,
+	CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 }
 
 func init() {
 	RootCmd.PersistentFlags().StringVar(&modelIdFlag, "model-id", "", "Specify LLM model ID")
-	RootCmd.PersistentFlags().StringVar(&modelIdFlag, "modelId", "", "Specify LLM model ID (alias)")
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
-	RootCmd.PersistentFlags().BoolVarP(&printFlag, "print", "p", false, "Run once and print the final assistant output (non-interactive)")
-	RootCmd.PersistentFlags().BoolVar(&initFlag, "init", false, "Initialize project documentation")
-	RootCmd.PersistentFlags().BoolVar(&updateFlag, "update", false, "Update existing project documentation")
 }
 
 func executeCommand(command string, userMessage string) {
