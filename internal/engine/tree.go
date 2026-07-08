@@ -15,52 +15,7 @@ type FileChange struct {
 }
 
 func isAllowedFile(repoRoot, relPath string, ignores []string) bool {
-	if tools.ShouldIgnorePath(relPath, ignores) {
-		return false
-	}
-
-	components := strings.Split(relPath, string(filepath.Separator))
-	ignoredDirs := map[string]bool{
-		".git":             true,
-		"node_modules":     true,
-		"dist":             true,
-		"build":            true,
-		"cache":            true,
-		"code-reducer":     true,
-		".gemini":          true,
-		"bower_components": true,
-		"__pycache__":      true,
-		".pytest_cache":    true,
-		".mypy_cache":      true,
-		".tox":             true,
-		"venv":             true,
-		".venv":            true,
-	}
-	for _, comp := range components {
-		if ignoredDirs[comp] || strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".egg-info") {
-			return false
-		}
-	}
-
-	name := filepath.Base(relPath)
-	ext := strings.ToLower(filepath.Ext(name))
-	if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".pdf" ||
-		ext == ".exe" || ext == ".dll" || ext == ".so" || ext == ".o" || ext == ".a" ||
-		ext == ".zip" || ext == ".gz" || ext == ".tar" || ext == ".lock" || ext == ".pyc" ||
-		ext == ".pyo" || ext == ".pyd" || tools.NameSuffixIgnored(name) {
-		return false
-	}
-
-	absPath, err := security.SafeResolve(repoRoot, relPath)
-	if err != nil {
-		return false
-	}
-
-	if tools.IsBinaryFile(absPath) {
-		return false
-	}
-
-	return true
+	return !tools.ShouldIgnoreFile(repoRoot, relPath, ignores)
 }
 
 func propagateAffected(node *DirNode, affectedDirs map[string]bool) bool {

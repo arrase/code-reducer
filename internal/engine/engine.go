@@ -188,7 +188,12 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 
 	logEvent("status", "Step 1: Code Discovery & Building Tree...")
 	docsDir := cfg.DocsDir
+	gitignorePatterns, err := tools.LoadGitignore(repoRoot)
+	if err != nil {
+		logEvent("status", fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
+	}
 	ignores := append(cfg.Ignore, docsDir)
+	ignores = append(ignores, gitignorePatterns...)
 
 	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
 	if err != nil {
@@ -299,7 +304,12 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	logEvent("status", "Starting Map-Reduce pipeline: update")
 
 	docsDir := cfg.DocsDir
+	gitignorePatterns, err := tools.LoadGitignore(repoRoot)
+	if err != nil {
+		logEvent("status", fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
+	}
 	ignores := append(cfg.Ignore, docsDir)
+	ignores = append(ignores, gitignorePatterns...)
 
 	// 1. Load existing cache
 	cache, err := loadMetadataCache(repoRoot, docsDir)

@@ -196,8 +196,8 @@ When writing documentation files to the filesystem:
 ### 3. File Discovery, Binary, and Ignore Filters
 
 Repository scanning is executed using `filepath.WalkDir` coupled with multiple layers of evaluation:
-1. **Pruning Subtrees**: Common dependency, cache, and build directories (`.git`, `node_modules`, `bower_components`, `dist`, `build`, `cache`, `__pycache__`, `venv`, `.venv`, and directory names ending in `.egg-info`) are skipped using `filepath.SkipDir` at the walk root, saving CPU cycles.
-2. **Ignore Matching Rules**: Ignores specified in the YAML configuration are resolved with `ShouldIgnorePath`. This evaluates four matching schemes:
+1. **Pruning Subtrees**: Common default dependency, cache, and build directories (`.git`, `node_modules`, `bower_components`, `dist`, `build`, `cache`, `__pycache__`, `venv`, `.venv`, and directory names ending in `.egg-info`) are skipped using `filepath.SkipDir` at the walk root, saving CPU cycles.
+2. **Ignore Matching Rules**: Ignores loaded from the project's `.gitignore` and specified in the YAML configuration are merged and resolved with `ShouldIgnorePath`. This evaluates four matching schemes:
    * **Exact Match**: The relative cleaned path matches the ignore pattern.
    * **Prefix Match**: The path resides within a subdirectory matching the ignore pattern.
    * **Component-Level Match**: A folder name anywhere in the path matches the pattern.

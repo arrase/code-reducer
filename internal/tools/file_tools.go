@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -76,27 +77,101 @@ func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
 	return nil
 }
 
+var DefaultIgnoredDirs = map[string]bool{
+	".git":             true,
+	"node_modules":     true,
+	"dist":             true,
+	"build":            true,
+	"cache":            true,
+	"code-reducer":     true,
+	".gemini":          true,
+	"bower_components": true,
+	"__pycache__":      true,
+	".pytest_cache":    true,
+	".mypy_cache":      true,
+	".tox":             true,
+	"venv":             true,
+	".venv":            true,
+}
+
+var DefaultIgnoredExtensions = map[string]bool{
+	".png":  true,
+	".jpg":  true,
+	".jpeg": true,
+	".gif":  true,
+	".pdf":  true,
+	".exe":  true,
+	".dll":  true,
+	".so":   true,
+	".o":    true,
+	".a":    true,
+	".zip":  true,
+	".gz":   true,
+	".tar":  true,
+	".lock": true,
+	".pyc":  true,
+	".pyo":  true,
+	".pyd":  true,
+}
+
+// LoadGitignore reads the .gitignore file from repoRoot and returns its active ignore patterns.
+func LoadGitignore(repoRoot string) ([]string, error) {
+	gitignorePath := filepath.Join(repoRoot, ".gitignore")
+	file, err := os.Open(gitignorePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // No .gitignore file is not an error
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var patterns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, line)
+	}
+	return patterns, scanner.Err()
+}
+
+// ShouldIgnoreFile checks if a file (specified by relative path) is ignored.
+func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string) bool {
+	// 1. Check user-defined ignores (config + gitignore)
+	if ShouldIgnorePath(relPath, customIgnores) {
+		return true
+	}
+
+	// 2. Check path components for default ignored directories and dot-prefixed items
+	components := strings.Split(relPath, string(filepath.Separator))
+	for _, comp := range components {
+		if DefaultIgnoredDirs[comp] || strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".egg-info") {
+			return true
+		}
+	}
+
+	// 3. Check filename extensions & suffixes
+	name := filepath.Base(relPath)
+	ext := strings.ToLower(filepath.Ext(name))
+	if DefaultIgnoredExtensions[ext] || NameSuffixIgnored(name) {
+		return true
+	}
+
+	// 4. Check if it's a binary file
+	absPath, err := security.SafeResolve(repoRoot, relPath)
+	if err != nil {
+		return true // Treat unsafe paths outside repo root as ignored
+	}
+	return IsBinaryFile(absPath)
+}
+
 // DiscoverCodeFiles recursively walks the codebase to find high-signal source files.
 // It ignores build, dependency, and output files, as well as any paths in the custom ignores list.
 func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 	var files []string
-	ignoredDirs := map[string]bool{
-		".git":             true,
-		"node_modules":     true,
-		"dist":             true,
-		"build":            true,
-		"cache":            true,
-		"code-reducer":     true,
-		".gemini":          true,
-		"bower_components": true,
-		"__pycache__":      true,
-		".pytest_cache":    true,
-		".mypy_cache":      true,
-		".tox":             true,
-		"venv":             true,
-		".venv":            true,
-	}
-
 	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // Skip items with errors
@@ -111,32 +186,15 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 			return nil
 		}
 
-		if ShouldIgnorePath(rel, ignores) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
 		if d.IsDir() {
 			name := d.Name()
-			if ignoredDirs[name] || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") {
+			if DefaultIgnoredDirs[name] || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || ShouldIgnorePath(rel, ignores) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		// Ignore binary/build/lock files
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".pdf" ||
-			ext == ".exe" || ext == ".dll" || ext == ".so" || ext == ".o" || ext == ".a" ||
-			ext == ".zip" || ext == ".gz" || ext == ".tar" || ext == ".lock" || ext == ".pyc" ||
-			ext == ".pyo" || ext == ".pyd" || NameSuffixIgnored(d.Name()) {
-			return nil
-		}
-
-		// Extra safety: Check if it's a binary file using null-byte detection
-		if IsBinaryFile(path) {
+		if ShouldIgnoreFile(repoRoot, rel, ignores) {
 			return nil
 		}
 
