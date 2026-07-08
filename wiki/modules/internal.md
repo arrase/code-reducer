@@ -1,249 +1,224 @@
-# `internal/engine` — Orchestration Layer
-
-**Responsibility:** Manages document ingestion, BM25-based file ranking, directory tree construction, system prompt retrieval, recursive chunk batching, Ollama API client configuration, and JSON response parsing for LLM-driven code analysis workflows.
-
-**Data Flow:** Raw repository contents → tokenization → frequency computation → BM25 scoring → XML-wrapped context assembly → LLM invocation via `LLMClient` → markdown fence stripping → `reduceInChunks` synthesis → parsed responses.
+# Internal Modules — Architecture & Specification
 
 ---
 
-## Document Processing & Ranking (`context.go`)
+## Subsystem: security (`security.go`)
 
-### `Document` (struct)
-File content representation with pre-computed term frequency statistics for BM25 indexing:
+**Responsibility:** Enforces sandbox isolation, concurrency safety, and version-control hygiene for repository operations. All functions operate relative to the canonical `repoRoot`, establishing a consistent security perimeter around filesystem I/O and lock management.
+
+### Path Traversal Protection — `SafeResolve`
 
 ```go
-type Document struct {
-    Content       string
-    TermFrequency map[string]int
-}
+func SafeResolve(repoRoot, inputPath string) (string, error)
 ```
 
-### `Tokenize(input string) []string`
-Splits raw input text into lowercase alphanumeric tokens via regex. Produces the token stream consumed by subsequent frequency calculation and BM25 scoring stages.
+Validates that an external `inputPath` resolves strictly within the repository boundary defined by `repoRoot`. Rejects absolute paths, relative traversals via `..`, and symlink targets pointing outside the repo. Returns a normalized absolute path on success or a sentinel error on failure. Acts as the mandatory entry point for all filesystem I/O operations to prevent escape vectors.
 
-### `EstimateTokens(text string) int`
-Approximates token count from character length under the assumption that one token ≈ 4 characters. Used for context size budgeting before LLM invocation.
-
-### `FilterFilesBM25(query string, files []Document) []Document`
-Ranks repository files by relevance to a query using BM25; returns top-K results ordered by descending score. Input: raw file paths + corpus content. Output: ranked slice of `Document`.
-
----
-
-## Directory Tree Construction (`engine.go`)
-
-### `DirNode` (struct)
-Hierarchical directory tree node containing direct file paths and child subdirectory references:
+### Concurrency Control — `AcquireLock`
 
 ```go
-type DirNode struct {
-    Files            []string
-    Subdirectories   *DirNode
-}
+func AcquireLock(repoRoot string, exclusive bool) (*flock.Flock, error)
 ```
 
-### `buildTree(filePaths []string) *DirNode`
-Constructs a hierarchical directory tree from a list of file paths rooted at `"."`. Recursively partitions paths into parent directories and leaves. Used to structure context before chunked LLM synthesis.
+Acquires a POSIX advisory file lock using `syscall.Flock`. Accepts an `exclusive bool` flag selecting between exclusive (write-serialize) and shared (read-multiple-writer) modes. Detects and rejects TOCTOU symlink races on the lockfile itself before acquiring, ensuring the target inode has not been swapped post-resolution. Returns a `*flock.Flock` handle that must be released by the caller to prevent resource leaks.
 
----
-
-## System Prompt Handling (`engine.go`)
-
-### `GetDefaultSystemPrompt(phase string) (string, error)`
-Returns task-specific system prompts for three workflow phases: file analysis, module synthesis, and architecture tasks. Selects the prompt based on current engine phase state.
-
-### `LoadSystemPrompt() (string, error)`
-Retrieves a default system prompt with error handling; always returns successfully under normal operation. Fallback when no task-specific prompt matches.
-
----
-
-## LLM Client Management (`engine.go`)
-
-### `LLMClient` (struct)
-Holds configuration parameters required to connect to the Ollama API: model ID, base URL, context size limit. Serves as the transport layer singleton for all subsequent inference calls.
+### Version Control Hygiene — `EnsureGitignoreHasLockfile` & Constants
 
 ```go
-type LLMClient struct {
-    ModelID     string
-    BaseURL     string
-    NumCtx      int
-}
-```
-
-### `NewLLMClient(modelID, baseURL string, numCtx int) (*LLMClient, error)`
-Factory constructor initializing and returning a new `*LLMClient` instance with provided settings. Called once per engine lifecycle to establish the client handle.
-
----
-
-## Recursive Chunk Batching & Markdown Fence Stripping (`engine.go`)
-
-### `stripOuterMarkdownFence(response string) string`
-Extracts content between triple-backtick markdown fences or JSON fences using regex matching. Strips surrounding markdown wrapper from raw LLM responses before further processing.
-
-### `reduceInChunks(dirTree *DirNode, accumulated []byte) (string, error)`
-Synthesizes architecture documentation by recursively batching items into LLM calls with markdown fence stripping applied post-response. Input: directory tree + accumulated results. Output: synthesized markdown document.
-
----
-
-## Context Safety & Auto-scaling (`context.go`)
-
-### `WrapInXmlDelimiter(content, filePath string) string`
-Wraps file content in XML-like delimiters tagged with the file path to prevent prompt injection attacks. Each wrapped entry is prefixed/suffixed with `<file>` markers for safe LLM consumption:
-
-```go
-// <file>path/to/file.go</file>\n<content>\n...raw bytes...\n</content>
-```
-
-### `AutoScaleContext(maximum int) int`
-Caps context size at a safe default of 8192 when the provided maximum is non-positive; otherwise returns input unchanged. Guards against oversized context submissions to the LLM provider.
-
----
-
-## Response Parsing Utilities (`json_parser.go`)
-
-### `CleanJSONResponse(response string) string`
-Extracts JSON content from markdown code fences, optionally trimming surrounding whitespace and text before or after the first opening brace/bracket to last closing brace/bracket. Handles raw Ollama responses that may embed JSON within markdown blocks:
-
-```go
-// Input:  ```json\n{"key":"value"}\n```
-// Output: {"key":"value"}
-```
-
-### `UnmarshalJSONResponse(rawResponse string, target interface{}) error`
-Pipelines response cleanup through `CleanJSONResponse`, then unmarshals the resulting JSON string into the provided `target` value via `encoding/json.Unmarshal`. Used to deserialize LLM-returned structured data into typed Go objects.
-
----
-
-# `internal/tools` — Low-level Repository Operations
-
-**Responsibility:** Provides low-level utility primitives for repository-aware operations: safe file I/O, git command execution, source-file discovery, and cryptographic hashing of resolved paths. All functions operate against an absolute repository root that is resolved once per operation to prevent path-traversal vulnerabilities. Data flows consistently from a caller-supplied string through `filepath.Abs` resolution into the security layer before any filesystem or git interaction occurs.
-
----
-
-## Filesystem Operations (`file_tools.go`)
-
-### Safe Read / Write Interface
-
-| Function | Direction | Responsibility |
-|---|---|---|
-| **ReadFileSafely(path)** | Inbound | Resolves an absolute path via the security layer, then reads the repository-relative file and returns its byte content. |
-| **WriteFileSafely(relPath string, content []byte) error** | Outbound | Accepts bytes + a repository-relative path, creates parent directories as needed, verifies the target is not a symlink before writing, and persists the data. |
-
-Both functions delegate to the security layer for absolute-path resolution. `WriteFileSafely` additionally enforces a symlink check on the target before any write operation to prevent privilege escalation through symlink injection.
-
-### Source-File Discovery (`DiscoverCodeFiles(root string) ([]string, error)`)
-Recursively walks the repository root, collecting relative paths of source files while excluding: build artifacts (compiled binaries, object files), binary files detected via null-byte scanning, dependency directories (vendor, node_modules, etc.), and user-configured ignore patterns. The walk is bounded to the repository root. Each discovered candidate passes through `IsBinaryFile` before inclusion. Returns paths relative to `root`.
-
-### Binary Detection (`IsBinaryFile(path string) (bool, error)`)
-Reads a file and inspects its first 1024 bytes for null byte presence. If any null byte is found, returns `true`, classifying the file as binary rather than text source material. O(1) disk-read cost regardless of file size.
-
----
-
-## Git Operations (`git_tools.go`)
-
-### Generic Git Execution (`RunGit(root string, args ...string) (string, error)`)
-Executes an arbitrary git subcommand within a specified repository root directory and returns the combined stdout/stderr output. Handles both success and failure cases without panicking on non-zero exit codes. The caller is responsible for interpreting return values.
-
-### `GetGitHead(root string) (string, error)`
-Delegates to `RunGit` with the subcommand `rev-parse HEAD`, returning the current HEAD commit hash. Operates against a resolved absolute path.
-
----
-
-## Path Hashing (`registry.go`)
-
-### `HashRepoRoot(path string) (string, error)`
-Returns a SHA-256 hex-encoded hash of the resolved absolute path passed as argument. If `filepath.Abs` fails during resolution, falls back to returning the raw input string unchanged. Used for deterministic identification of repository states across operations that require a content-addressable key derived from the root location.
-
----
-
-# `security` — Repository Isolation & Concurrency Control
-
-**Responsibility:** Enforces repository isolation, process-level concurrency control, and VCS hygiene for the code-reducer runtime environment. Manages three critical subsystems: path resolution integrity, file-based locking for concurrent analyzer invocations, and lockfile exclusion from Git tracking. Data flow proceeds as follows: user-supplied paths are sanitized via **path safety** primitives before any filesystem operation; concurrent access is governed by a `flock.Flock` handle acquired with PID registration to prevent overlapping reduction runs; finally, repository state is preserved by ensuring the lockfile remains untracked in `.gitignore`.
-
----
-
-## Constants
-
-### `LockFileName`
-Defines the absolute path for the process coordination file stored at the repository root:
-
-```go
+func EnsureGitignoreHasLockfile(repoRoot string) error
 const LockFileName = ".code-reducer.lock"
 ```
 
-Serves as the anchor point for both flock acquisition and git exclusion logic.
+`LockFileName` defines the canonical path for the process-level lockfile used consistently across all functions in this module.
+
+`EnsureGitignoreHasLockfile` ensures `.gitignore` contains an entry for `LockFileName`. If `.gitignore` is missing, it creates one with the lockfile entry; if existing, appends the entry to prevent duplicate tracking or corruption of git state. Prevents accidental modification of the lockfile via `git` operations while preserving repository integrity.
 
 ---
 
-## Path Safety (`SafeResolve(repoRoot, inputPath string) (string, error)`)
-Validates and sanitizes user-supplied paths to ensure they resolve strictly within the repository boundary. Prevents symlink attacks and path traversal attempts by resolving relative components against `repoRoot` and rejecting any target that escapes the root directory or references dangling symlinks. Returns the canonical absolute path within the repo on success, or an error if resolution fails.
+## Subsystem: tools (`internal/tools`)
+
+**Responsibility:** Encapsulates low-level primitives for filesystem I/O, repository traversal, Git interaction, and deterministic content hashing. Sits between the application layer and OS/subprocess abstractions, shielding consumers from path resolution failures, symlink race conditions, build artifact noise, and non-deterministic subprocess behavior. Data flows originate at either a virtual file system path or a repository root string; both converge on byte-level operations (read/write/hash) before being consumed by higher-order tooling modules.
+
+### File I/O & Classification
+
+#### `ReadFileSafely`
+
+```go
+func ReadFileSafely(path string) ([]byte, error)
+```
+
+Resolves a virtual path through the embedded filesystem abstraction and reads underlying content into memory. Returns raw bytes (`[]byte`) or an error upon resolution failure (missing parent directory, permission denial) or read failure (I/O error, truncated stream). **Contract:** nil on success is not permitted—zero-length files return an empty slice with `nil` error.
+
+#### `WriteFileSafely`
+
+```go
+func WriteFileSafely(path string, content []byte) error
+```
+
+Writes content to a virtual path using a TOCTOU-safe pattern designed to detect and reject symlink targets before truncation. Performs a stat call equivalent to the target inode immediately prior to opening for write; if the target is not a regular file (i.e., a symlink or directory), the operation aborts with an error, preventing `os.SYMLINK` race conditions where a dangling symlink could cause data loss on truncation. **Contract:** Error if the target is not a regular file or permission denied; otherwise writes `content` atomically where possible (or in a single truncation+write pass).
+
+#### `IsBinaryFile`
+
+```go
+func IsBinaryFile(path string) bool
+```
+
+Determines binary classification by scanning the first 1024 bytes of an opened file descriptor for null byte (`\x00`) characters. Presence of any null byte within the scanned window classifies content as binary; absence implies text/ASCII. **Contract:** Boolean output—`true` if null byte detected within the first 1024 bytes.
+
+### Repository Discovery — `DiscoverCodeFiles`
+
+```go
+func DiscoverCodeFiles(root string) ([]string, error)
+```
+
+Recursively walks the repository root, collecting high-signal source file paths while filtering out build artifacts (e.g., `.o`, `.class`, `node_modules/`), third-party dependencies, and custom ignore patterns defined in a configurable exclusion list. Uses standard library path-walkers with explicit pruning logic to skip directories matching known artifact signatures. **Contract:** Sorted slice of high-signal source file paths; error if the walk encounters unreadable directories or permission errors that cannot be recovered from.
+
+### Git Operations — `RunGit` & `GetGitHead`
+
+```go
+func RunGit(repoDir string, args ...string) (string, error)
+func GetGitHead(repoDir string) (string, error)
+```
+
+**`RunGit`:** Executes a git command within the specified repository directory, capturing both stdout and stderr streams. Returns the combined output string along with an exit code status, handling both successful execution (exit 0) and failure cases (non-zero exit codes). Subprocess spawned via `os/exec.Command`, inheriting parent environment variables unless explicitly overridden.
+
+**`GetGitHead`:** Returns the current HEAD commit hash for the given repository root by delegating to `RunGit` with arguments equivalent to `git rev-parse --short=80 HEAD`. Returned string is trimmed of whitespace and validated against a hex character set; if validation fails, an error is propagated indicating an invalid or detached state. **Contract:** 80-character hex SHA hash of the current HEAD; error if HEAD is not reachable or git execution fails.
+
+### Hashing & Registry — `HashRepoRoot`
+
+```go
+func HashRepoRoot(path string) (string, error)
+```
+
+Computes and returns the hexadecimal SHA-256 hash of the resolved absolute path provided as input. Resolves symlinks to obtain a canonical absolute path before hashing, ensuring deterministic output regardless of filesystem aliasing. Typically used for indexing repository states or verifying integrity in registry operations. **Contract:** 64-character hex SHA-256 digest; error if the path cannot be resolved to a canonical form.
 
 ---
 
-## Concurrency Control (`AcquireLock(repoRoot string, exclusive bool) (*flock.Flock, error)`)
-Acquires a file-based flock on `.code-reducer.lock` to serialize access across concurrent analyzer processes. When `exclusive` is true, obtains an exclusive (write) lock; otherwise acquires a shared (read) lock. Records the current process PID within the lockfile metadata to identify active owners for diagnostic purposes. Returns a pointer to the acquired `*flock.Flock` handle for subsequent release operations and errors if locking fails or the file is unreadable.
+## Subsystem: config (`internal/config`)
+
+**Responsibility:** Owns the entire configuration lifecycle for Code-Reducer: schema definition, filesystem persistence with restricted permissions, and multi-layer precedence resolution. Produces a single resolved `Config` instance consumed by the pipeline runner.
+
+### Config Schema — `config.Config`
+
+```go
+type Config struct {
+    ModelID string
+    OllamaSettings OllamaSettings
+    LangchainTracing bool
+    LangsmithTracing bool
+    IgnoredPaths []string
+    DocsDir string
+}
+```
+
+Canonical schema for `.code-reducer.yaml`. All downstream consumers treat it as immutable once resolved.
+
+### Filesystem Operations — `ConfigExists` & `LoadConfig` & `SaveConfig`
+
+#### `ConfigExists`
+
+```go
+func ConfigExists(path string) (bool, error)
+```
+
+Pre-flight check before attempting to read configuration. Returns `false, nil` when absent and a non-empty error on filesystem-level failures (e.g., permission denied). Used by CLI entrypoints to gate help messages and configuration prompts.
+
+#### `LoadConfig`
+
+```go
+func LoadConfig(path string) (*config.Config, error)
+```
+
+Reads raw YAML bytes from disk and unmarshals into a populated `Config`. Returns an empty `Config{}` with no error when the file is absent (caller must check `ConfigExists` first). On parse failure, returns the zero value with a non-nil error. Unmarshaling uses reflection-safe YAML parsing that tolerates field order differences between schema versions; unknown fields are silently dropped to prevent breaking upgrades.
+
+**Data flow:** `disk (.code-reducer.yaml) → io.ReadFile → yaml.Unmarshal → *config.Config`
+
+#### `SaveConfig`
+
+```go
+func SaveConfig(cfg *config.Config, path string) error
+```
+
+Marshals a `Config` into YAML and persists it with mode `0600`. The restrictive permission prevents other local users from reading sensitive configuration (model IDs, API keys embedded in Ollama settings). Atomic write semantics: the file is created at mode 0644, then `chmod`'d to 0600. This avoids a race window where the intermediate world-readable state could be observed by concurrent processes. If the parent directory does not exist, the function returns a clear error rather than silently failing.
+
+### Precedence Resolution — `ResolveConfig`
+
+**Responsibility:** Produce a single resolved `Config` from four sources layered in strict precedence order: **system defaults → YAML file → environment variables → CLI flags**. The final value is used by every downstream component without any caller needing to know which layer supplied it.
+
+**Precedence contract:**
+
+| Layer | Override scope |
+| --- | --- |
+| System defaults | `Config` zero values (used when no file exists) |
+| YAML file | Full struct override where fields are non-empty |
+| Environment variables | Per-field env mapping (`CODE_REDUCER_MODEL_ID`, etc.) |
+| CLI flags | Final override; wins over everything above |
+
+**Implementation notes:** Each layer is a pure function returning `(partial *Config, error)`. The resolver composes them left-to-right. Partial configs are merged field-by-field with the higher-precedence layer winning on any non-zero value. This prevents partial overrides from corrupting defaults (e.g., an empty string in YAML does not reset a previously-set CLI flag). The resolver returns a copy of the resolved struct to prevent accidental mutation by callers.
+
+**Failure modes:** If the YAML parse fails during `LoadConfig`, the resolver treats it as "no config file present" and falls through to env/CLI layers only. This allows users to ship partial configurations without being blocked by malformed files.
 
 ---
 
-## Repository Integrity (`EnsureGitignoreHasLockfile(repoRoot string) error`)
-Guarantees that the repository's `.gitignore` file exists at `repoRoot` and contains an entry for the lockfile path defined by `LockFileName`. If the file is absent, it is initialized; if present but missing the specific exclusion pattern, the entry is appended. Ensures the coordination file remains outside Git tracking history to prevent accidental inclusion in repositories or merge conflicts during VCS operations.
+## Subsystem: engine (`internal/engine`)
 
----
+**Responsibility:** Implements a two-stage retrieval–generation pipeline: **BM25 lexical scoring** of candidate files followed by **LLM-driven synthesis** that consumes ranked content. The module ingests raw file paths, tokenizes their contents, ranks them against user queries using the BM25 formula, and streams LLM responses with retry logic for transient HTTP failures (429/500–504). A `Runner` orchestrates end-to-end execution: it acquires a lock, instantiates an `LLMClient`, and drives documentation generation within a bounded context window.
 
-# `internal/config` — Configuration Management
+### BM25 Ranking & Indexing (`context.go`)
 
-**Responsibility & Data Flow:** Centralizes application configuration resolution. Abstracts three concerns: persistent config file I/O (`*.yaml`, 0600 mode), environment variable injection, and runtime parameter discovery (CLI flags → env vars → dynamic host resource scaling). Canonical data flow is **load → parse → apply → persist**, with explicit short-circuit semantics at each stage (silent skip on missing file for `LoadAndApplyConfig`; fixed return value for `GetDatabasePath`).
-
----
-
-## Configuration Schema & File I/O (`config.go`)
-
-### Structs
-
-- **`Config`** — schema for `.code-reducer.yaml`. Holds model, Ollama, LangSmith, and LangChain configuration fields plus optional ignore lists and docs directory path.
-
-### Functions
-
-| Function | Behavior |
-|---|---|
-| `ConfigExists(cwd string) bool` | Returns `true` if a `.code-reducer.yaml` file exists in the specified working directory. |
-| `LoadConfig(cwd string) (*Config, error)` | Reads and parses `.code-reducer.yaml` from the given directory into a `*Config` value. |
-| `SaveConfig(cwd string, cfg *Config) error` | Marshals the `Config` to YAML and writes it to `.code-reducer.yaml` with mode 0600 in the specified directory. |
-| `LoadAndApplyConfig(cwd string) error` | Loads config (silently ignoring missing files), then sets corresponding environment variables only when they are not already present from the parent process. |
-
-### Constants
-
-- **`ConfigFileName`** — `.code-reducer.yaml`. Persisted configuration filename.
-
----
-
-## Environment Variable Resolution (`env.go`)
-
-The module defines explicit env keys and defaults for downstream consumers:
+**Constants:**
 
 | Constant | Purpose |
-|---|---|
-| `CodeReducerModelIdEnvKey` | Code Reducer model identifier |
-| `OllamaBaseUrlEnvKey` | Ollama base URL |
-| `OllamaNumCtxEnvKey` | Ollama context size |
-| `LangsmithApiKeyEnvKey` | LangSmith API key |
-| `LangchainProjectEnvKey` | LangChain project name |
-| `LangchainTracingEnvKey` | LangChain tracing v2 enable/disable |
+|----------|---------|
+| `k1` | BM25 term-frequency saturation parameter (default 1.5). Controls the asymptotic growth of TF contribution per occurrence. |
+| `b` | BM25 document-length normalization factor (default 0.75). Reduces the weight assigned to documents as their length approaches the corpus mean. |
 
-### Defaults
+**Types:**
 
-- **`OllamaDefaultBaseURL`** — `http://localhost:11434`. Default Ollama base URL.
-- **`OllamaDefaultNumCtx`** — 8192 tokens. Default Ollama context size.
+- **`Document`** — Indexable unit holding a file path, raw content, tokenized tokens, per-term frequencies, and total token count (`n`). Populated before ingestion into the BM25 scorer.
+- **`DocScore`** — Temporary key-value pair pairing each candidate path with its computed BM25 relevance score during ranking phase.
 
----
+**Functions:**
 
-## Database Path Resolution (`database.go`)
+- **`Tokenize`** — Splits input text into lowercase alphanumeric word tokens via regular expression matching (`[a-z0-9]+`). Returns a slice of trimmed token strings.
+- **`FilterFilesBM25`** — Orchestrates the full scoring pipeline: loads each candidate file, tokenizes content, computes smoothed IDF for query terms, scores every document with `TF · IDF`, sorts results by descending relevance, and returns the top *K* paths.
+- **`EstimateTokens`** — Approximates token count by dividing character length by 4 (assumes ~4 characters per average English word). Used for context-budget estimation when exact counting is unavailable.
+- **`WrapInXmlDelimiter`** — Encapsulates file path and content inside strict `<file_content>` XML-like tags to mitigate prompt-injection risks during LLM consumption.
+- **`AutoScaleContext`** — Returns a safe default of 8192 characters when the caller provides zero or negative context limits; otherwise passes through unchanged.
 
-### `GetDatabasePath() (string, error)`
-Returns the fixed database file path `code-reducer.sqlite` with no error. Used for deterministic location of persistent state across engine invocations.
+### LLM Client & Interaction (`engine.go`)
 
----
+**Types:**
 
-## Ollama Context Size Resolution (`ollama.go`)
+- **`Message`** — Represents an LLM message with `role` and `content` fields for chat interaction (system, user, assistant).
+- **`LLMClient`** — HTTP-based client struct configured with model ID, base URL, context length, and timeout. Wraps synchronous (`CallLLM`) and streaming (`StreamLLM`) invocation methods.
 
-### `GetOllamaContextSize(flagVal string) int`
-Resolves the Ollama context size by checking a CLI flag first, then an environment variable, then dynamically scaling based on host RAM. Falls back to the configured default when all sources are absent or invalid.
+**Functions:**
+
+- **`NewLLMClient`** — Constructs an `LLMClient` instance from a configuration pointer containing model ID, base URL, context length, and timeout parameters.
+- **`CallLLM`** — Invokes a synchronous LLM call with retry logic for transient HTTP errors (status 429 Too Many Requests; 500–504 server/transport-level failures). Returns the parsed response or an error.
+- **`StreamLLM`** — Streams the LLM response in real time by reading line-by-line from the HTTP stream and invoking a callback function per chunk received.
+
+**Prompt Loading:**
+
+- **`Event`** — Represents an event occurrence with a type identifier and associated message string (used for logging pipeline events).
+- **`GetDefaultSystemPrompt`** — Returns a system prompt tailored to one of four commands: `extract_file`, `module_synthesis`, `architecture`, or `default`.
+- **`LoadSystemPrompt`** — Delegates directly to `GetDefaultSystemPrompt`; provides aliasing for external consumers.
+
+### JSON Parsing Utilities (`json_parser.go`)
+
+**Functions:**
+
+- **`CleanJSONResponse`** — Extracts raw JSON content from a response string by either stripping markdown code fences (`` ``` ``) or locating the first opening brace/bracket to the last closing brace/bracket in the payload.
+- **`UnmarshalJSONResponse`** — Chains `CleanJSONResponse` with `json.Unmarshal`, returning an error if parsing fails into the provided target interface value.
+
+### Runner Orchestrator (`runner.go`)
+
+**Types:**
+
+- **`Runner`** — Struct storing engine configuration and orchestrating repository processing workflows across BM25 ranking, LLM streaming, and documentation generation phases.
+
+**Functions:**
+
+- **`NewRunner`** — Constructs a new `Runner` instance by encapsulating the provided configuration pointer.
+- **`Run`** — Executes the full pipeline lifecycle: acquires a lock to serialize concurrent invocations, instantiates an `LLMClient`, and drives documentation generation within a bounded context window.

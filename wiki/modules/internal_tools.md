@@ -1,80 +1,105 @@
 # internal/tools
 
-## Module Responsibility
+## Module Overview
 
-The `internal/tools` package provides low-level utility primitives for repository-aware operations: safe file I/O, git command execution, source-file discovery, and cryptographic hashing of resolved paths. All functions operate against an absolute repository root that is resolved once per operation to prevent path-traversal vulnerabilities. Data flows consistently from a caller-supplied string through `filepath.Abs` resolution into the security layer before any filesystem or git interaction occurs.
-
----
-
-## Filesystem Operations (`file_tools.go`)
-
-### Safe Read / Write Interface
-
-| Function | Direction | Responsibility |
-|---|---|---|
-| **ReadFileSafely** | Inbound | Resolves an absolute path via the security layer, then reads the repository-relative file and returns its byte content. |
-| **WriteFileSafely** | Outbound | Accepts bytes + a repository-relative path, creates parent directories as needed, verifies the target is not a symlink before writing, and persists the data. |
-
-```
-ReadFileSafely(path string) ([]byte, error)
-
-WriteFileSafely(relPath string, content []byte) error
-```
-
-Both functions delegate to the security layer for absolute-path resolution. `WriteFileSafely` additionally enforces a symlink check on the target before any write operation to prevent privilege escalation through symlink injection.
-
-### Source-File Discovery (`DiscoverCodeFiles`)
-
-`DiscoverCodeFiles` recursively walks the repository root, collecting relative paths of source files while excluding:
-- Build artifacts (compiled binaries, object files)
-- Binary files detected via null-byte scanning
-- Dependency directories (vendor, node_modules, etc.)
-- User-configured ignore patterns
-
-```
-DiscoverCodeFiles(root string) ([]string, error)
-```
-
-The walk is bounded to the repository root. Each discovered candidate passes through `IsBinaryFile` before inclusion. The returned slice contains paths relative to `root`.
-
-### Binary Detection (`IsBinaryFile`)
-
-**IsBinaryFile** reads a file and inspects its first 1024 bytes for null byte presence. If any null byte is found, the function returns `true`, classifying the file as binary rather than text source material. This heuristic provides O(1) disk-read cost regardless of file size.
-
-```
-IsBinaryFile(path string) (bool, error)
-```
+The `internal/tools` package encapsulates low-level primitives for filesystem I/O, repository traversal, Git interaction, and deterministic content hashing. It sits between the application layer and OS/subprocess abstractions, shielding consumers from path resolution failures, symlink race conditions, build artifact noise, and non-deterministic subprocess behavior. Data flows originate at either a virtual file system path or a repository root string; both converge on byte-level operations (read/write/hash) before being consumed by higher-order tooling modules.
 
 ---
 
-## Git Operations (`git_tools.go`)
+## File I/O & Classification
 
-### Generic Git Execution (`RunGit`)
+### ReadFileSafely
 
-**RunGit** executes an arbitrary git subcommand within a specified repository root directory and returns the combined stdout/stderr output. It handles both success and failure cases without panicking on non-zero exit codes. The caller is responsible for interpreting return values.
+Resolves a virtual path through the embedded filesystem abstraction and reads the underlying content into memory, returning raw bytes (`[]byte`) or an error upon resolution failure (missing parent directory, permission denial) or read failure (I/O error, truncated stream).
 
-```
-RunGit(root string, args ...string) (string, error)
-```
-
-**GetGitHead** delegates to `RunGit` with the subcommand `rev-parse HEAD`, returning the current HEAD commit hash:
-
-```
-GetGitHead(root string) (string, error)
+```go
+func ReadFileSafely(path string) ([]byte, error) { /* ... */ }
 ```
 
-Both functions operate against a resolved absolute path. The git process inherits the repository root as its working directory; stdout/stderr are captured and returned verbatim.
+**Contract:**
+*   **Input:** Virtual path string.
+*   **Output:** Raw file content bytes; nil on success is not permitted—zero-length files return an empty slice with `nil` error.
+
+### WriteFileSafely
+
+Writes content to a virtual path using a TOCTOU-safe pattern designed to detect and reject symlink targets before truncation. The implementation performs a stat call equivalent to the target inode immediately prior to opening for write; if the target is not a regular file (i.e., a symlink or directory), the operation aborts with an error, preventing `os.SYMLINK` race conditions where a dangling symlink could cause data loss on truncation.
+
+```go
+func WriteFileSafely(path string, content []byte) error { /* ... */ }
+```
+
+**Contract:**
+*   **Input:** Target virtual path and payload bytes.
+*   **Output:** Error if the target is not a regular file or permission denied; otherwise writes `content` atomically where possible (or in a single truncation+write pass).
+
+### IsBinaryFile
+
+Determines binary classification by scanning the first 1024 bytes of an opened file descriptor for null byte (`\x00`) characters. A presence of any null byte within the scanned window classifies the content as binary; absence implies text/ASCII. This heuristic avoids full-file parsing overhead while maintaining high signal-to-noise ratio for common binary formats (images, executables, archives).
+
+```go
+func IsBinaryFile(path string) bool { /* ... */ }
+```
+
+**Contract:**
+*   **Input:** File path to inspect.
+*   **Output:** Boolean; `true` if null byte detected within the first 1024 bytes.
 
 ---
 
-## Path Hashing (`registry.go`)
+## Repository Discovery
 
-### SHA-256 of Resolved Root (`HashRepoRoot`)
+### DiscoverCodeFiles
 
-**HashRepoRoot** returns a SHA-256 hex-encoded hash of the resolved absolute path passed as argument. If `filepath.Abs` fails during resolution, it falls back to returning the raw input string unchanged:
+Recursively walks the repository root, collecting high-signal source file paths while filtering out build artifacts (e.g., `.o`, `.class`, `node_modules/`), third-party dependencies, and custom ignore patterns defined in a configurable exclusion list. The traversal uses standard library path-walkers with explicit pruning logic to skip directories matching known artifact signatures.
 
+```go
+func DiscoverCodeFiles(root string) ([]string, error) { /* ... */ }
 ```
-HashRepoRoot(path string) (string, error)
+
+**Contract:**
+*   **Input:** Repository root absolute path.
+*   **Output:** Sorted slice of high-signal source file paths; error if the walk encounters unreadable directories or permission errors that cannot be recovered from.
+
+---
+
+## Git Operations
+
+### RunGit
+
+Executes a git command within the specified repository directory, capturing both stdout and stderr streams. It returns the combined output string along with an exit code status, handling both successful execution (exit 0) and failure cases (non-zero exit codes). The subprocess is spawned via `os/exec.Command` or equivalent, inheriting parent environment variables unless explicitly overridden.
+
+```go
+func RunGit(repoDir string, args ...string) (string, error) { /* ... */ }
 ```
 
-This function is used for deterministic identification of repository states across operations that require a content-addressable key derived from the root location.
+**Contract:**
+*   **Input:** Repository directory and git subcommand arguments.
+*   **Output:** Git command stdout; error if the subprocess exits non-zero or fails to spawn.
+
+### GetGitHead
+
+Returns the current HEAD commit hash for the given repository root by delegating to `RunGit` with arguments equivalent to `git rev-parse --short=80 HEAD`. The returned string is trimmed of whitespace and validated against a hex character set; if validation fails, an error is propagated indicating an invalid or detached state.
+
+```go
+func GetGitHead(repoDir string) (string, error) { /* ... */ }
+```
+
+**Contract:**
+*   **Input:** Repository directory path.
+*   **Output:** 80-character hex SHA hash of the current HEAD; error if HEAD is not reachable or git execution fails.
+
+---
+
+## Hashing & Registry
+
+### HashRepoRoot
+
+Computes and returns the hexadecimal SHA-256 hash of the resolved absolute path provided as input. The implementation resolves symlinks to obtain a canonical absolute path before hashing, ensuring deterministic output regardless of filesystem aliasing. This utility is typically used for indexing repository states or verifying integrity in registry operations.
+
+```go
+func HashRepoRoot(path string) (string, error) { /* ... */ }
+```
+
+**Contract:**
+*   **Input:** Any file system path (relative or absolute).
+*   **Output:** 64-character hex SHA-256 digest; error if the path cannot be resolved to a canonical form.

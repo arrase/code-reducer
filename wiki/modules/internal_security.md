@@ -1,39 +1,26 @@
-# security.go
+# Security & Isolation Module (`security.go`)
 
-## Module Overview
+## Responsibility
 
-The `security` module enforces repository isolation, process-level concurrency control, and VCS hygiene for the code-reducer runtime environment. It manages three critical subsystems: path resolution integrity, file-based locking for concurrent analyzer invocations, and lockfile exclusion from Git tracking. Data flow proceeds as follows: user-supplied paths are sanitized via **path safety** primitives before any filesystem operation; concurrent access is governed by a `flock.Flock` handle acquired with PID registration to prevent overlapping reduction runs; finally, repository state is preserved by ensuring the lockfile remains untracked in `.gitignore`.
+The `security` package enforces sandbox isolation and concurrency safety for repository operations. It validates external input against the repository boundary, serializes resource access via POSIX file locking, and ensures lockfile metadata remains excluded from version control history. All functions operate relative to a canonical `repoRoot`, establishing a consistent security perimeter.
 
-## Constants
+## Path Traversal Protection (`SafeResolve`)
 
-### LockFileName
+**Signature:** `func SafeResolve(repoRoot, inputPath string) (string, error)`
 
-```go
-const LockFileName = ".code-reducer.lock"
-```
+`SafeResolve` validates that an external `inputPath` resolves strictly within the repository boundary defined by `repoRoot`. It rejects absolute paths, relative traversals via `..`, and symlink targets pointing outside the repo. It returns a normalized absolute path on success or a sentinel error on failure. This function acts as the mandatory entry point for all filesystem I/O operations to prevent escape vectors.
 
-Defines the absolute path for the process coordination file stored at the repository root. Serves as the anchor point for both flock acquisition and git exclusion logic.
+## Concurrency Control (`AcquireLock`)
 
-## Path Safety
+**Signature:** `func AcquireLock(repoRoot string, exclusive bool) (*flock.Flock, error)`
 
-### SafeResolve
+`AcquireLock` acquires a POSIX advisory file lock using `syscall.Flock`. It accepts an `exclusive bool` flag to select between exclusive (write-serialize) and shared (read-multiple-writer) modes. The function detects and rejects TOCTOU symlink races on the lockfile itself before acquiring, ensuring the target inode has not been swapped post-resolution. It returns a handle of type `*flock.Flock`, which must be released by the caller to prevent resource leaks.
 
-**Signature:** `SafeResolve(repoRoot, inputPath string) (string, error)`
+## Version Control Hygiene (`EnsureGitignoreHasLockfile`) & Constants
 
-Validates and sanitizes user-supplied paths to ensure they resolve strictly within the repository boundary. Prevents symlink attacks and path traversal attempts by resolving relative components against `repoRoot` and rejecting any target that escapes the root directory or references dangling symlinks. Returns the canonical absolute path within the repo on success, or an error if resolution fails.
+**Signature:** `func EnsureGitignoreHasLockfile(repoRoot string) error`
+**Constant:** `const LockFileName = ".code-reducer.lock"`
 
-## Concurrency Control
+`LockFileName` defines the canonical path for the process-level lockfile, used consistently across all functions in this module.
 
-### AcquireLock
-
-**Signature:** `AcquireLock(repoRoot string, exclusive bool) (*flock.Flock, error)`
-
-Acquires a file-based flock on `.code-reducer.lock` to serialize access across concurrent analyzer processes. When `exclusive` is true, obtains an exclusive (write) lock; otherwise acquires a shared (read) lock. Records the current process PID within the lockfile metadata to identify active owners for diagnostic purposes. Returns a pointer to the acquired `*flock.Flock` handle for subsequent release operations and errors if locking fails or the file is unreadable.
-
-## Repository Integrity
-
-### EnsureGitignoreHasLockfile
-
-**Signature:** `EnsureGitignoreHasLockfile(repoRoot string) error`
-
-Guarantees that the repository's `.gitignore` file exists at `repoRoot` and contains an entry for the lockfile path defined by `LockFileName`. If the file is absent, it is initialized; if present but missing the specific exclusion pattern, the entry is appended. Ensures the coordination file remains outside Git tracking history to prevent accidental inclusion in repositories or merge conflicts during VCS operations.
+`EnsureGitignoreHasLockfile` ensures `.gitignore` contains an entry for `LockFileName`. If `.gitignore` is missing, it creates one with the lockfile entry; if existing, it appends the entry to prevent duplicate tracking or corruption of git state. This prevents accidental modification of the lockfile via `git` operations while preserving repository integrity.

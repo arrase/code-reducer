@@ -8,4 +8,5 @@ ignore:
   - .code-reducer.lock
   - code-reducer
   - go.sum
+  - AGENT.md
 docs_dir: wiki

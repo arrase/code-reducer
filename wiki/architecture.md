@@ -1,109 +1,74 @@
-# code-reducer — Architecture Overview
+# Architecture Overview
 
-## System Boundaries & Module Interaction
+## System Boundaries
 
-`code-reducer` is a CLI-driven repository analysis tool written in Go 1.26. It ingests a source repository, ranks files via BM25 term-frequency scoring, constructs hierarchical directory trees from those results, synthesizes markdown documentation through recursive chunk batching against an Ollama LLM backend, and persists the output to disk. The application is driven by a Cobra CLI at `cmd/`, with all orchestration funneled through a root command that enforces sequential state transitions (setup → lock acquire → config load → engine run → stream).
+Code-Reducer is a single-process CLI application that ingests source code from a repository root, ranks candidate files via BM25 lexical scoring against user queries, synthesizes documentation through an LLM pipeline, and persists configuration with restricted permissions. The system operates as a lock-serialized engine: concurrent invocations are prevented via POSIX file locking (`AcquireLock`), the analysis boundary is enforced through path-traversal protection (`SafeResolve`), and all I/O passes through TOCTOU-safe wrappers to reject symlink races.
 
-The system boundary encompasses **five packages** organized into two layers:
+**External boundaries:**
+- CLI invocation → `RootCmd` dispatches subcommand
+- Configuration resolved via layered precedence (system defaults → YAML file → env vars → CLI flags)
+- Security perimeter established (`AcquireLock`, `SafeResolve`)
+- Repository traversal discovers source files (`DiscoverCodeFiles`)
+- BM25 ranking scores candidate documents against query terms
+- LLM synthesis consumes ranked content within bounded context window
+- Documentation persisted to `DocsDir`
 
-- **Infrastructure layer** (`security`, `internal/tools`) — hardens path resolution, enforces repository isolation, serializes concurrent processes via flock-based locking, and provides safe file I/O primitives.
-- **Engine layer** (`internal/engine`, `internal/config`) — ingests file corpus, computes relevance scores, assembles LLM prompts from directory trees, invokes the Ollama API, strips markdown fences from responses, and writes synthesized output.
-
-The CLI package (`cmd`) sits at the entry point and delegates lifecycle management to the engine layer while gating execution on credential presence (the `MODEL_ID` environment variable). If credentials are missing, it redirects into an interactive setup flow that persists configuration to `.code-reducer.yaml`, then re-acquires the lock and reloads config before proceeding.
-
-## Module Interaction Diagram
+## Module Interaction Map
 
 ```
-┌─────────────────────────────────────────────────┐
-│              cmd/ (Cobra CLI)                     │
-│  ┌──────────────┐  ┌────────────┐  ┌──────────┐ │
-│  │ init subcmd  │  │ rootCmd    │  │ setup     │ │
-│  └──────────────┘  └─────┬──────┘  └─────┬─────┘ │
-│                          │               │       │
-│                    executeCommand()      │       │
-│                          │               │       │
-│  ┌──────────────────────▼─────────────────────▼──┐│
-│  │ security.SafeResolve(repoRoot)                 ││
-│  │ security.AcquireLock(exclusive=true)           ││
-│  │ internal/config.LoadConfig(cwd)                ││
-│  │ internal/engine.reducesInChunks(dirTree)       ││
-│  │ ┌─────────────────────────────────────────────┐││
-│  │ │ LLMClient → Ollama API → markdown strip     │││
-│  │ └─────────────────────────────────────────────┘││
-│  │ internal/tools.WriteFileSafely(output)         ││
-│  └────────────────────────────────────────────────┘│
-└──────────────────────────────────────────────────┘
+┌─────────────┐     ┌──────────────┐     ┌────────────┐
+│  CLI Layer   │     │ Config       │     │ Engine      │
+│              │     │ Subsystem    │     │             │
+│ RootCmd      │────▶│ ResolveConfig│────▶│ Runner      │
+│ NeedsCred    │     │ Load/Save    │     │ BM25+LLM   │
+│ RunSetupFlow │     │ ConfigSchema │     │ LLMClient  │
+└─────────────┘     └──────────────┘     └────────────┘
+       │                    │                   │
+       ▼                    ▼                   ▼
+┌─────────────┐     ┌──────────────┐     ┌────────────┐
+│ Security     │     │ Tools        │     │ DocsOut    │
+│ Subsystem    │     │ Subsystem    │     │            │
+│ SafeResolve  │     │ ReadFileSafely│   │ Persist    │
+│ AcquireLock  │     │ WriteFileSafely│  │ to DocsDir │
+│ EnsureGitignore│   │ DiscoverCodeFiles│
+└─────────────┘     └──────────────┘     └────────────┘
 ```
 
-## Package Responsibilities & Interfaces
+## Data Flow Summary
 
-### `security` — Repository Isolation & Concurrency Control
+**Initialization path:** `RootCmd` → `NeedsCredentialSetup()` → (if true) `RunSetupFlow()` → persist config atomically.
 
-Enforces three subsystems: path resolution integrity, file-based locking for process serialization, and VCS hygiene (lockfile excluded from Git tracking). The package anchor is `.code-reducer.lock`, a repository-root coordination file. All path operations resolve through `SafeResolve(repoRoot, inputPath)` which validates strict containment within `repoRoot` and rejects dangling symlinks or escape attempts.
+**Analysis path:** `RootCmd` → `ResolveConfig()` → `AcquireLock()` → `DiscoverCodeFiles()` → BM25 scoring (`FilterFilesBM25`) → LLM synthesis (`CallLLM`/`StreamLLM`) → documentation persisted to `DocsDir`.
 
-Key functions:
-- `SafeResolve(repoRoot, inputPath) (string, error)` — canonical absolute path resolution with traversal rejection
-- `AcquireLock(repoRoot string, exclusive bool) (*flock.Flock, error)` — flock acquisition with PID metadata recording; shared lock for reads, exclusive for writes
-- `EnsureGitignoreHasLockfile(repoRoot string) error` — guarantees `.gitignore` includes the lockfile pattern
+## Key Architectural Decisions
 
-### `internal/tools` — Low-Level Repository Operations
+### Lock Serialization
+All operations are serialized through POSIX advisory file locking. `AcquireLock(repoRoot, exclusive)` returns a `*flock.Flock` handle that must be released by the caller. Concurrent invocations are prevented; no parallel execution within a single process lifetime.
 
-Provides safe file I/O, git command execution, source-file discovery, and SHA-256 path hashing. All filesystem operations resolve absolute paths once per operation via `filepath.Abs` before any disk interaction to prevent path-traversal vulnerabilities.
+### Path Traversal Protection
+`SafeResolve(repoRoot, inputPath)` is the mandatory entry point for all filesystem I/O. It validates external paths resolve strictly within `repoRoot`, rejects absolute paths and `..` traversals, and detects symlink targets pointing outside the repo boundary. Returns normalized absolute path on success or sentinel error on failure.
 
-Key functions:
-- `ReadFileSafely(path) []byte` — inbound read with security-layer resolution
-- `WriteFileSafely(relPath string, content []byte) error` — outbound write; creates parents as needed, verifies no symlink injection before persisting
-- `DiscoverCodeFiles(root string) ([]string, error)` — recursive walk collecting source files while excluding build artifacts, binaries (null-byte detection), and dependency directories (`vendor`, `node_modules`)
-- `IsBinaryFile(path string) (bool, error)` — null-byte scan of first 1024 bytes; O(1) regardless of file size
-- `RunGit(root string, args ...string) (string, error)` — git subcommand execution returning combined stdout/stderr without panicking on non-zero exit codes
-- `GetGitHead(root string) (string, error)` — HEAD commit hash via `git rev-parse HEAD`
-- `HashRepoRoot(path string) (string, error)` — SHA-256 hex of resolved path for content-addressable keys
+### Configuration Precedence
+Four-layer resolution with strict override scope: system defaults → YAML file → environment variables (`CODE_REDUCER_MODEL_ID`, etc.) → CLI flags. Each layer is a pure function returning `(partial *Config, error)`. The resolver composes left-to-right; partial configs merge field-by-field with higher-precedence winning on any non-zero value. Returns a copy to prevent accidental mutation. If YAML parse fails, resolver treats it as "no config file" and falls through to env/CLI layers only.
 
-### `internal/engine` — Orchestration Layer
+### TOCTOU-Safe I/O
+`WriteFileSafely` performs a stat equivalent immediately prior to truncation; if target is not a regular file (symlink or directory), operation aborts with error, preventing `os.SYMLINK` race conditions where dangling symlinks could cause data loss.
 
-Manages document ingestion, BM25 ranking, directory tree construction, system prompt retrieval, chunk batching, Ollama client configuration, and JSON response parsing. The data flow is: raw corpus → tokenization → frequency computation → BM25 scoring → XML-wrapped context assembly → LLM invocation → markdown fence stripping → synthesis output.
+### LLM Pipeline with Retry Logic
+`CallLLM` wraps synchronous invocation with retry logic for transient HTTP errors: status 429 (Too Many Requests) and 500–504 (server/transport failures). `StreamLLM` reads line-by-line from HTTP stream, invoking a callback per chunk.
 
-Key functions:
-- `Tokenize(input string) []string` — regex-based lowercase alphanumeric tokenization
-- `EstimateTokens(text string) int` — 4-char-per-token approximation for context budgeting
-- `FilterFilesBM25(query, files []Document) []Document` — BM25 relevance ranking returning top-K by descending score
-- `buildTree(filePaths []string) *DirNode` — constructs hierarchical directory tree from file paths rooted at `"."`
-- `GetDefaultSystemPrompt(phase string) (string, error)` — task-specific prompts for analysis/synthesis/architecture phases
-- `NewLLMClient(modelID, baseURL string, numCtx int) (*LLMClient, error)` — factory for Ollama transport singleton holding model ID, base URL, and context size limit
-- `stripOuterMarkdownFence(response string) string` — extracts content between triple-backtick fences via regex
-- `reduceInChunks(dirTree *DirNode, accumulated []byte) (string, error)` — recursive chunk batching with post-response markdown stripping; input is directory tree + accumulated results, output is synthesized markdown
-- `WrapInXmlDelimiter(content, filePath string) string` — wraps file content in `<file>path</file><content>...</content>` XML-like delimiters to prevent prompt injection
-- `AutoScaleContext(maximum int) int` — caps context at 8192 when maximum is non-positive; otherwise passes through
+### BM25 Ranking
+Two-stage retrieval-generation pipeline: candidate files are loaded, tokenized via regex (`[a-z0-9]+`), scored with smoothed IDF against query terms using TF·IDF formula, sorted by descending relevance, and top K paths returned. Constants `k1=1.5` (TF saturation) and `b=0.75` (doc-length normalization) are configurable.
 
-### `internal/config` — Configuration Management
+### Prompt Injection Mitigation
+File path and content are encapsulated inside `<file_content>` XML-like tags before LLM consumption to mitigate prompt injection risks during synthesis.
 
-Centralizes application configuration resolution with a load → parse → apply → persist data flow and short-circuit semantics (silent skip on missing file for `LoadAndApplyConfig`). Schema lives in `.code-reducer.yaml` with 0600 permissions.
+## Module Interaction Details
 
-Key functions:
-- `ConfigExists(cwd string) bool` — checks for `.code-reducer.yaml` presence
-- `LoadConfig(cwd string) (*Config, error)` — parses YAML into `*Config`; holds model/Ollama/LangSmith/LangChain fields plus optional ignore lists and docs directory path
-- `SaveConfig(cwd string, cfg *Config) error` — marshals to YAML with 0600 mode
-- `LoadAndApplyConfig(cwd string) error` — loads config (ignoring missing file), sets environment variables only when absent from parent process
-- `GetOllamaContextSize(flagVal string) int` — resolves context size by checking CLI flag → env var → dynamic host RAM scaling → configured default
+**CLI Bootstrap ↔ Config:** `RootCmd` initializes the command tree; configuration resolution flows through `ResolveConfig`. If credentials missing, `NeedsCredentialSetup()` returns true and triggers `RunSetupFlow()`, which persists parameters atomically via `SaveConfig(cfg, path)` with mode 0600.
 
-Environment keys defined: `CodeReducerModelIdEnvKey`, `OllamaBaseUrlEnvKey`, `OllamaNumCtxEnvKey`, `LangsmithApiKeyEnvKey`, `LangchainProjectEnvKey`, `LangchainTracingEnvKey`. Defaults: Ollama base URL is `http://localhost:11434`, default context size 8192.
+**Security ↔ Tools:** Security functions operate relative to canonical `repoRoot`. `SafeResolve` validates all paths before any tool function touches them. `AcquireLock` establishes the concurrency boundary that protects all operations in the pipeline.
 
-### `cmd` — CLI Entry Point & Lifecycle Management
+**Engine ↔ Config:** `Runner` receives resolved config, instantiates `LLMClient`, and drives documentation generation within bounded context window (8192 default). BM25 scoring feeds ranked file paths into LLM prompt via `WrapInXmlDelimiter`.
 
-Implements Cobra-based CLI with sequential state transitions enforced by the root command. Registers subcommands at package init time and delegates orchestration to a root command that gates execution on credential presence.
-
-Key functions:
-- RootCmd → `executeCommand()` orchestrates: credential check → lock acquire → config load → LLM engine invocation + live event streaming
-- `NeedsCredentialSetup() bool` — returns true when `MODEL_ID` env var is absent, redirecting into setup mode
-- `RunSetupFlow() error` — guides interactive configuration session; prompts for missing values and writes `.code-reducer.yaml`; returns control to root command which re-acquires lock and reloads config before engine execution
-
-## Configuration Hierarchy
-
-The application resolves configuration in this order:
-
-1. **CLI flags** (highest priority)
-2. **Environment variables** (`MODEL_ID`, `OLLAMA_BASE_URL`, etc.)
-3. **`.code-reducer.yaml` file** (persisted, 0600 mode)
-4. **Host RAM-based auto-scaling** (lowest, for context size only)
-
-The config file is written only during setup flow or manual invocation; it remains outside Git tracking via `EnsureGitignoreHasLockfile`. The lockfile itself (`security.LockFileName = ".code-reducer.lock"`) is also excluded from `.gitignore` to prevent accidental inclusion in repositories.
+**Tools ↔ Security:** Low-level primitives (`ReadFileSafely`, `WriteFileSafely`) shield consumers from path resolution failures, symlink race conditions, and non-deterministic subprocess behavior. Data flows converge on byte-level operations before being consumed by higher-order tooling modules.

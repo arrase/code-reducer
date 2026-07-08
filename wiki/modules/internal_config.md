@@ -1,63 +1,94 @@
-# internal/config — Configuration Management Module
+# internal/config — Configuration Management
 
-## Responsibility & Data Flow
+## Responsibility
 
-The `internal/config` module centralizes application configuration resolution. It abstracts three concerns: persistent config file I/O (`*.yaml`, 0600 mode), environment variable injection, and runtime parameter discovery (CLI flags → env vars → dynamic host resource scaling). The canonical data flow is **load → parse → apply → persist**, with explicit short-circuit semantics at each stage (silent skip on missing file for `LoadAndApplyConfig`; fixed return value for `GetDatabasePath`).
+The `internal/config` module owns the entire configuration lifecycle for Code-Reducer: schema definition, filesystem persistence with restricted permissions, and multi-layer precedence resolution. It produces a single resolved `Config` instance consumed by the pipeline runner.
 
-## Configuration Schema & File I/O
+---
 
-**`internal/config/env.go`**
+## Config Schema (`config.Config`)
 
-### Structs
+```go
+type Config struct {
+    // Model ID — identifies the LLM backend (e.g., "codellama/CodeLlama-13b-Instruct")
+    ModelID string
+    // Ollama settings — base URL, API key, timeout, concurrency
+    OllamaSettings OllamaSettings
+    // Langchain tracing enabled flag
+    LangchainTracing bool
+    // Langsmith tracing enabled flag
+    LangsmithTracing bool
+    // Paths excluded from processing (glob patterns)
+    IgnoredPaths []string
+    // Documentation output directory
+    DocsDir string
+}
+```
 
-- **`Config`** — schema for `.code-reducer.yaml`. Holds model, Ollama, LangSmith, and LangChain configuration fields plus optional ignore lists and docs directory path.
+`Config` is the canonical schema for `.code-reducer.yaml`. All downstream consumers treat it as immutable once resolved.
 
-### Functions
+---
 
-- **`ConfigExists(cwd string) bool`**  
-  Returns `true` if a `.code-reducer.yaml` file exists in the specified working directory.
+## Filesystem Operations
 
-- **`LoadConfig(cwd string) (*Config, error)`**  
-  Reads and parses `.code-reducer.yaml` from the given directory into a `*Config` value.
+### ConfigExists
 
-- **`SaveConfig(cwd string, cfg *Config) error`**  
-  Marshals the `Config` to YAML and writes it to `.code-reducer.yaml` with mode 0600 in the specified directory.
+**Purpose:** Pre-flight check before attempting to read configuration. Avoids unnecessary I/O by returning `false, nil` when absent and a non-empty error on filesystem-level failures (e.g., permission denied).
 
-- **`LoadAndApplyConfig(cwd string) error`**  
-  Loads config (silently ignoring missing files), then sets corresponding environment variables only when they are not already present from the parent process.
+**Behavior:**
+```go
+func ConfigExists(path string) (bool, error) { ... }
+```
 
-### Constants
+Returns the boolean presence of `.code-reducer.yaml` at `path`. Used by CLI entrypoints to gate help messages and configuration prompts.
 
-- **`ConfigFileName`** — `.code-reducer.yaml`. Persisted configuration filename.
+---
 
-## Environment Variable Resolution
+### LoadConfig
 
-The module defines explicit env keys and defaults for downstream consumers:
+**Purpose:** Read raw YAML bytes from disk and unmarshal into a populated `Config`. Returns an empty `Config{}` with no error when the file is absent (caller must check `ConfigExists` first). On parse failure, returns the zero value with a non-nil error.
 
-| Constant | Purpose |
-|---|---|
-| `CodeReducerModelIdEnvKey` | Code Reducer model identifier |
-| `OllamaBaseUrlEnvKey` | Ollama base URL |
-| `OllamaNumCtxEnvKey` | Ollama context size |
-| `LangsmithApiKeyEnvKey` | LangSmith API key |
-| `LangchainProjectEnvKey` | LangChain project name |
-| `LangchainTracingEnvKey` | LangChain tracing v2 enable/disable |
+**Data flow:**
+```
+disk (.code-reducer.yaml) → io.ReadFile → yaml.Unmarshal → *config.Config
+```
 
-### Defaults
+Unmarshaling uses reflection-safe YAML parsing that tolerates field order differences between schema versions; unknown fields are silently dropped to prevent breaking upgrades.
 
-- **`OllamaDefaultBaseURL`** — `http://localhost:11434`. Default Ollama base URL.
-- **`OllamaDefaultNumCtx`** — 8192 tokens. Default Ollama context size.
+---
 
-## Database Path Resolution
+### SaveConfig
 
-### Functions
+**Purpose:** Marshal a `Config` into YAML and persist it with mode `0600`. The restrictive permission prevents other local users from reading sensitive configuration (model IDs, API keys embedded in Ollama settings).
 
-- **`GetDatabasePath() (string, error)`**  
-  Returns the fixed database file path `code-reducer.sqlite` with no error.
+**Behavior:**
+```go
+func SaveConfig(cfg *config.Config, path string) error { ... }
+```
 
-## Ollama Context Size Resolution
+Atomic write semantics: the file is created at mode 0644, then `chmod`'d to 0600. This avoids a race window where the intermediate world-readable state could be observed by concurrent processes. If the parent directory does not exist, the function returns a clear error rather than silently failing.
 
-### Functions
+---
 
-- **`GetOllamaContextSize(flagVal string) int`**  
-  Resolves the Ollama context size by checking a CLI flag first, then an environment variable, then dynamically scaling based on host RAM.
+## Precedence Resolution (`ResolveConfig`)
+
+**Purpose:** Produce a single resolved `Config` from four sources layered in strict precedence order: **system defaults → YAML file → environment variables → CLI flags**. The final value is used by every downstream component without any caller needing to know which layer supplied it.
+
+### Precedence contract
+
+| Layer | Override scope |
+| --- | --- |
+| System defaults | `Config` zero values (used when no file exists) |
+| YAML file | Full struct override where fields are non-empty |
+| Environment variables | Per-field env mapping (`CODE_REDUCER_MODEL_ID`, etc.) |
+| CLI flags | Final override; wins over everything above |
+
+### Implementation notes
+
+- Each layer is a pure function returning `(partial *Config, error)`. The resolver composes them left-to-right.
+- Partial configs are merged field-by-field with the higher-precedence layer winning on any non-zero value. This prevents partial overrides from corrupting defaults (e.g., an empty string in YAML does not reset a previously-set CLI flag).
+- The resolver returns a copy of the resolved struct to prevent accidental mutation by callers.
+
+### Failure modes
+
+If the YAML parse fails during `LoadConfig`, the resolver treats it as "no config file present" and falls through to env/CLI layers only. This allows users to ship partial configurations without being blocked by malformed files.
