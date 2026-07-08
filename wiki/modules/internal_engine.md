@@ -1,111 +1,134 @@
-# Module Documentation: Internal Engine
+# internal/engine — Code Reduction Engine
 
-## Responsibility & Data Flow
+## Module Responsibility & Data Flow
 
-The internal engine orchestrates a hierarchical Map-Reduce pipeline that synthesizes code repositories into structured documentation. The `Runner` coordinates all operations—lock acquisition, LLM client instantiation, and mode-based execution (init/update). On invocation, `Run(ctx, repoRoot, mode)` acquires a repository lock, instantiates an `LLMClient`, then dispatches to either the init or update pipeline based on the `mode` parameter.
+The `internal/engine` module implements the Map-Reduce pipeline for automated codebase documentation generation. It orchestrates three phases: **discover** (file-system traversal and tree construction), **synthesize** (LLM-driven hierarchical content aggregation with SHA256 caching), and **reduce** (global architecture summary assembly). The runner exposes a single entry point that acquires the lock, instantiates the LLM client, and dispatches to context-specific pipelines.
 
-The pipeline discovers code files, constructs a directory tree via `DirNode` nodes, and synthesizes modules hierarchically through `synthesizeNode`. Each node recursively processes children and files: file metadata is cached in `MetadataCache`, per-directory markdown documentation is written to disk at `.metadata.json`, and the synthesized output propagates upward. The root-level synthesis generates global architecture docs and quickstart documentation.
+---
 
-## Tree Construction & File Change Tracking
+## File System Traversal & Tree Construction
 
 ### DirNode
 
-Represents a hierarchical directory node containing a path identifier, an array of associated files, and a map of child nodes for tree construction.
+```go
+type DirNode struct {
+    Path     string
+    Files    []string   // direct files within this directory
+    Children []*DirNode // subdirectories
+}
+```
+
+Represents a node in the recursive directory tree. Each `DirNode` holds its absolute path, a flat list of immediate file paths, and child subtrees for nested directories.
+
+### buildTree
+
+Constructs a root `*DirNode` from a slice of absolute file paths by parsing each path into directory components, then recursively nesting children under their parent nodes.
 
 ### FileChange
 
-Stores a file change entry consisting of a relative path string and a status field indicating whether the file was added, modified, or deleted.
+```go
+type FileChange struct {
+    Path   string // relative file path
+    Status string // "Added", "Modified", or "Deleted"
+}
+```
 
-## LLM Client Abstraction
+A single file-change record produced by diffing the current state against the baseline repository snapshot.
+
+### determineAffected / propagateAffected
+
+`determineAffected` walks the directory tree and marks directories as **affected** when any descendant is marked affected, a module doc is missing, or cache entries are empty. `propagateAffected` is the recursive walker that bubbles upward from leaf nodes to ancestors, ensuring every ancestor of a changed file inherits the affected flag.
+
+### isAllowedFile
+
+Returns `true` when the relative path passes ignore rules defined by `*security.ShouldIgnoreFile`. Paths failing this check are excluded from tree construction and subsequent synthesis.
+
+---
+
+## LLM Client & Communication Layer
 
 ### Message
 
-Struct representing a chat message with `Role` and `Content` fields, used for LLM request/response payloads.
+```go
+type Message struct {
+    Role   string // role identifier (system / user)
+    Content string // text payload for prompt construction
+}
+```
 
-### LLMClient
+Represents a single turn in an LLM interaction record used to construct the full prompt input.
 
-Configurable client struct holding model ID, base URL, context size, and HTTP transport for Ollama API interactions.
+### LLMClient & NewLLMClient
 
-#### NewLLMClient
+Aggregates connection settings and HTTP transport required to communicate with an Ollama-compatible endpoint. `NewLLMClient` instantiates a new client initialized with model ID, base URL, context window size, and default timeout.
 
-Factory function that initializes an `LLMClient` with the provided configuration and a 10-minute timeout on the default HTTP client.
+### CallLLM / StreamLLM
 
-#### CallLLM
+- **CallLLM** — Executes a synchronous non-streaming HTTP POST to the configured Ollama API endpoint; returns the raw response string or an error.
+- **StreamLLM** — Initiates a streaming HTTP request, parses incoming chunks line-by-line, and invokes the supplied callback for each content segment.
 
-Synchronous method that sends a non-streaming chat request to the configured Ollama endpoint and returns the model's response text or an error.
+### stripOuterMarkdownFence / CleanJSONResponse / UnmarshalJSONResponse
 
-#### StreamLLM
+`stripOuterMarkdownFence` strips surrounding markdown code fences from input strings using regex to clean common LLM output artifacts. `CleanJSONResponse` extends this by stripping fences and isolating the first/last JSON delimiters when fences are absent. `UnmarshalJSONResponse` chains both: cleans the raw response then unmarshals into a target interface, wrapping parse errors with context.
 
-Asynchronous method that streams real-time chunks from the LLM via the streaming API, invoking a user-supplied callback for each content chunk until completion.
+### GetDefaultSystemPrompt / LoadSystemPrompt
 
-### GetDefaultSystemPrompt
+`GetDefaultSystemPrompt` returns a context-specific system prompt string based on command type, defining the AI persona and task instructions for each analysis mode. `LoadSystemPrompt` delegates directly without additional error handling.
 
-Returns a system prompt string tailored to one of three commands (`extract_file`, `module_synthesis`, `architecture`) or a default fallback, with Code-Reducer role definition embedded in all variants.
+---
 
-### LoadSystemPrompt
+## Caching Layer
 
-Delegates directly to `GetDefaultSystemPrompt` and returns the resulting prompt paired with a nil error for use by callers that require a typed result.
+### FileCacheEntry & MetadataCache
 
-## JSON Response Parsing & Cleaning
+- **FileCacheEntry** — Stores the SHA256 hash and associated facts for a single file within the cache structure.
+- **MetadataCache** — Maintains the last documented commit identifier along with maps of cached files and modules.
 
-### CleanJSONResponse
+### loadMetadataCache / saveMetadataCache
 
-Extracts valid JSON content from a raw response string by stripping markdown code fences and locating the first opening brace or bracket through the last closing brace or bracket.
-
-### UnmarshalJSONResponse
-
-Cleans the raw JSON response string using `CleanJSONResponse` and unmarshals it into the provided target interface value, returning an error if parsing fails.
-
-## Metadata Caching Layer
-
-### FileCacheEntry
-
-Stores per-file cache data consisting of the file's SHA256 hash and an associated facts string.
-
-### MetadataCache
-
-Aggregates repository-wide metadata including the last documented commit, a map of per-file entries, and module-to-path mappings.
-
-#### loadMetadataCache
-
-Deserializes the on-disk `.metadata.json` into memory; if the file is absent or malformed it returns a freshly initialized empty `MetadataCache`.
-
-#### saveMetadataCache
-
-Marshals an in-memory `MetadataCache` to formatted JSON and writes it safely to disk at `.metadata.json`.
+`loadMetadataCache` reads a metadata JSON from the docs directory, returning an initialized or parsed `*MetadataCache`. `saveMetadataCache` serializes the provided instance into a formatted JSON file at the specified metadata path.
 
 ### computeSHA256
 
-Reads the contents of the given virtual path and returns its SHA256 hash as a hex-encoded string.
+Calculates the SHA256 hash of content located at a given virtual path and returns the hex-encoded string. Used to deduplicate synthesis results across re-runs.
 
-## Core Synthesis Engine
+---
+
+## Core Engine Pipeline
+
+### synthesizeNode
+
+Traverses a directory tree node's children and files, extracts file facts through LLM analysis with SHA256 caching, then hierarchically merges all components into a consolidated summary. Each leaf is analyzed independently; intermediate nodes aggregate their descendants' summaries before returning upward.
+
+### reduceInChunks
+
+Recursively batches code items by character limit and synthesizes them via LLM calls to produce architecture summaries, truncating oversized content when needed. Splits the input set into chunks that fit within the context window, processes each chunk through `synthesizeNode`, then merges results bottom-up until a single root summary remains.
+
+### RunInit (method on *LLMClient)
+
+Executes the full Map-Reduce pipeline: discovers code files, builds the hierarchical directory tree, performs recursive synthesis via `reduceInChunks`, and generates global architecture documentation plus a quickstart guide. Returns an `Event` struct holding Type and Message for logging emitted during execution.
+
+---
+
+## Orchestration & Runner
+
+### Runner / NewRunner / Run
+
+- **Runner** — Struct holding an engine configuration pointer; primary container for executing code-reduction pipelines.
+- **NewRunner** — Initializes a new `*Runner` by accepting a config pointer and storing it within the struct fields.
+- **Run** — Orchestrates the full execution lifecycle: acquires lock, instantiates LLM client from config, dispatches to context-specific documentation pipeline based on repository root and command type.
+
+---
+
+## Event Logging
 
 ### Event
 
-Struct holding a `Type` string and `Message` string to represent status or progress events emitted during processing.
+```go
+type Event struct {
+    Type    string // event category identifier
+    Message string // human-readable description of the emitted event
+}
+```
 
-#### reduceInChunks(ctx, c, nodePath, items, logEvent) error
-
-Recursively chunks code file paths into batches that fit the LLM context window, then synthesizes them by calling the LLM to produce a combined description.
-
-#### synthesizeNode(ctx, c, node, repoRoot, docsDir, cache, affectedDirs, logEvent) error
-
-Performs hierarchical tree synthesis for a directory by recursively processing children and files, caching file metadata, and writing per-directory markdown documentation.
-
-## Runner & Pipeline Orchestration
-
-### Runner
-
-Coordinates repository operations including lock acquisition, gitignore management, LLM client instantiation, and mode-based execution of init or update pipelines.
-
-#### NewRunner(cfg *config.Config) *Runner
-
-Factory function that initializes a new `Runner` instance with the provided configuration.
-
-#### Run(ctx context.Context, repoRoot string, mode string, onEvent func(Event)) error
-
-Main entry point that ensures lockfile is gitignored, acquires a repository lock, instantiates an `LLMClient`, and executes either the init or update pipeline based on the `mode` parameter.
-
-### RunInit(ctx, repoRoot, cfg, onEvent) error
-
-Orchestrates the full Map-Reduce pipeline: discovers code files, builds a directory tree, synthesizes all modules hierarchically, generates global architecture docs, and writes quickstart documentation.
+Struct holding a Type string and Message string used for logging events emitted during engine execution.

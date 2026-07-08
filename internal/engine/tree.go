@@ -14,8 +14,8 @@ type FileChange struct {
 	Status string // "Added", "Modified", "Deleted"
 }
 
-func isAllowedFile(repoRoot, relPath string, ignores []string) bool {
-	return !tools.ShouldIgnoreFile(repoRoot, relPath, ignores)
+func isAllowedFile(repoRoot, relPath string, ignores []string, ignoredExtensions []string) bool {
+	return !tools.ShouldIgnoreFile(repoRoot, relPath, ignores, ignoredExtensions)
 }
 
 func propagateAffected(node *DirNode, affectedDirs map[string]bool) bool {

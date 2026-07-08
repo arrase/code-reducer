@@ -195,7 +195,7 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 	ignores := append(cfg.Ignore, docsDir)
 	ignores = append(ignores, gitignorePatterns...)
 
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores, cfg.IgnoreExtensions)
 	if err != nil {
 		return err
 	}
@@ -323,8 +323,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 
 	logEvent("status", "Step 1: Detecting changed files...")
 
-	// 2. Discover all code files to build the current codebase tree
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores, cfg.IgnoreExtensions)
 	if err != nil {
 		return err
 	}
@@ -334,7 +333,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	var allowedCodeFiles []string
 
 	for _, f := range codeFiles {
-		if isAllowedFile(repoRoot, f, ignores) {
+		if isAllowedFile(repoRoot, f, ignores, cfg.IgnoreExtensions) {
 			allowedCodeFiles = append(allowedCodeFiles, f)
 			hash, err := computeSHA256(repoRoot, f)
 			if err == nil {

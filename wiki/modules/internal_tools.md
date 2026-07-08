@@ -1,59 +1,87 @@
-# internal/tools — Repository Utilities Module
+# internal/tools — Repository Infrastructure Package
 
-## Overview
+## Module Responsibility and Data Flow
 
-This module provides deterministic, safety-hardened utilities for repository introspection: safe file I/O with TOCTOU protection against symlink races, recursive source-file discovery that filters build artifacts/dependencies/cache/binary files, git command execution wrappers, and filesystem-root SHA-256 hashing. All exported functions accept a virtual path or repository root as input; internal helpers handle path normalization, pattern matching, and binary detection before the primary operation executes.
+This package provides low-level repository operations required by higher-level analysis modules: safe file I/O, git state queries, path hashing, and recursive source-file discovery. The data flow follows a consistent pattern—**verify the environment → resolve paths safely → read/write with TOCTOU guards → filter against ignore rules**. All functions operate on an absolute or virtual repository root that is resolved once per session; subsequent operations reference this canonical location internally.
 
-## Safe File I/O (`file_tools.go`)
+---
 
-### `ReadFileSafely`
+## Repository Verification and Git Operations
 
-Resolves a virtual (relative) path to an absolute filesystem location under sandboxed conditions and reads its content into memory. Returns `nil` on any failure — no partial results are exposed. The resolver prevents traversal beyond the repository boundary; the reader returns zero-length or empty bytes only when the target is absent rather than an error value, allowing callers a uniform success path for "file not present" scenarios.
+### `git_tools.go`
 
-### `WriteFileSally`
+#### `VerifyGitRepo(repoPath string) error`
 
-Writes content to the resolved absolute path with TOCTOU-safe checks: before opening the file descriptor, it verifies that no symlink race can intercept the write by checking that the target inode is unchanged between resolution and open. If the destination is a symlink, truncation of the followed target is prevented — the function detects the symlink state pre-write and refuses to truncate the underlying real file.
+Confirms two preconditions before any git or filesystem operation proceeds:
 
-### Data Flow
+1. The host system has a `git` executable accessible via `$PATH`.
+2. `repoPath` is inside a valid git working tree (i.e., `.git/` exists and the path resolves to it).
 
-```
-virtual_path → resolve_absolute → TOCTOU check (symlink race guard) → open O_RDWR|O_CREATE|O_TRUNC → write content → close
-```
+Returns an error if either check fails, preventing silent misbehavior downstream when callers assume a git-backed repository.
 
-## File Discovery (`file_tools.go`)
+#### `GetGitHead(repoPath string) (string, error)`
 
-### `DiscoverCodeFiles`
+Delegates to `RunGit("rev-parse", "HEAD")`, trims whitespace from stdout, and returns the current commit hash. Used by discovery and hashing modules to anchor state snapshots.
 
-Recursively walks the repository root directory tree to collect relative paths of source files. Filters exclude: build artifacts, dependency directories, cache directories, binary files, and user-supplied ignore patterns. Returns a sorted slice of cleaned relative paths for deterministic iteration across platforms.
+#### `RunGit(repoPath string, args ...string) (string, error)`
 
-### `ShouldIgnorePath` (internal)
+Executes a git command inside `repoPath`. Returns the trimmed stdout string plus any error; stderr is discarded in this wrapper because higher-level callers typically only need success output or a failure signal.
 
-Determines whether a cleaned relative path matches any entry in the provided ignore list using four match modes: exact string equality, prefix matching, component-level substring matching (any single path separator-delimited segment), and glob pattern matching (`filepath.Match`). Returns `true` on first match.
+---
 
-### `IsBinaryFile` (internal)
+## Safe File I/O Operations
 
-Reads up to 1024 bytes from a file handle; returns `true` if any byte in the prefix contains a null byte (`\x00`), indicating a binary rather than text source file. Used as an exclusion predicate during discovery walks.
+### `file_tools.go` — Read Pathway
 
-### `NameSuffixIgnored` (internal)
+#### `ReadFileSafely(virtualPath string) ([]byte, error)`
 
-Returns `true` when the final path component ends with known lockfile suffixes: `.lock.json`, `.lock.yaml`, `pnpm-lock.yaml`. Prevents lockfile entries from appearing in discovered code sets.
+Resolves a virtual (relative-to-repo-root) path to its absolute on-disk location and reads the content into memory. The resolver normalizes separators and canonicalizes the result so that `./foo`, `../bar/baz`, and `baz` all produce identical byte slices for the same file.
 
-## Git Integration (`git_tools.go`)
+### `file_tools.go` — Write Pathway
 
-### `RunGit`
+#### `WriteFileSafely(absPath string, data []byte) error`
 
-Executes a specified git command (as an argument slice) in the provided repository root with `os/exec.CommandContext`-style error propagation. Returns combined stdout/stderr as a single string and any non-zero exit status mapped to an `error`. The process is spawned with inherited environment variables; working directory is explicitly set to the supplied root, preventing drift from parent processes.
+Writes file content using a **TOCTOU-safe pattern**: before truncating the target, it verifies that `absPath` is not a symlink (via `os.Lstat()`). If the path is a symlink, the function returns an error rather than silently following the link and overwriting its destination. This prevents privilege escalation vectors where an attacker replaces a file with a symlink pointing to `/etc/passwd`.
 
-### `GetGitHead`
+---
 
-Returns the current HEAD commit hash for the repository rooted at the provided directory by delegating to `RunGit` with arguments `[git rev-parse HEAD]`. Returns an empty string on error rather than a partial hash.
+## Path Resolution and Hashing
 
-### `VerifyGitRepo`
+### `registry.go` — Root Fingerprint
 
-Confirms two preconditions: (1) that the git executable exists on the system path, and (2) that the supplied directory is inside a valid git working tree (`git rev-parse --is-inside-work-tree`). Returns an error describing which precondition failed if either check does not pass. Used as an admission gate before invoking other git-dependent operations.
+#### `HashRepoRoot(path string) string`
 
-## Content Hashing (`registry.go`)
+Computes the SHA-256 hex digest of the resolved absolute path of the repository root. The input `path` may be relative or absolute; internal resolution normalizes it before hashing. This produces a deterministic fingerprint for the current repo location, useful for caching, diff detection, and state anchoring across runs.
 
-### `HashRepoRoot` (exported)
+---
 
-Computes a SHA-256 hash of the resolved absolute filesystem path of the repository root and returns its hexadecimal representation as a string. The hash is deterministic for a given commit state — identical file contents produce identical hashes regardless of walk order, symlink state, or metadata differences. Used to fingerprint repository snapshots without requiring full tree traversal.
+## File Discovery and Ignore Logic
+
+### `file_tools.go` — Ignore Rules Engine
+
+#### `LoadGitignore(repoRoot string) ([]string, error)`
+
+Reads `.gitignore` from `repoRoot`, parses line-by-line, skips comments (`#`) and blank lines, and returns the list of active ignore patterns. Patterns are returned in their original form (no glob expansion); callers apply them against relative paths using standard path-matching semantics.
+
+#### `ShouldIgnoreFile(relPath string) bool`
+
+Determines whether a relative file path should be excluded from processing by evaluating:
+
+- Custom patterns loaded via `LoadGitignore`.
+- Dot-prefixed components (`.` prefix at any level).
+- Known binary/extension suffixes (e.g., `.exe`, `.so`).
+- Suffix-based rules for common non-source extensions.
+
+Returns `true` if the file matches any ignore criterion; otherwise `false`.
+
+### `file_tools.go` — Source Discovery
+
+#### `DiscoverCodeFiles(repoRoot string) ([]string, error)`
+
+Recursively walks the repository tree to collect high-signal source files (`.go`, `.py`, `.rs`, etc.). Skips:
+
+- Build directories (`node_modules/`, `vendor/`, `__pycache__/`, etc.).
+- Dependency paths identified by common prefixes.
+- Any entry matching the ignore list produced by `ShouldIgnoreFile`.
+
+Returns a flat slice of relative file paths, sorted for deterministic output. Used as the primary input to analysis and transformation pipelines.

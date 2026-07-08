@@ -1,12 +1,43 @@
 model_id: ornith:9b
 ollama_base_url: http://localhost:11434
-ollama_num_ctx: 10000
+ollama_num_ctx: 15000
 ignore:
-    - .gitignore
-    - README.md
+    - .git
+    - node_modules
+    - bower_components
+    - dist
+    - build
+    - cache
+    - __pycache__
+    - .pytest_cache
+    - .mypy_cache
+    - .tox
+    - venv
+    - .venv
+    - code-reducer
+    - .gemini
     - .code-reducer.yaml
     - .code-reducer.lock
-    - code-reducer
+    - .gitignore
+    - README.md
     - go.sum
     - AGENTS.md
+ignore_extensions:
+    - .png
+    - .jpg
+    - .jpeg
+    - .gif
+    - .pdf
+    - .exe
+    - .dll
+    - .so
+    - .o
+    - .a
+    - .zip
+    - .gz
+    - .tar
+    - .lock
+    - .pyc
+    - .pyo
+    - .pyd
 docs_dir: wiki

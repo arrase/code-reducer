@@ -86,32 +86,79 @@ func RunSetupFlow(repoRoot string) {
 		}
 	}
 
-	existingIgnore := ""
-	if existingCfg != nil && len(existingCfg.Ignore) > 0 {
-		existingIgnore = strings.Join(existingCfg.Ignore, ", ")
-	}
-
-	fmt.Printf("Enter directories/files to ignore (comma-separated) [%s]: ", existingIgnore)
-	ignoreInput, _ := reader.ReadString('\n')
-	ignoreInput = strings.TrimSpace(ignoreInput)
-
 	var ignores []string
-	if ignoreInput == "" {
-		if existingCfg != nil && existingCfg.Ignore != nil {
-			ignores = existingCfg.Ignore
-		} else {
-			ignores = []string{}
-		}
-	} else {
-		parts := strings.Split(ignoreInput, ",")
-		for _, part := range parts {
-			trimmed := strings.TrimSpace(part)
-			if trimmed != "" {
-				ignores = append(ignores, trimmed)
+	if existingCfg == nil {
+		fmt.Print("Enter custom directories/files to ignore (in addition to standard defaults) []: ")
+		ignoreInput, _ := reader.ReadString('\n')
+		ignoreInput = strings.TrimSpace(ignoreInput)
+
+		ignores = append(ignores, config.DefaultIgnores...)
+		if ignoreInput != "" {
+			parts := strings.Split(ignoreInput, ",")
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					ignores = append(ignores, trimmed)
+				}
 			}
 		}
-		if ignores == nil {
-			ignores = []string{}
+	} else {
+		existingIgnore := strings.Join(existingCfg.Ignore, ", ")
+		fmt.Printf("Enter directories/files to ignore (comma-separated) [%s]: ", existingIgnore)
+		ignoreInput, _ := reader.ReadString('\n')
+		ignoreInput = strings.TrimSpace(ignoreInput)
+
+		if ignoreInput == "" {
+			ignores = existingCfg.Ignore
+		} else {
+			parts := strings.Split(ignoreInput, ",")
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					ignores = append(ignores, trimmed)
+				}
+			}
+			if ignores == nil {
+				ignores = []string{}
+			}
+		}
+	}
+
+	var ignoreExtensions []string
+	if existingCfg == nil {
+		fmt.Print("Enter custom file extensions to ignore (in addition to standard defaults) []: ")
+		extInput, _ := reader.ReadString('\n')
+		extInput = strings.TrimSpace(extInput)
+
+		ignoreExtensions = append(ignoreExtensions, config.DefaultIgnoredExtensions...)
+		if extInput != "" {
+			parts := strings.Split(extInput, ",")
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					ignoreExtensions = append(ignoreExtensions, trimmed)
+				}
+			}
+		}
+	} else {
+		existingExtensions := strings.Join(existingCfg.IgnoreExtensions, ", ")
+		fmt.Printf("Enter file extensions to ignore (comma-separated) [%s]: ", existingExtensions)
+		extInput, _ := reader.ReadString('\n')
+		extInput = strings.TrimSpace(extInput)
+
+		if extInput == "" {
+			ignoreExtensions = existingCfg.IgnoreExtensions
+		} else {
+			parts := strings.Split(extInput, ",")
+			for _, part := range parts {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					ignoreExtensions = append(ignoreExtensions, trimmed)
+				}
+			}
+			if ignoreExtensions == nil {
+				ignoreExtensions = []string{}
+			}
 		}
 	}
 
@@ -128,11 +175,12 @@ func RunSetupFlow(repoRoot string) {
 	}
 
 	newCfg := &config.Config{
-		ModelID:       modelInput,
-		OllamaBaseURL: urlInput,
-		OllamaNumCtx:  numCtx,
-		Ignore:        ignores,
-		DocsDir:       docsDirInput,
+		ModelID:          modelInput,
+		OllamaBaseURL:    urlInput,
+		OllamaNumCtx:     numCtx,
+		Ignore:           ignores,
+		IgnoreExtensions: ignoreExtensions,
+		DocsDir:          docsDirInput,
 	}
 
 	// Preserve optional fields if they existed

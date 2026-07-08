@@ -31,6 +31,7 @@ type Config struct {
 	LangchainProject   string   `yaml:"langchain_project,omitempty"`
 	LangchainTracingV2 string   `yaml:"langchain_tracing_v2,omitempty"`
 	Ignore             []string `yaml:"ignore"`
+	IgnoreExtensions   []string `yaml:"ignore_extensions"`
 	DocsDir            string   `yaml:"docs_dir"`
 }
 
@@ -68,6 +69,45 @@ func SaveConfig(cwd string, cfg *Config) error {
 	return nil
 }
 
+var DefaultIgnores = []string{
+	".git",
+	"node_modules",
+	"bower_components",
+	"dist",
+	"build",
+	"cache",
+	"__pycache__",
+	".pytest_cache",
+	".mypy_cache",
+	".tox",
+	"venv",
+	".venv",
+	"code-reducer",
+	".gemini",
+	".code-reducer.yaml",
+	".code-reducer.lock",
+}
+
+var DefaultIgnoredExtensions = []string{
+	".png",
+	".jpg",
+	".jpeg",
+	".gif",
+	".pdf",
+	".exe",
+	".dll",
+	".so",
+	".o",
+	".a",
+	".zip",
+	".gz",
+	".tar",
+	".lock",
+	".pyc",
+	".pyo",
+	".pyd",
+}
+
 // ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
 // It returns a fully resolved Config struct ready to be used by the pipeline runner and LLM client.
 // It also sets required external environment variables (such as Langchain/Langsmith tracing variables).
@@ -77,8 +117,23 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 		cfg = &Config{}
 	}
 
+	var resolvedIgnore []string
+	if cfg.Ignore != nil {
+		resolvedIgnore = cfg.Ignore
+	} else {
+		resolvedIgnore = DefaultIgnores
+	}
+
+	var resolvedExtensions []string
+	if cfg.IgnoreExtensions != nil {
+		resolvedExtensions = cfg.IgnoreExtensions
+	} else {
+		resolvedExtensions = DefaultIgnoredExtensions
+	}
+
 	resolved := &Config{
-		Ignore: cfg.Ignore,
+		Ignore:           resolvedIgnore,
+		IgnoreExtensions: resolvedExtensions,
 	}
 
 	// 1. Resolve Model ID: Flag > Env > YAML > Default

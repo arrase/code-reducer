@@ -77,43 +77,6 @@ func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
 	return nil
 }
 
-var DefaultIgnoredDirs = map[string]bool{
-	".git":             true,
-	"node_modules":     true,
-	"dist":             true,
-	"build":            true,
-	"cache":            true,
-	"code-reducer":     true,
-	".gemini":          true,
-	"bower_components": true,
-	"__pycache__":      true,
-	".pytest_cache":    true,
-	".mypy_cache":      true,
-	".tox":             true,
-	"venv":             true,
-	".venv":            true,
-}
-
-var DefaultIgnoredExtensions = map[string]bool{
-	".png":  true,
-	".jpg":  true,
-	".jpeg": true,
-	".gif":  true,
-	".pdf":  true,
-	".exe":  true,
-	".dll":  true,
-	".so":   true,
-	".o":    true,
-	".a":    true,
-	".zip":  true,
-	".gz":   true,
-	".tar":  true,
-	".lock": true,
-	".pyc":  true,
-	".pyo":  true,
-	".pyd":  true,
-}
-
 // LoadGitignore reads the .gitignore file from repoRoot and returns its active ignore patterns.
 func LoadGitignore(repoRoot string) ([]string, error) {
 	gitignorePath := filepath.Join(repoRoot, ".gitignore")
@@ -139,16 +102,16 @@ func LoadGitignore(repoRoot string) ([]string, error) {
 }
 
 // ShouldIgnoreFile checks if a file (specified by relative path) is ignored.
-func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string) bool {
+func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string, ignoredExtensions []string) bool {
 	// 1. Check user-defined ignores (config + gitignore)
 	if ShouldIgnorePath(relPath, customIgnores) {
 		return true
 	}
 
-	// 2. Check path components for default ignored directories and dot-prefixed items
+	// 2. Check path components for dot-prefixed items or .egg-info
 	components := strings.Split(relPath, string(filepath.Separator))
 	for _, comp := range components {
-		if DefaultIgnoredDirs[comp] || strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".egg-info") {
+		if strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".egg-info") {
 			return true
 		}
 	}
@@ -156,7 +119,16 @@ func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string) bool {
 	// 3. Check filename extensions & suffixes
 	name := filepath.Base(relPath)
 	ext := strings.ToLower(filepath.Ext(name))
-	if DefaultIgnoredExtensions[ext] || NameSuffixIgnored(name) {
+	for _, iext := range ignoredExtensions {
+		normIext := iext
+		if !strings.HasPrefix(normIext, ".") {
+			normIext = "." + normIext
+		}
+		if ext == strings.ToLower(normIext) {
+			return true
+		}
+	}
+	if NameSuffixIgnored(name) {
 		return true
 	}
 
@@ -170,7 +142,7 @@ func ShouldIgnoreFile(repoRoot, relPath string, customIgnores []string) bool {
 
 // DiscoverCodeFiles recursively walks the codebase to find high-signal source files.
 // It ignores build, dependency, and output files, as well as any paths in the custom ignores list.
-func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
+func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []string) ([]string, error) {
 	var files []string
 	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -188,13 +160,13 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 
 		if d.IsDir() {
 			name := d.Name()
-			if DefaultIgnoredDirs[name] || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || ShouldIgnorePath(rel, ignores) {
+			if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || ShouldIgnorePath(rel, ignores) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		if ShouldIgnoreFile(repoRoot, rel, ignores) {
+		if ShouldIgnoreFile(repoRoot, rel, ignores, ignoredExtensions) {
 			return nil
 		}
 
