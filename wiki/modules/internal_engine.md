@@ -1,142 +1,111 @@
-# Code Reduction Engine Architecture
+# Module Documentation: Internal Engine
 
-## Module Responsibility
+## Responsibility & Data Flow
 
-The `engine` package implements a deterministic code reduction pipeline that ranks repository files via BM25 relevance scoring, caches file fingerprints to avoid redundant reprocessing on subsequent runs, detects affected directories from parsed git diffs, and orchestrates LLM-powered code generation through a configurable chat-completion client. The runner entry point branches execution into initialization or update modes based on the supplied mode parameter.
+The internal engine orchestrates a hierarchical Map-Reduce pipeline that synthesizes code repositories into structured documentation. The `Runner` coordinates all operations—lock acquisition, LLM client instantiation, and mode-based execution (init/update). On invocation, `Run(ctx, repoRoot, mode)` acquires a repository lock, instantiates an `LLMClient`, then dispatches to either the init or update pipeline based on the `mode` parameter.
 
----
+The pipeline discovers code files, constructs a directory tree via `DirNode` nodes, and synthesizes modules hierarchically through `synthesizeNode`. Each node recursively processes children and files: file metadata is cached in `MetadataCache`, per-directory markdown documentation is written to disk at `.metadata.json`, and the synthesized output propagates upward. The root-level synthesis generates global architecture docs and quickstart documentation.
 
-## Data Model & BM25 Ranking (`context.go`)
+## Tree Construction & File Change Tracking
 
-### File Content Representation — `Document`
+### DirNode
 
-```go
-type Document struct {
-    // Content holds the raw file text.
-    Content string
-    // TermFrequencies maps token → occurrence count for BM25 scoring.
-    TermFrequencies map[string]int
-    // TokenCount is the total number of tokens in the document.
-    TokenCount int
-}
-```
+Represents a hierarchical directory node containing a path identifier, an array of associated files, and a map of child nodes for tree construction.
 
-### Text Tokenization — `Tokenize`
+### FileChange
 
-Splits input text into lowercase alphanumeric tokens using a compiled regex tokenizer. Non-alphanumeric characters are discarded; whitespace and punctuation yield no tokens.
+Stores a file change entry consisting of a relative path string and a status field indicating whether the file was added, modified, or deleted.
 
-### Relevance Ranking — `FilterFilesBM25`
+## LLM Client Abstraction
 
-Ranks repository files by relevance to an arbitrary query string using BM25 (Okapi). Returns the top-K file paths after computing term frequencies over each document's tokenized content. The ranking formula incorporates normalized IDF weighting against the total corpus size and a length normalization factor proportional to `avgdl`.
+### Message
 
-### Prompt Injection Mitigation — `WrapInXmlDelimiter`
+Struct representing a chat message with `Role` and `Content` fields, used for LLM request/response payloads.
 
-Wraps file content in strict XML-like tags with the file path attribute: `<file path="...">content</file>`. This prevents prompt injection attacks by constraining LLM input to syntactically delimited regions.
+### LLMClient
 
----
+Configurable client struct holding model ID, base URL, context size, and HTTP transport for Ollama API interactions.
 
-## Caching Layer (`engine.go`)
+#### NewLLMClient
 
-### Cached File Entry — `FileCacheEntry`
+Factory function that initializes an `LLMClient` with the provided configuration and a 10-minute timeout on the default HTTP client.
 
-Stores a cached file's SHA256 hash and associated facts for retrieval without re-processing:
+#### CallLLM
 
-```go
-type FileCacheEntry struct {
-    Hash   string      // SHA256 hex digest of the original content.
-    Facts  interface{} // Arbitrary metadata keyed by filename (e.g., code reduction results).
-}
-```
+Synchronous method that sends a non-streaming chat request to the configured Ollama endpoint and returns the model's response text or an error.
 
-### Metadata Cache — `MetadataCache`
+#### StreamLLM
 
-Aggregates per-file cache entries, the last documented commit hash, and module mappings into a single JSON-deserializable structure:
+Asynchronous method that streams real-time chunks from the LLM via the streaming API, invoking a user-supplied callback for each content chunk until completion.
 
-```go
-type MetadataCache struct {
-    LastDocumentedCommit string               // Commit hash of most recent successful documentation pass.
-    FileCache             map[string]FileCacheEntry `json:"file_cache"`
-    ModuleMappings        map[string]string         `json:"module_mappings"`
-}
-```
+### GetDefaultSystemPrompt
 
-### Cache I/O — `loadMetadataCache` / `saveMetadataCache`
+Returns a system prompt string tailored to one of three commands (`extract_file`, `module_synthesis`, `architecture`) or a default fallback, with Code-Reducer role definition embedded in all variants.
 
-- **`loadMetadataCache(repoRoot, docsDir) (*MetadataCache, error)`** reads the metadata cache from disk at `<repoRoot>/<docsDir>/metadata_cache.json`. Returns an empty default cache if the file is missing or malformed.
-- **`saveMetadataCache(repoRoot, docsDir, cache *MetadataCache) error`** serializes the metadata cache to JSON and writes it safely to disk atomically (write-to-temp + rename).
+### LoadSystemPrompt
 
-### File Fingerprinting — `computeSHA256`
+Delegates directly to `GetDefaultSystemPrompt` and returns the resulting prompt paired with a nil error for use by callers that require a typed result.
 
-Reads a file at the given path and returns its SHA256 hex digest. Used for change detection between runs.
+## JSON Response Parsing & Cleaning
 
----
+### CleanJSONResponse
 
-## Change Detection & Affected Directory Propagation (`engine.go`)
+Extracts valid JSON content from a raw response string by stripping markdown code fences and locating the first opening brace or bracket through the last closing brace or bracket.
 
-### Git Diff Parsing — `parseGitDiff`
+### UnmarshalJSONResponse
 
-Parses raw git diff output into structured `[]FileChange` entries, categorizing adds, deletes, renames (via rename detection logic), copies, modifications, and type changes. Each entry carries the relative file path and change classification.
+Cleans the raw JSON response string using `CleanJSONResponse` and unmarshals it into the provided target interface value, returning an error if parsing fails.
 
-### File Filtering — `isAllowedFile`
+## Metadata Caching Layer
 
-Filters files by:
-- Ignore lists (explicit path patterns)
-- Directory/component name whitelists
-- File extension allowlists (excludes binaries like `.exe`, `.dll`)
-- Safe path resolution to prevent traversal attacks
+### FileCacheEntry
 
-Returns `true` if the file passes all filters.
+Stores per-file cache data consisting of the file's SHA256 hash and an associated facts string.
 
-### Affected Region Detection — `determineAffected` / `propagateAffected`
+### MetadataCache
 
-- **`determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataCache, filteredChanges []FileChange, affectedDirs map[string]bool)`** identifies which directories need updating by checking for changed files and verifying module existence against the metadata cache.
-- **`propagateAffected(node *DirNode, affectedDirs map[string]bool) bool`** recursively marks a directory tree as affected when any descendant is marked. Returns `true` if propagation occurred.
+Aggregates repository-wide metadata including the last documented commit, a map of per-file entries, and module-to-path mappings.
 
----
+#### loadMetadataCache
 
-## LLM Client (`engine.go`)
+Deserializes the on-disk `.metadata.json` into memory; if the file is absent or malformed it returns a freshly initialized empty `MetadataCache`.
 
-### Message — `Message`
+#### saveMetadataCache
 
-Represents an LLM role-content pair used in chat completions with JSON serialization support:
+Marshals an in-memory `MetadataCache` to formatted JSON and writes it safely to disk at `.metadata.json`.
 
-```go
-type Message struct {
-    Role   string // "system", "user", "assistant"
-    Content string
-}
-```
+### computeSHA256
 
-### Client Configuration — `LLMClient` / `NewLLMClient`
+Reads the contents of the given virtual path and returns its SHA256 hash as a hex-encoded string.
 
-- **`LLMClient`** holds configuration for an LLM provider including model ID, base URL, context size limit, and HTTP client instance.
-- **`NewLLMClient(modelID, baseURL string, numCtx int) *LLMClient`** initializes a new `LLMClient` with the given parameters and a 10-minute default timeout for HTTP requests.
+## Core Synthesis Engine
 
----
+### Event
 
-## Response Parsing (`json_parser.go`)
+Struct holding a `Type` string and `Message` string to represent status or progress events emitted during processing.
 
-### JSON Extraction — `CleanJSONResponse`
+#### reduceInChunks(ctx, c, nodePath, items, logEvent) error
 
-Extracts JSON content from surrounding markdown code fences (`` ```json `` or `` ``` ``) or locates the first opening brace/bracket and last closing brace/bracket in raw text to return a trimmed JSON string. Handles malformed responses gracefully by returning an empty string if no valid JSON is found.
+Recursively chunks code file paths into batches that fit the LLM context window, then synthesizes them by calling the LLM to produce a combined description.
 
-### Deserialization — `UnmarshalJSONResponse`
+#### synthesizeNode(ctx, c, node, repoRoot, docsDir, cache, affectedDirs, logEvent) error
 
-Cleans the raw response using `CleanJSONResponse`, then unmarshals the resulting JSON into the provided target interface value (e.g., `*struct`). Returns an error if deserialization fails or the cleaned text is empty.
+Performs hierarchical tree synthesis for a directory by recursively processing children and files, caching file metadata, and writing per-directory markdown documentation.
 
----
+## Runner & Pipeline Orchestration
 
-## Execution Orchestration (`runner.go`)
+### Runner
 
-### Runner — `Runner` / `NewRunner` / `Run`
+Coordinates repository operations including lock acquisition, gitignore management, LLM client instantiation, and mode-based execution of init or update pipelines.
 
-- **`Runner`**: A struct holding a reference to the engine configuration, serving as the primary entry point for executing code reduction workflows.
-- **`NewRunner(cfg *Config)`** initializes and returns a new `Runner` instance bound to a specific configuration pointer.
-- **`Run(mode string) error`** executes the core workflow by:
-  1. Acquiring repository locks (mutex or file-based, depending on environment).
-  2. Creating an LLM client via `NewLLMClient`.
-  3. Branching into initialization mode (`mode == "init"`) or update mode based on the provided mode parameter.
-  4. Loading the metadata cache from disk (or creating a fresh one for init).
-  5. Running git diff, filtering changes, and determining affected directories.
-  6. Re-processing only affected files through BM25 ranking followed by LLM code generation.
-  7. Updating the metadata cache with new SHA256 hashes and facts after completion.
+#### NewRunner(cfg *config.Config) *Runner
+
+Factory function that initializes a new `Runner` instance with the provided configuration.
+
+#### Run(ctx context.Context, repoRoot string, mode string, onEvent func(Event)) error
+
+Main entry point that ensures lockfile is gitignored, acquires a repository lock, instantiates an `LLMClient`, and executes either the init or update pipeline based on the `mode` parameter.
+
+### RunInit(ctx, repoRoot, cfg, onEvent) error
+
+Orchestrates the full Map-Reduce pipeline: discovers code files, builds a directory tree, synthesizes all modules hierarchically, generates global architecture docs, and writes quickstart documentation.

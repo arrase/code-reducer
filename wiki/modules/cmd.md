@@ -1,49 +1,49 @@
-# CLI Architecture: Code Reducer Command Module
+# Command-Line Interface Architecture
 
 ## Module Responsibility
 
-The `cmd` package implements the top-level Cobra command hierarchy for the Code Reducer CLI tool. It owns three operational flows: **initialization** (`init`), **configuration setup** (`setup`), and **update operations** (`update`). Data flow terminates at an engine abstraction that resolves execution semantics per mode argument. Configuration state persists via `.code-reducer.yaml`, validated against LLM credential requirements before any engine invocation.
+This module implements a Cobra-based CLI application that manages LLM provider configuration and generates/maintains documentation through an incremental update pipeline. The architecture separates concerns into three phases: initialization (internal wiring), setup (interactive credential collection), and runtime operations (update commands). Data flow proceeds from `RootCmd` initialization → credential validation → setup execution or direct command dispatch.
 
-## Command Registration & Entry Point
+## Command Hierarchy & Wiring
 
-### `init.go` — Init Command Instantiation
+### Initialization Layer (`init.go`)
 
-```go
-var initCmd *cobra.Command // package-level singleton
-func init() { /* registration */ }
+Internal-only wiring establishes the Cobra command tree without exported symbols. This layer registers subcommands with the root command, validates command dependencies at package load time, and configures persistent flag inheritance across the hierarchy.
+
+### Root Command (`root.go`)
+
+**`RootCmd`** — Defines the cobra root command for the CLI application. Configures usage text, completion options, and persistent flags shared by all subcommands. Serves as the single entry point for all CLI operations.
+
+**`NeedsCredentialSetup()`** — Returns `true` if the resolved configuration lacks a model ID, indicating that credential setup is required before execution of any command. This function reads from persisted config state to gate subsequent operation flows.
+
+### Setup Command (`cmd/setup.go`)
+
+**`RunSetupFlow()`** — Guides the user through an interactive setup flow to collect:
+- LLM Model ID
+- Ollama Base URL
+- Context size limit
+- Ignored file paths
+- Documentation directory path
+
+All collected values are persisted into a local configuration file via `config.SaveConfig`. The function handles input validation and persists state atomically.
+
+### Update Command (`update.go`)
+
+**`updateCmd`** — Defines a Cobra command instance that triggers incremental documentation updates by scanning files changed since the last documented commit. Reads diff metadata from version control state to determine which documentation sections require regeneration.
+
+**`init()`** — Registers the update command with `RootCmd` during package initialization to integrate it into the CLI's command hierarchy. This registration occurs at import time via `Command.AddCommand()`.
+
+## Data Flow
+
+```
+CLI Invocation → RootCmd.ParseArgs() → NeedsCredentialSetup() check
+    ├── true (no model ID) → RunSetupFlow() → config.SaveConfig() → re-invocation
+    └── false (config present) → Dispatch to updateCmd or default command
+        └── updateCmd.ScanChangedFiles() → DocumentationRegeneration()
 ```
 
-- **`initCmd`** instantiates the Cobra subcommand for `init`, binding usage documentation and execution logic that triggers repository scanning and wiki markdown page generation.
-- **`init()`** registers `initCmd` on the root command hierarchy at package initialization, ensuring the parser discovers it without explicit user invocation.
+## Dependency Graph
 
-### `root.go` — Root Command & Execution Delegation
-
-```go
-type root struct { /* Cobra.Command */ }
-func executeCommand(mode string) error
-func NeedsCredentialSetup(cfg *config.Config) bool
-```
-
-- **`RootCmd`** exposes the primary Cobra command instance; all subcommands (`init`, `update`) are children of this node.
-- **`executeCommand()`** performs three-stage validation: (1) git repository integrity check, (2) configuration resolution from persisted state, (3) initialization-state verification. It then delegates to an engine based on the supplied mode argument.
-- **`NeedsCredentialSetup()`** inspects the resolved project configuration; returns `true` if critical LLM model credentials are absent. Used by `executeCommand()` to gate engine invocation until credential setup completes.
-
-## Configuration Setup Flow
-
-### `setup.go` — Interactive Config Generation
-
-```go
-func RunSetupFlow() error
-```
-
-- **`RunSetupFlow()`** drives an interactive terminal session that prompts the user for configuration parameters and persists them via `config.SaveConfig`. Output: `.code-reducer.yaml` written to project root. This function is invoked only when credential setup is required or initial configuration does not exist.
-
-## Update Command — Internal Implementation
-
-### `update.go` — Unexported Package-Private Operations
-
-```go
-// No exported identifiers. All functions begin with lowercase letters.
-```
-
-- Contains no exported functions, variables, structs, interfaces, or data structures. Identifiers (`updateCmd`, internal helpers) are package-private, meaning update-specific logic is scoped to the `cmd` package and not exposed externally.
+- `root.go` depends on `setup.go` for credential validation gating
+- `update.go` depends on config state established by `setup.go`
+- `init.go` provides the internal wiring glue between all exported components

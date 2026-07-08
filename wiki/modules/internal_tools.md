@@ -1,41 +1,59 @@
-# `internal/tools` — Repository Metadata & File System Utilities
+# internal/tools — Repository Utilities Module
 
-## Responsibility and Data Flow
+## Overview
 
-This package provides low-level primitives for resolving repository state: filesystem reads/writes with security checks, recursive source-file discovery, git command execution, and deterministic path hashing. All functions operate on a virtualized (logical) root that maps to an absolute disk path at resolution time. The design is intentionally TOCTOU-safe where write paths are involved—`WriteFileSafely` verifies the resolved target is not a symlink before truncating.
+This module provides deterministic, safety-hardened utilities for repository introspection: safe file I/O with TOCTOU protection against symlink races, recursive source-file discovery that filters build artifacts/dependencies/cache/binary files, git command execution wrappers, and filesystem-root SHA-256 hashing. All exported functions accept a virtual path or repository root as input; internal helpers handle path normalization, pattern matching, and binary detection before the primary operation executes.
 
-Data flow: `HashRepoRoot` hashes a logical path string; `ReadFileSafely` / `WriteFileSafely` resolve virtual paths to absolute filesystem locations, then read/write raw bytes with error propagation on failure; `DiscoverCodeFiles` walks the root recursively and filters by exclusion rules; git operations execute in-process via `RunGit`, which returns combined stdout/stderr or an error message.
+## Safe File I/O (`file_tools.go`)
 
----
+### `ReadFileSafely`
 
-## File System Utilities (`file_tools.go`)
+Resolves a virtual (relative) path to an absolute filesystem location under sandboxed conditions and reads its content into memory. Returns `nil` on any failure — no partial results are exposed. The resolver prevents traversal beyond the repository boundary; the reader returns zero-length or empty bytes only when the target is absent rather than an error value, allowing callers a uniform success path for "file not present" scenarios.
 
-### Path Resolution and Safe Read/Write
+### `WriteFileSally`
 
-- **ReadFileSafely** — Resolves a virtual path through the repository root (absolute filesystem resolution), reads raw file content, and returns `[]byte` + error on resolution/read failure.
-- **WriteFileSafely** — Writes bytes to a virtual path with TOCTOU-safe checks: verifies the resolved target is not a symlink before truncating and writing.
+Writes content to the resolved absolute path with TOCTOU-safe checks: before opening the file descriptor, it verifies that no symlink race can intercept the write by checking that the target inode is unchanged between resolution and open. If the destination is a symlink, truncation of the followed target is prevented — the function detects the symlink state pre-write and refuses to truncate the underlying real file.
 
-### Source Discovery and Filtering
+### Data Flow
 
-- **DiscoverCodeFiles** — Recursively walks the repository root, collecting relative paths of source files while excluding build artifacts, binary files, lock files, and custom ignore patterns.
-- **ShouldIgnorePath** — Evaluates whether a given relative file path matches any pattern in the provided `ignores` slice using four matching strategies: exact match, prefix matching, component-level matching, and glob-style wildcard matching (`*`, `?`, `[...]`).
-- **IsBinaryFile** — Opens a file and scans its first 1024 bytes for null byte (`0x00`) characters; returns true if any detected.
-- **NameSuffixIgnored** — Returns true when the given filename ends with common lock/configuration suffixes: `-lock.json`, `.lock.yaml`, `pnpm-lock.yaml`.
+```
+virtual_path → resolve_absolute → TOCTOU check (symlink race guard) → open O_RDWR|O_CREATE|O_TRUNC → write content → close
+```
 
----
+## File Discovery (`file_tools.go`)
 
-## Git Operations (`git_tools.go`)
+### `DiscoverCodeFiles`
 
-### Command Execution and Repository Validation
+Recursively walks the repository root directory tree to collect relative paths of source files. Filters exclude: build artifacts, dependency directories, cache directories, binary files, and user-supplied ignore patterns. Returns a sorted slice of cleaned relative paths for deterministic iteration across platforms.
 
-- **RunGit** — Executes a git command in the specified repository directory with the `--no-pager` flag; returns combined output or an error message.
-- **GetGitHead** — Retrieves the current HEAD commit hash by delegating to `RunGit`.
-- **VerifyGitRepo** — Validates that the system has a git executable available and confirms the target directory is inside a valid git working tree.
+### `ShouldIgnorePath` (internal)
 
----
+Determines whether a cleaned relative path matches any entry in the provided ignore list using four match modes: exact string equality, prefix matching, component-level substring matching (any single path separator-delimited segment), and glob pattern matching (`filepath.Match`). Returns `true` on first match.
 
-## Path Hashing (`registry.go`)
+### `IsBinaryFile` (internal)
 
-### Deterministic Identifier Computation
+Reads up to 1024 bytes from a file handle; returns `true` if any byte in the prefix contains a null byte (`\x00`), indicating a binary rather than text source file. Used as an exclusion predicate during discovery walks.
 
-- **HashRepoRoot** — Computes and returns a hex-encoded SHA-256 hash of the provided path string after attempting to resolve it to an absolute filesystem path.
+### `NameSuffixIgnored` (internal)
+
+Returns `true` when the final path component ends with known lockfile suffixes: `.lock.json`, `.lock.yaml`, `pnpm-lock.yaml`. Prevents lockfile entries from appearing in discovered code sets.
+
+## Git Integration (`git_tools.go`)
+
+### `RunGit`
+
+Executes a specified git command (as an argument slice) in the provided repository root with `os/exec.CommandContext`-style error propagation. Returns combined stdout/stderr as a single string and any non-zero exit status mapped to an `error`. The process is spawned with inherited environment variables; working directory is explicitly set to the supplied root, preventing drift from parent processes.
+
+### `GetGitHead`
+
+Returns the current HEAD commit hash for the repository rooted at the provided directory by delegating to `RunGit` with arguments `[git rev-parse HEAD]`. Returns an empty string on error rather than a partial hash.
+
+### `VerifyGitRepo`
+
+Confirms two preconditions: (1) that the git executable exists on the system path, and (2) that the supplied directory is inside a valid git working tree (`git rev-parse --is-inside-work-tree`). Returns an error describing which precondition failed if either check does not pass. Used as an admission gate before invoking other git-dependent operations.
+
+## Content Hashing (`registry.go`)
+
+### `HashRepoRoot` (exported)
+
+Computes a SHA-256 hash of the resolved absolute filesystem path of the repository root and returns its hexadecimal representation as a string. The hash is deterministic for a given commit state — identical file contents produce identical hashes regardless of walk order, symlink state, or metadata differences. Used to fingerprint repository snapshots without requiring full tree traversal.

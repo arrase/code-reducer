@@ -55,7 +55,7 @@ func AcquireLock(repoRoot string, exclusive bool) (*SimpleLock, error) {
 	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		if os.IsExist(err) {
-			return nil, fmt.Errorf("lock at %s is already held by another process", lockPath)
+			return nil, fmt.Errorf("lock at %s is already held by another process. If you are sure no other code-reducer process is running, delete this stale lockfile manually", lockPath)
 		}
 		return nil, fmt.Errorf("failed to acquire lock at %s: %w", lockPath, err)
 	}

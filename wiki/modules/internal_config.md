@@ -1,63 +1,50 @@
-# Configuration Module (`internal/config`)
+# `internal/config` — Configuration Resolution and Persistence
 
-## Responsibility
+## Module Responsibility
 
-This module owns the application's runtime configuration lifecycle: loading defaults, merging user-provided overrides from multiple sources (CLI flags, environment variables, YAML file), persisting state, and injecting resolved values into the OS process environment for downstream components. It is a single source of truth for model identity (`CodeReducerModelIdEnvKey`), Ollama server connection parameters, tracing instrumentation options, and ignored-path/last-commit metadata stored in `.code-reducer.yaml`.
+The `internal/config` package owns the complete lifecycle of application configuration: detection, loading, merging, resolution, and persistence. It provides a layered resolution strategy that merges system defaults → YAML file → environment variables → CLI flags into a single canonical `*Config`. All resolved values are also propagated to external tracing environment variables so downstream services observe them without separate injection logic.
 
-## Data Flow: Configuration Resolution Pipeline
+## Constants
 
-The core operation is `ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config`, which orchestrates a four-tier resolution strategy:
-
-1. **System Defaults** — Hard-coded fallbacks (`OllamaDefaultBaseURL = "http://localhost:11434"`, `OllamaDefaultNumCtx = 8192`) serve as the base layer.
-2. **YAML Config File** — If present (detected via `ConfigExists(cwd string) bool`), `LoadConfig(cwd string) (*Config, error)` unmarshals `.code-reducer.yaml` from `repoRoot`. Missing or unreadable files yield an empty struct rather than returning errors.
-3. **Environment Variables** — Each tier-specific override key (`CodeReducerModelIdEnvKey`, `OllamaBaseUrlEnvKey`, `OllamaNumCtxEnvKey`, `LangsmithApiKeyEnvKey`, `LangchainProjectEnvKey`, `LangchainTracingEnvKey`) is read from `os.Getenv` and applied to the resolved config when non-empty.
-4. **CLI Flags** — Explicit positional arguments (`modelIdFlag`, `numCtxFlag`) take precedence over environment variables, providing the highest-priority runtime override for model identity and context window size respectively.
-
-The final resolved `*Config` value is returned with all tracing-related environment variables propagated to the OS process via `os.Setenv`, ensuring downstream packages (e.g., LangSmith/Tracing client initializers) observe consistent configuration without requiring explicit dependency on this module.
-
-## Configuration Types and Schema
-
-```go
-type Config struct {
-    // Model identity — overridden by CLI/env when present
-    CodeReducerModelId string `yaml:"model_id"`
-
-    // Ollama connection parameters
-    OllamaBaseUrl  string `yaml:"base_url"`
-    OllamaNumCtx   int    `yaml:"num_ctx"`
-
-    // LangSmith tracing configuration
-    LangsmithTracingEnabled bool   `yaml:"langsmith_tracing_enabled,omitempty"`
-    LangsmithApiKey         string `yaml:"langsmith_api_key,omitempty"`
-
-    // LangChain v2 tracing configuration
-    LangchainTracingEnabled bool   `yaml:"langchain_tracing_enabled,omitempty"`
-    LangchainProjectName    string `yaml:"langchain_project_name,omitempty"`
-
-    // Operational metadata
-    IgnoredPaths []string `yaml:"ignored_paths,omitempty"`
-    DocDirectory  string   `yaml:"doc_directory,omitempty"`
-    LastCommitSHA string   `yaml:"last_commit_sha,omitempty"`
-}
-```
-
-## Persistence Operations
-
-- **`ConfigExists(cwd string) bool`** — Returns true if `.code-reducer.yaml` exists in the given working directory via `os.Stat`, enabling conditional loading.
-- **`LoadConfig(cwd string) (*Config, error)`** — Reads and unmarshals the YAML file into a `*Config`. On failure (missing/unreadable), returns an initialized empty struct with no error; callers must inspect the returned value for defaults rather than treating nil as "not loaded".
-- **`SaveConfig(cwd string, cfg *Config) error`** — Marshals the configuration to YAML and writes it atomically with `os.FileMode(0600)` permissions. Marshaling or write failures are wrapped in a single error value; callers should handle the returned error uniformly without distinguishing cause unless necessary for observability.
-
-## Environment Variable Keys (Process Propagation)
-
-The following keys are injected into `os.Environ` during resolution when their corresponding values are non-empty:
-
-| Key | Purpose |
+| Constant | Purpose |
 |---|---|
-| `CodeReducerModelIdEnvKey` | Runtime model identifier override |
-| `OllamaBaseUrlEnvKey` | Ollama server endpoint override |
-| `OllamaNumCtxEnvKey` | Context window token count override |
-| `LangsmithApiKeyEnvKey` | LangSmith tracing API key injection |
-| `LangchainProjectEnvKey` | LangChain v2 project name injection |
-| `LangchainTracingEnvKey` | LangChain v2 tracing enable/disable flag |
+| `ConfigFileName` | Canonical filename `.code-reducer.yaml` used for all disk read/write operations within the package. |
+| `CodeReducerModelIdEnvKey` | Environment variable key that overrides the LLM model identifier at runtime. |
+| `OllamaBaseUrlEnvKey` | Environment variable key that overrides the Ollama API base URL at runtime. |
+| `OllamaNumCtxEnvKey` | Environment variable key that overrides the Ollama context size (window) at runtime. |
+| `LangsmithApiKeyEnvKey` | Environment variable key for the LangSmith tracing API key. |
+| `LangchainProjectEnvKey` | Environment variable key for the LangChain project identifier. |
+| `LangchainTracingEnvKey` | Environment variable key that enables/disables LangChain v2 tracing. |
+| `OllamaDefaultBaseURL` | Fallback base URL used when neither config nor environment overrides the Ollama endpoint. |
+| `OllamaDefaultNumCtx` | Default context size (8192) applied when no explicit override is present in any layer. |
 
-This propagation pattern ensures that any process spawned from this application inherits the resolved configuration without requiring explicit re-configuration in downstream binaries.
+## Structs
+
+### `Config`
+
+Schema for `.code-reducer.yaml`. Fields cover: LLM model ID, Ollama settings (base URL, context size), Langsmith/Langchain tracing configuration (API key, project, enabled flag), ignored file paths, and the docs directory path. This struct is the canonical in-memory representation of all configuration sources after resolution.
+
+## Functions
+
+### `ConfigExists(dir string) bool`
+
+Performs a filesystem check via `os.Stat` to determine whether `.code-reducer.yaml` exists within `dir`. Returns `true` only when the file is present; callers use this gate before attempting load operations to avoid silent failures.
+
+### `LoadConfig(dir string) (*Config, error)`
+
+Reads `.code-reducer.yaml` from `dir`, parses it with `yaml.Unmarshal`, and returns a populated `*Config`. Returns an error if the file does not exist (caller should verify via `ConfigExists` first) or if parsing fails. This is the raw-disk loader; no merging, validation, or default injection occurs here.
+
+### `SaveConfig(config *Config, dir string) error`
+
+Serializes a `*Config` to YAML and writes it to `.code-reducer.yaml` in `dir`. The file is created with Unix mode `0600`, ensuring the configuration file remains world-unreadable on disk. This function handles both initial creation and updates; callers are responsible for providing a fully populated config.
+
+### `ResolveConfig(cliFlags, env vars) (*Config, error)`
+
+Terminal resolution step that merges four precedence layers into a single canonical `*Config`:
+
+1. **System defaults** — hardcoded fallbacks (`OllamaDefaultBaseURL`, `OllamaDefaultNumCtx`).
+2. **YAML config** — loaded via `LoadConfig` from disk (if present).
+3. **Environment variables** — read from the process environment using the defined env keys; overrides YAML values where applicable.
+4. **CLI flags** — provided by the caller at startup; highest precedence.
+
+After merging, the resolved struct is written back to external tracing environment variables so that downstream tracing infrastructure observes consistent configuration without separate injection calls. Returns the fully resolved `*Config` and any error encountered during resolution or serialization.

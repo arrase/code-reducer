@@ -1,428 +1,20 @@
 package engine
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"time"
 
 	"github.com/arrase/code-reducer/internal/config"
 	"github.com/arrase/code-reducer/internal/security"
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
-type FileCacheEntry struct {
-	SHA256 string `json:"sha256"`
-	Facts  string `json:"facts"`
-}
-
-type MetadataCache struct {
-	LastDocumentedCommit string                    `json:"last_documented_commit"`
-	Files                map[string]FileCacheEntry `json:"files"`
-	Modules              map[string]string         `json:"modules"`
-}
-
-func loadMetadataCache(repoRoot string, docsDir string) (*MetadataCache, error) {
-	metadataPath := filepath.Join(docsDir, ".metadata.json")
-	data, err := tools.ReadFileSafely(repoRoot, metadataPath)
-	if err != nil {
-		return &MetadataCache{
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}, nil
-	}
-	var cache MetadataCache
-	if err := json.Unmarshal(data, &cache); err != nil {
-		return &MetadataCache{
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}, nil
-	}
-	if cache.Files == nil {
-		cache.Files = make(map[string]FileCacheEntry)
-	}
-	if cache.Modules == nil {
-		cache.Modules = make(map[string]string)
-	}
-	return &cache, nil
-}
-
-func saveMetadataCache(repoRoot string, docsDir string, cache *MetadataCache) error {
-	metadataPath := filepath.Join(docsDir, ".metadata.json")
-	data, err := json.MarshalIndent(cache, "", "  ")
-	if err != nil {
-		return err
-	}
-	return tools.WriteFileSafely(repoRoot, metadataPath, data)
-}
-
-func computeSHA256(repoRoot, virtualPath string) (string, error) {
-	content, err := tools.ReadFileSafely(repoRoot, virtualPath)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.Sum256(content)
-	return hex.EncodeToString(hash[:]), nil
-}
-
-
-
-type FileChange struct {
-	Path   string
-	Status string // "Added", "Modified", "Deleted"
-}
-
-func isAllowedFile(repoRoot, relPath string, ignores []string) bool {
-	if tools.ShouldIgnorePath(relPath, ignores) {
-		return false
-	}
-
-	components := strings.Split(relPath, string(filepath.Separator))
-	ignoredDirs := map[string]bool{
-		".git":             true,
-		"node_modules":     true,
-		"dist":             true,
-		"build":            true,
-		"cache":            true,
-		"code-reducer":     true,
-		".gemini":          true,
-		"bower_components": true,
-		"__pycache__":      true,
-		".pytest_cache":    true,
-		".mypy_cache":      true,
-		".tox":             true,
-		"venv":             true,
-		".venv":            true,
-	}
-	for _, comp := range components {
-		if ignoredDirs[comp] || strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".egg-info") {
-			return false
-		}
-	}
-
-	name := filepath.Base(relPath)
-	ext := strings.ToLower(filepath.Ext(name))
-	if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".pdf" ||
-		ext == ".exe" || ext == ".dll" || ext == ".so" || ext == ".o" || ext == ".a" ||
-		ext == ".zip" || ext == ".gz" || ext == ".tar" || ext == ".lock" || ext == ".pyc" ||
-		ext == ".pyo" || ext == ".pyd" || tools.NameSuffixIgnored(name) {
-		return false
-	}
-
-	absPath, err := security.SafeResolve(repoRoot, relPath)
-	if err != nil {
-		return false
-	}
-
-	if tools.IsBinaryFile(absPath) {
-		return false
-	}
-
-	return true
-}
-
-func propagateAffected(node *DirNode, affectedDirs map[string]bool) bool {
-	isAffected := affectedDirs[node.Path]
-	for _, child := range node.Children {
-		if propagateAffected(child, affectedDirs) {
-			isAffected = true
-		}
-	}
-	if isAffected {
-		affectedDirs[node.Path] = true
-	}
-	return isAffected
-}
-
-func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataCache, filteredChanges []FileChange, affectedDirs map[string]bool) {
-	changedFiles := make(map[string]bool)
-	for _, c := range filteredChanges {
-		changedFiles[c.Path] = true
-	}
-
-	var checkNode func(n *DirNode)
-	checkNode = func(n *DirNode) {
-		for _, f := range n.Files {
-			if changedFiles[f] {
-				affectedDirs[n.Path] = true
-				break
-			}
-		}
-
-		safeName := strings.ReplaceAll(n.Path, string(filepath.Separator), "_")
-		if safeName == "." || safeName == "" {
-			safeName = "root"
-		}
-		modulePath := filepath.Join(docsDir, "modules", safeName+".md")
-		absModulePath, err := security.SafeResolve(repoRoot, modulePath)
-		if err == nil {
-			if _, err := os.Stat(absModulePath); os.IsNotExist(err) {
-				affectedDirs[n.Path] = true
-			}
-		}
-
-		if cache.Modules[n.Path] == "" {
-			affectedDirs[n.Path] = true
-		}
-
-		for _, child := range n.Children {
-			checkNode(child)
-		}
-	}
-	checkNode(node)
-}
-
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type LLMClient struct {
-	ModelID    string
-	BaseURL    string
-	NumCtx     int
-	HTTPClient *http.Client
-}
-
-func NewLLMClient(modelID, baseURL string, numCtx int) *LLMClient {
-	return &LLMClient{
-		ModelID:    modelID,
-		BaseURL:    baseURL,
-		NumCtx:     numCtx,
-		HTTPClient: &http.Client{Timeout: 10 * time.Minute},
-	}
-}
-
-// Structs for Ollama requests and responses
-type ollamaRequest struct {
-	Model    string         `json:"model"`
-	Messages []Message      `json:"messages"`
-	Stream   bool           `json:"stream"`
-	Format   string         `json:"format,omitempty"`
-	Options  *ollamaOptions `json:"options,omitempty"`
-}
-
-type ollamaOptions struct {
-	NumCtx int `json:"num_ctx,omitempty"`
-}
-
-type ollamaResponse struct {
-	Message Message `json:"message"`
-}
-
-type ollamaChunk struct {
-	Message Message `json:"message"`
-	Done    bool    `json:"done"`
-}
-
-// CallLLM invokes the LLM via HTTP failing fast without retries.
-func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error) {
-	baseURL := c.BaseURL
-	if baseURL == "" {
-		baseURL = "http://localhost:11434"
-	}
-	url := strings.TrimSuffix(baseURL, "/") + "/api/chat"
-
-	options := &ollamaOptions{NumCtx: c.NumCtx}
-	if options.NumCtx <= 0 {
-		options.NumCtx = 8192
-	}
-
-	reqBody := ollamaRequest{
-		Model:    c.ModelID,
-		Messages: append([]Message{{Role: "system", Content: systemPrompt}}, messages...),
-		Stream:   false,
-		Options:  options,
-	}
-	if jsonFormat {
-		reqBody.Format = "json"
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		respData, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", err
-		}
-
-		var result ollamaResponse
-		if err := json.Unmarshal(respData, &result); err != nil {
-			return "", fmt.Errorf("failed to parse response: %w", err)
-		}
-		return result.Message.Content, nil
-	}
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return "", fmt.Errorf("ollama api error: status %d, response: %s", resp.StatusCode, string(body))
-}
-
-// StreamLLM streams responses in real time from the LLM.
-func (c *LLMClient) StreamLLM(ctx context.Context, systemPrompt string, messages []Message, onChunk func(string)) error {
-	baseURL := c.BaseURL
-	if baseURL == "" {
-		baseURL = "http://localhost:11434"
-	}
-	url := strings.TrimSuffix(baseURL, "/") + "/api/chat"
-
-	options := &ollamaOptions{NumCtx: c.NumCtx}
-	if options.NumCtx <= 0 {
-		options.NumCtx = 8192
-	}
-
-	reqBody := ollamaRequest{
-		Model:    c.ModelID,
-		Messages: append([]Message{{Role: "system", Content: systemPrompt}}, messages...),
-		Stream:   true,
-		Options:  options,
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("ollama api error (stream): status %d, response: %s", resp.StatusCode, string(body))
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("error reading stream: %w", err)
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		var chunk ollamaChunk
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			continue
-		}
-		if chunk.Message.Content != "" && onChunk != nil {
-			onChunk(chunk.Message.Content)
-		}
-		if chunk.Done {
-			break
-		}
-	}
-
-	return nil
-}
-
 type Event struct {
 	Type    string
 	Message string
-}
-
-var markdownFenceRe = regexp.MustCompile("(?s)^\\x60{3,}(?:markdown|json)?\\s*(.*?)\\s*\\x60{3,}$")
-
-func stripOuterMarkdownFence(content string) string {
-	trimmed := strings.TrimSpace(content)
-	if matches := markdownFenceRe.FindStringSubmatch(trimmed); len(matches) > 1 {
-		return strings.TrimSpace(matches[1])
-	}
-	return trimmed
-}
-
-func (c *LLMClient) GetDefaultSystemPrompt(command string) string {
-	basePrompt := "You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.\n"
-	switch command {
-	case "extract_file":
-		return basePrompt + "Task: Analyze a single source code file.\nOutput: A strict Markdown list of all exported functions, classes, interfaces, and core data structures. Under each item, write EXACTLY ONE sentence explaining its technical purpose. Do not write any introductory paragraphs."
-	case "module_synthesis":
-		return basePrompt + "Task: Write a technical documentation page for a code module based on the provided list of its internal components.\nRule 1: Group related functions and classes under appropriate Markdown headings.\nRule 2: Explain the responsibility of the module and the data flow.\nRule 3: Keep it highly technical and dense."
-	case "architecture":
-		return basePrompt + "Task: Write a global architecture or quickstart document based on the module summaries.\nRule 1: Explain the system boundaries and how the modules interact.\nRule 2: Provide a dense, developer-friendly overview."
-	default:
-		return basePrompt
-	}
-}
-
-func (c *LLMClient) LoadSystemPrompt(command string) (string, error) {
-	return c.GetDefaultSystemPrompt(command), nil
-}
-
-type DirNode struct {
-	Path     string
-	Files    []string
-	Children map[string]*DirNode
-}
-
-func buildTree(files []string) *DirNode {
-	root := &DirNode{Path: ".", Children: make(map[string]*DirNode)}
-	for _, f := range files {
-		d := filepath.Dir(f)
-		if d == "." {
-			root.Files = append(root.Files, f)
-			continue
-		}
-
-		parts := strings.Split(d, string(filepath.Separator))
-		curr := root
-		currPath := ""
-		for _, part := range parts {
-			if currPath == "" {
-				currPath = part
-			} else {
-				currPath = currPath + string(filepath.Separator) + part
-			}
-			if _, ok := curr.Children[part]; !ok {
-				curr.Children[part] = &DirNode{Path: currPath, Children: make(map[string]*DirNode)}
-			}
-			curr = curr.Children[part]
-		}
-		curr.Files = append(curr.Files, f)
-	}
-	return root
 }
 
 func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []string, logEvent func(string, string)) (string, error) {
@@ -430,12 +22,17 @@ func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []
 		return "", nil
 	}
 
+	maxChunkChars := c.NumCtx * 3
+	if maxChunkChars <= 0 {
+		maxChunkChars = 24576 // 8192 * 3
+	}
+
 	var batches [][]string
 	var currentBatch []string
 	currentLen := 0
 
 	for _, item := range items {
-		if currentLen+len(item) > 15000 && len(currentBatch) > 0 {
+		if currentLen+len(item) > maxChunkChars && len(currentBatch) > 0 {
 			batches = append(batches, currentBatch)
 			currentBatch = []string{item}
 			currentLen = len(item)
@@ -446,6 +43,21 @@ func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []
 	}
 	if len(currentBatch) > 0 {
 		batches = append(batches, currentBatch)
+	}
+
+	// Prevent infinite loop if items cannot be batched together
+	if len(batches) == len(items) && len(items) > 1 {
+		logEvent("status", "➜ Warning: Items too large to batch, truncating to fit context window")
+		allowedPerItem := maxChunkChars / len(items)
+		var truncatedItems []string
+		for _, item := range items {
+			if len(item) > allowedPerItem {
+				truncatedItems = append(truncatedItems, item[:allowedPerItem]+"\n...[truncated]")
+			} else {
+				truncatedItems = append(truncatedItems, item)
+			}
+		}
+		batches = [][]string{truncatedItems}
 	}
 
 	if len(batches) == 1 {
