@@ -18,7 +18,7 @@ func NewRunner(cfg *config.Config) *Runner {
 	}
 }
 
-func (r *Runner) Run(ctx context.Context, repoRoot string, userMessage string, onEvent func(Event)) error {
+func (r *Runner) Run(ctx context.Context, repoRoot string, mode string, onEvent func(Event)) error {
 	logEvent := func(t, m string) {
 		if onEvent != nil {
 			onEvent(Event{Type: t, Message: m})
@@ -41,8 +41,16 @@ func (r *Runner) Run(ctx context.Context, repoRoot string, userMessage string, o
 	client := NewLLMClient(r.cfg.ModelID, r.cfg.OllamaBaseURL, r.cfg.OllamaNumCtx)
 
 	// 4. Run the documentation pipeline
-	if err := client.RunInit(ctx, repoRoot, r.cfg, userMessage, onEvent); err != nil {
-		return err
+	if mode == "init" {
+		if err := client.RunInit(ctx, repoRoot, r.cfg, onEvent); err != nil {
+			return err
+		}
+	} else if mode == "update" {
+		if err := client.RunUpdate(ctx, repoRoot, r.cfg, onEvent); err != nil {
+			return err
+		}
+	} else {
+		return fmt.Errorf("unsupported mode: %s", mode)
 	}
 
 	return nil

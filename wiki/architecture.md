@@ -1,74 +1,114 @@
-# Architecture Overview
+# Architecture — Code Reducer
 
-## System Boundaries
+## 1. System Boundaries
 
-Code-Reducer is a single-process CLI application that ingests source code from a repository root, ranks candidate files via BM25 lexical scoring against user queries, synthesizes documentation through an LLM pipeline, and persists configuration with restricted permissions. The system operates as a lock-serialized engine: concurrent invocations are prevented via POSIX file locking (`AcquireLock`), the analysis boundary is enforced through path-traversal protection (`SafeResolve`), and all I/O passes through TOCTOU-safe wrappers to reject symlink races.
+**Code Reducer** is a Go-based CLI tool that generates and maintains automated documentation (wiki pages) from repository state via LLM inference. It operates as a single-process, lock-serialized agent: every run acquires an exclusive flock on a dedicated lockfile before performing any filesystem or Git operation, ensuring no two invocations can mutate the documentation store concurrently.
 
-**External boundaries:**
-- CLI invocation → `RootCmd` dispatches subcommand
-- Configuration resolved via layered precedence (system defaults → YAML file → env vars → CLI flags)
-- Security perimeter established (`AcquireLock`, `SafeResolve`)
-- Repository traversal discovers source files (`DiscoverCodeFiles`)
-- BM25 ranking scores candidate documents against query terms
-- LLM synthesis consumes ranked content within bounded context window
-- Documentation persisted to `DocsDir`
+The application has three external dependencies:
+- **Ollama** (default base URL `http://localhost:11434`) — LLM inference backend; configurable via config file, environment variable, or CLI flag.
+- **Git** — source of truth for repository state; used to enumerate changed files and compute commit SHAs.
+- **LangSmith / LangChain v2** (optional) — tracing instrumentation providers, injected into the process environment when enabled in configuration.
 
-## Module Interaction Map
+The tool runs on any OS that provides `flock(2)` semantics or a compatible lock primitive. It does not require network access beyond Ollama; all LLM calls are HTTP/JSON over a configurable base URL with a 10-minute timeout per request and retry logic for transient failures.
+
+## 2. Initialization Order & Module Interaction
+
+Execution follows a strict dependency chain: `security` → `tools` → `config` → `engine`, with `cmd` at the top bridging user input to engine execution. Every subsystem that touches repository state consults `security` first; every subsystem that performs filesystem I/O relies on `tools`; every subsystem that needs runtime parameters reads from `config`; the `engine` orchestrates the full pipeline and calls back into all three.
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌────────────┐
-│  CLI Layer   │     │ Config       │     │ Engine      │
-│              │     │ Subsystem    │     │             │
-│ RootCmd      │────▶│ ResolveConfig│────▶│ Runner      │
-│ NeedsCred    │     │ Load/Save    │     │ BM25+LLM   │
-│ RunSetupFlow │     │ ConfigSchema │     │ LLMClient  │
-└─────────────┘     └──────────────┘     └────────────┘
-       │                    │                   │
-       ▼                    ▼                   ▼
-┌─────────────┐     ┌──────────────┐     ┌────────────┐
-│ Security     │     │ Tools        │     │ DocsOut    │
-│ Subsystem    │     │ Subsystem    │     │            │
-│ SafeResolve  │     │ ReadFileSafely│   │ Persist    │
-│ AcquireLock  │     │ WriteFileSafely│  │ to DocsDir │
-│ EnsureGitignore│   │ DiscoverCodeFiles│
-└─────────────┘     └──────────────┘     └────────────┘
+┌─────────────────────────────────────────────────┐
+│  cmd (Cobra CLI)                                 │
+│    └── RootCmd / updateCmd                       │
+│          ├── config resolution                   │
+│          ├── signal handling                     │
+│          └── Runner.Run()                        │
+├─────────────────────────────────────────────────┤
+│  engine (orchestrator)                           │
+│    ├── runner.go    — lock acquisition, mode dispatch │
+│    ├── context.go   — tokenization, BM25 indexing  │
+│    ├── engine.go    — diff parsing, cache I/O       │
+│    ├── json_parser.go — response cleaning           │
+│    └── LLMClient      — HTTP chat API wrapper        │
+├─────────────────────────────────────────────────┤
+│  config (runtime parameters)                     │
+│    ├── ResolveConfig() — 4-tier precedence         │
+│    ├── SaveConfig()   — atomic YAML write          │
+│    └── propagation    — os.Setenv for downstream   │
+├─────────────────────────────────────────────────┤
+│  security (confinement & locking)                │
+│    ├── SafeResolve     — path traversal guard       │
+│    ├── AcquireLock     — flock(2) mutual exclusion  │
+│    └── EnsureGitignoreHasLockfile                  │
+├─────────────────────────────────────────────────┤
+│  tools (low-level primitives)                    │
+│    ├── ReadFileSafely / WriteFileSafely           │
+│    ├── DiscoverCodeFiles — recursive walk + filters│
+│    ├── RunGit / GetGitHead                        │
+│    └── HashRepoRoot   — SHA-256 of absolute path  │
+└─────────────────────────────────────────────────┘
 ```
 
-## Data Flow Summary
+### Data Flow: A Typical `update` Run
 
-**Initialization path:** `RootCmd` → `NeedsCredentialSetup()` → (if true) `RunSetupFlow()` → persist config atomically.
+1. **CLI entry** (`cmd/root.go`) parses flags, checks for credential setup, and dispatches to `executeCommand`.
+2. **Config resolution** (`config/ResolveConfig`) merges defaults → YAML file → env vars → CLI flags into a single `*Config`. Tracing keys are propagated via `os.Setenv` so downstream packages (LangSmith/LangChain) observe them without explicit dependency on this module.
+3. **Lock acquisition** (`security.AcquireLock`) serializes concurrent runs by flocking the lockfile; `.gitignore` is verified to contain the lock entry.
+4. **Repository validation** — `tools.VerifyGitRepo` ensures a valid git working tree exists.
+5. **Diff parsing** (`engine.parseGitDiff`) turns raw `git diff` output into a slice of `FileChange` records (Added/Modified/Deleted/Renamed/Copied).
+6. **Affected node detection** — `determineAffected` walks the directory tree, marking directories as affected whenever any child is changed; parent propagation ensures structural changes invalidate ancestor documentation entries.
+7. **BM25 indexing** (`context.FilterFilesBM25`) ranks repository files by relevance to a query string using term frequency statistics from tokenized content; top-K results form the context for LLM inference.
+8. **LLM call** — `LLMClient.CallLLM` streams the response with retry logic, accumulating chunks until completion or exhaustion of retries.
+9. **Response parsing** (`json_parser`) strips markdown fences and extracts JSON via brace-matching; `UnmarshalJSONResponse` deserializes into typed structs for downstream use.
+10. **Cache persistence** — `saveMetadataCache` writes `.metadata.json`; the next run reads it back to avoid reprocessing unchanged entities.
+11. **Commit** — Git HEAD SHA is updated in config upon success; lock released.
 
-**Analysis path:** `RootCmd` → `ResolveConfig()` → `AcquireLock()` → `DiscoverCodeFiles()` → BM25 scoring (`FilterFilesBM25`) → LLM synthesis (`CallLLM`/`StreamLLM`) → documentation persisted to `DocsDir`.
+## 3. Cache & State Persistence
 
-## Key Architectural Decisions
+Three state files live at the repository root:
 
-### Lock Serialization
-All operations are serialized through POSIX advisory file locking. `AcquireLock(repoRoot, exclusive)` returns a `*flock.Flock` handle that must be released by the caller. Concurrent invocations are prevented; no parallel execution within a single process lifetime.
+| File | Purpose | Format |
+|---|---|---|
+| `.code-reducer.yaml` | Runtime configuration (model ID, Ollama URL, tracing flags) | YAML |
+| `.metadata.json` | Last documented commit SHA + file/module cache map | JSON |
+| `<lockfile>` | Flock target for mutual exclusion | OS lock |
 
-### Path Traversal Protection
-`SafeResolve(repoRoot, inputPath)` is the mandatory entry point for all filesystem I/O. It validates external paths resolve strictly within `repoRoot`, rejects absolute paths and `..` traversals, and detects symlink targets pointing outside the repo boundary. Returns normalized absolute path on success or sentinel error on failure.
+The lock is ignored by git (`EnsureGitignoreHasLockfile` ensures the entry exists in `.gitignore`). Config and metadata files are written atomically with `0600` permissions; config loads return an empty struct on failure rather than erroring, so callers must inspect the returned value.
 
-### Configuration Precedence
-Four-layer resolution with strict override scope: system defaults → YAML file → environment variables (`CODE_REDUCER_MODEL_ID`, etc.) → CLI flags. Each layer is a pure function returning `(partial *Config, error)`. The resolver composes left-to-right; partial configs merge field-by-field with higher-precedence winning on any non-zero value. Returns a copy to prevent accidental mutation. If YAML parse fails, resolver treats it as "no config file" and falls through to env/CLI layers only.
+## 4. Configuration Precedence (Four-Tier Chain)
 
-### TOCTOU-Safe I/O
-`WriteFileSafely` performs a stat equivalent immediately prior to truncation; if target is not a regular file (symlink or directory), operation aborts with error, preventing `os.SYMLINK` race conditions where dangling symlinks could cause data loss.
+```
+1. System defaults   — OllamaDefaultBaseURL, OllamaDefaultNumCtx
+2. YAML file (.code-reducer.yaml) — unmarshaled if present; missing → empty struct
+3. Environment variables — CodeReducerModelIdEnvKey, OllamaBaseUrlEnvKey, etc.
+4. CLI flags            — --model-id, --num-ctx (highest priority)
+```
 
-### LLM Pipeline with Retry Logic
-`CallLLM` wraps synchronous invocation with retry logic for transient HTTP errors: status 429 (Too Many Requests) and 500–504 (server/transport failures). `StreamLLM` reads line-by-line from HTTP stream, invoking a callback per chunk.
+`ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)` returns the merged `*Config`. The YAML file is detected via `config.ConfigExists(cwd)`; a missing or unreadable file yields an empty struct with no error. On success, tracing-related env vars are propagated to the process so downstream binaries inherit them automatically.
 
-### BM25 Ranking
-Two-stage retrieval-generation pipeline: candidate files are loaded, tokenized via regex (`[a-z0-9]+`), scored with smoothed IDF against query terms using TF·IDF formula, sorted by descending relevance, and top K paths returned. Constants `k1=1.5` (TF saturation) and `b=0.75` (doc-length normalization) are configurable.
+## 5. Security Model
 
-### Prompt Injection Mitigation
-File path and content are encapsulated inside `<file_content>` XML-like tags before LLM consumption to mitigate prompt injection risks during synthesis.
+Every filesystem operation targeting repository resources passes through `security.SafeResolve`, which validates that resolved paths stay within the repo root and rejects path traversal components (`..`) at any resolution stage. Lock acquisition uses `flock(2)` with TOCTOU-safe checks: before truncation, the target is verified not to be a symlink (preventing hijack). `.gitignore` is maintained to exclude lock files from version control tracking.
 
-## Module Interaction Details
+## 6. LLM Interaction Contract
 
-**CLI Bootstrap ↔ Config:** `RootCmd` initializes the command tree; configuration resolution flows through `ResolveConfig`. If credentials missing, `NeedsCredentialSetup()` returns true and triggers `RunSetupFlow()`, which persists parameters atomically via `SaveConfig(cfg, path)` with mode 0600.
+The engine abstracts LLM access behind `LLMClient`, which holds model identity and transport parameters. The client:
+- Uses HTTP with a 10-minute timeout per request.
+- Implements retry logic for connection resets, rate limits, and transient errors.
+- Returns accumulated streamed chunks as a single string; partial responses are discarded only after retries exhaust.
 
-**Security ↔ Tools:** Security functions operate relative to canonical `repoRoot`. `SafeResolve` validates all paths before any tool function touches them. `AcquireLock` establishes the concurrency boundary that protects all operations in the pipeline.
+Response parsing handles common model behaviors where structured output is wrapped in conversational scaffolding (markdown fences, prefix/suffix text). `CleanJSONResponse` extracts JSON by either stripping fences or finding the first/last brace pair.
 
-**Engine ↔ Config:** `Runner` receives resolved config, instantiates `LLMClient`, and drives documentation generation within bounded context window (8192 default). BM25 scoring feeds ranked file paths into LLM prompt via `WrapInXmlDelimiter`.
+## 7. CLI Surface Area
 
-**Tools ↔ Security:** Low-level primitives (`ReadFileSafely`, `WriteFileSafely`) shield consumers from path resolution failures, symlink race conditions, and non-deterministic subprocess behavior. Data flows converge on byte-level operations before being consumed by higher-order tooling modules.
+The root command registers two persistent global flags (`--model-id`, `--num-ctx`) via package-level `init()`. Subcommands:
+- **update** — syncs wiki pages against repository changes since last documented commit; dispatches through `executeCommand` for full orchestration.
+- **setup** (implicit) — triggered when no config file exists; guides the user interactively to generate `.code-reducer.yaml`.
+
+Signal handling installs SIGINT/SIGTERM handlers that gracefully terminate engine execution during long-running LLM calls or diff parsing.
+
+## 8. Key Design Decisions
+
+- **Lock-first**: All write operations acquire an exclusive flock before any filesystem access, preventing concurrent mutation of the documentation store and metadata cache.
+- **Fail-safe defaults**: Config loads return empty structs on failure; BM25 indexing returns top-K with K clamped by context size; tokenization uses a compiled regex for performance.
+- **Path confinement**: Every repo-accessing operation is gated by `SafeResolve`, eliminating path traversal vectors at the entry point of every subsystem that touches repository state.
+- **Propagated env vars**: Tracing configuration keys are written to process environment on resolve, so downstream packages (LangSmith/LangChain) inherit them without needing explicit dependency on this module.

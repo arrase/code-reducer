@@ -34,3 +34,16 @@ func GetGitHead(repoRoot string) (string, error) {
 	return head, nil
 }
 
+// VerifyGitRepo checks if git is available and the directory is a git repository.
+func VerifyGitRepo(repoRoot string) error {
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git executable not found in system path")
+	}
+	_, err := RunGit(repoRoot, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		return fmt.Errorf("not a git repository (or any of the parent directories)")
+	}
+	return nil
+}
+
+

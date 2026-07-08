@@ -111,7 +111,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 			return nil
 		}
 
-		if shouldIgnorePath(rel, ignores) {
+		if ShouldIgnorePath(rel, ignores) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -131,7 +131,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 		if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".pdf" ||
 			ext == ".exe" || ext == ".dll" || ext == ".so" || ext == ".o" || ext == ".a" ||
 			ext == ".zip" || ext == ".gz" || ext == ".tar" || ext == ".lock" || ext == ".pyc" ||
-			ext == ".pyo" || ext == ".pyd" || nameSuffixIgnored(d.Name()) {
+			ext == ".pyo" || ext == ".pyd" || NameSuffixIgnored(d.Name()) {
 			return nil
 		}
 
@@ -147,7 +147,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 	return files, err
 }
 
-func shouldIgnorePath(relPath string, ignores []string) bool {
+func ShouldIgnorePath(relPath string, ignores []string) bool {
 	relClean := filepath.Clean(relPath)
 	for _, pattern := range ignores {
 		patternClean := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(pattern, "/")))
@@ -200,7 +200,7 @@ func IsBinaryFile(path string) bool {
 	return false
 }
 
-func nameSuffixIgnored(name string) bool {
+func NameSuffixIgnored(name string) bool {
 	lower := strings.ToLower(name)
 	return strings.HasSuffix(lower, "-lock.json") || strings.HasSuffix(lower, ".lock.yaml") || strings.HasSuffix(lower, "pnpm-lock.yaml")
 }

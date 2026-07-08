@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/mattn/go-isatty"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/arrase/code-reducer/internal/config"
 	"github.com/arrase/code-reducer/internal/engine"
+	"github.com/arrase/code-reducer/internal/tools"
 )
 
 var (
@@ -31,10 +34,15 @@ func init() {
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
 }
 
-func executeCommand(userMessage string) {
+func executeCommand(mode string) {
 	repoRoot, err := os.Getwd()
 	if err != nil {
 		fmt.Printf("Error getting current working directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := tools.VerifyGitRepo(repoRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -54,11 +62,37 @@ func executeCommand(userMessage string) {
 	// Resolve the merged configuration
 	cfg := config.ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)
 
+	// Command flow checks (Presence/Absence of .metadata.json and last_documented_commit)
+	metadataPath := filepath.Join(repoRoot, cfg.DocsDir, ".metadata.json")
+	lastSHA := ""
+	hasInit := false
+	if data, err := os.ReadFile(metadataPath); err == nil {
+		var meta struct {
+			LastDocumentedCommit string `json:"last_documented_commit"`
+		}
+		if json.Unmarshal(data, &meta) == nil && meta.LastDocumentedCommit != "" {
+			lastSHA = meta.LastDocumentedCommit
+			hasInit = true
+		}
+	}
+
+	if mode == "init" {
+		if hasInit {
+			fmt.Fprintf(os.Stderr, "Error: The project has already been initialized (last documented commit: %s). Please use 'code-reducer update' to refresh documentation.\n", lastSHA)
+			os.Exit(1)
+		}
+	} else if mode == "update" {
+		if !hasInit {
+			fmt.Fprintf(os.Stderr, "Error: The project has not been initialized yet. Please run 'code-reducer init' first.\n")
+			os.Exit(1)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	runner := engine.NewRunner(cfg)
-	err = runner.Run(ctx, repoRoot, userMessage, func(ev engine.Event) {
+	err = runner.Run(ctx, repoRoot, mode, func(ev engine.Event) {
 		if ev.Type == "status" {
 			fmt.Println(ev.Message)
 		} else if ev.Type == "error" {

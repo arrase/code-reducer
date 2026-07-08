@@ -2,11 +2,11 @@ model_id: ornith:9b
 ollama_base_url: http://localhost:11434
 ollama_num_ctx: 10000
 ignore:
-  - .gitignore
-  - README.md
-  - .code-reducer.yaml
-  - .code-reducer.lock
-  - code-reducer
-  - go.sum
-  - AGENT.md
+    - .gitignore
+    - README.md
+    - .code-reducer.yaml
+    - .code-reducer.lock
+    - code-reducer
+    - go.sum
+    - AGENTS.md
 docs_dir: wiki

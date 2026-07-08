@@ -1,94 +1,63 @@
-# internal/config — Configuration Management
+# Configuration Module (`internal/config`)
 
 ## Responsibility
 
-The `internal/config` module owns the entire configuration lifecycle for Code-Reducer: schema definition, filesystem persistence with restricted permissions, and multi-layer precedence resolution. It produces a single resolved `Config` instance consumed by the pipeline runner.
+This module owns the application's runtime configuration lifecycle: loading defaults, merging user-provided overrides from multiple sources (CLI flags, environment variables, YAML file), persisting state, and injecting resolved values into the OS process environment for downstream components. It is a single source of truth for model identity (`CodeReducerModelIdEnvKey`), Ollama server connection parameters, tracing instrumentation options, and ignored-path/last-commit metadata stored in `.code-reducer.yaml`.
 
----
+## Data Flow: Configuration Resolution Pipeline
 
-## Config Schema (`config.Config`)
+The core operation is `ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config`, which orchestrates a four-tier resolution strategy:
+
+1. **System Defaults** — Hard-coded fallbacks (`OllamaDefaultBaseURL = "http://localhost:11434"`, `OllamaDefaultNumCtx = 8192`) serve as the base layer.
+2. **YAML Config File** — If present (detected via `ConfigExists(cwd string) bool`), `LoadConfig(cwd string) (*Config, error)` unmarshals `.code-reducer.yaml` from `repoRoot`. Missing or unreadable files yield an empty struct rather than returning errors.
+3. **Environment Variables** — Each tier-specific override key (`CodeReducerModelIdEnvKey`, `OllamaBaseUrlEnvKey`, `OllamaNumCtxEnvKey`, `LangsmithApiKeyEnvKey`, `LangchainProjectEnvKey`, `LangchainTracingEnvKey`) is read from `os.Getenv` and applied to the resolved config when non-empty.
+4. **CLI Flags** — Explicit positional arguments (`modelIdFlag`, `numCtxFlag`) take precedence over environment variables, providing the highest-priority runtime override for model identity and context window size respectively.
+
+The final resolved `*Config` value is returned with all tracing-related environment variables propagated to the OS process via `os.Setenv`, ensuring downstream packages (e.g., LangSmith/Tracing client initializers) observe consistent configuration without requiring explicit dependency on this module.
+
+## Configuration Types and Schema
 
 ```go
 type Config struct {
-    // Model ID — identifies the LLM backend (e.g., "codellama/CodeLlama-13b-Instruct")
-    ModelID string
-    // Ollama settings — base URL, API key, timeout, concurrency
-    OllamaSettings OllamaSettings
-    // Langchain tracing enabled flag
-    LangchainTracing bool
-    // Langsmith tracing enabled flag
-    LangsmithTracing bool
-    // Paths excluded from processing (glob patterns)
-    IgnoredPaths []string
-    // Documentation output directory
-    DocsDir string
+    // Model identity — overridden by CLI/env when present
+    CodeReducerModelId string `yaml:"model_id"`
+
+    // Ollama connection parameters
+    OllamaBaseUrl  string `yaml:"base_url"`
+    OllamaNumCtx   int    `yaml:"num_ctx"`
+
+    // LangSmith tracing configuration
+    LangsmithTracingEnabled bool   `yaml:"langsmith_tracing_enabled,omitempty"`
+    LangsmithApiKey         string `yaml:"langsmith_api_key,omitempty"`
+
+    // LangChain v2 tracing configuration
+    LangchainTracingEnabled bool   `yaml:"langchain_tracing_enabled,omitempty"`
+    LangchainProjectName    string `yaml:"langchain_project_name,omitempty"`
+
+    // Operational metadata
+    IgnoredPaths []string `yaml:"ignored_paths,omitempty"`
+    DocDirectory  string   `yaml:"doc_directory,omitempty"`
+    LastCommitSHA string   `yaml:"last_commit_sha,omitempty"`
 }
 ```
 
-`Config` is the canonical schema for `.code-reducer.yaml`. All downstream consumers treat it as immutable once resolved.
+## Persistence Operations
 
----
+- **`ConfigExists(cwd string) bool`** — Returns true if `.code-reducer.yaml` exists in the given working directory via `os.Stat`, enabling conditional loading.
+- **`LoadConfig(cwd string) (*Config, error)`** — Reads and unmarshals the YAML file into a `*Config`. On failure (missing/unreadable), returns an initialized empty struct with no error; callers must inspect the returned value for defaults rather than treating nil as "not loaded".
+- **`SaveConfig(cwd string, cfg *Config) error`** — Marshals the configuration to YAML and writes it atomically with `os.FileMode(0600)` permissions. Marshaling or write failures are wrapped in a single error value; callers should handle the returned error uniformly without distinguishing cause unless necessary for observability.
 
-## Filesystem Operations
+## Environment Variable Keys (Process Propagation)
 
-### ConfigExists
+The following keys are injected into `os.Environ` during resolution when their corresponding values are non-empty:
 
-**Purpose:** Pre-flight check before attempting to read configuration. Avoids unnecessary I/O by returning `false, nil` when absent and a non-empty error on filesystem-level failures (e.g., permission denied).
+| Key | Purpose |
+|---|---|
+| `CodeReducerModelIdEnvKey` | Runtime model identifier override |
+| `OllamaBaseUrlEnvKey` | Ollama server endpoint override |
+| `OllamaNumCtxEnvKey` | Context window token count override |
+| `LangsmithApiKeyEnvKey` | LangSmith tracing API key injection |
+| `LangchainProjectEnvKey` | LangChain v2 project name injection |
+| `LangchainTracingEnvKey` | LangChain v2 tracing enable/disable flag |
 
-**Behavior:**
-```go
-func ConfigExists(path string) (bool, error) { ... }
-```
-
-Returns the boolean presence of `.code-reducer.yaml` at `path`. Used by CLI entrypoints to gate help messages and configuration prompts.
-
----
-
-### LoadConfig
-
-**Purpose:** Read raw YAML bytes from disk and unmarshal into a populated `Config`. Returns an empty `Config{}` with no error when the file is absent (caller must check `ConfigExists` first). On parse failure, returns the zero value with a non-nil error.
-
-**Data flow:**
-```
-disk (.code-reducer.yaml) → io.ReadFile → yaml.Unmarshal → *config.Config
-```
-
-Unmarshaling uses reflection-safe YAML parsing that tolerates field order differences between schema versions; unknown fields are silently dropped to prevent breaking upgrades.
-
----
-
-### SaveConfig
-
-**Purpose:** Marshal a `Config` into YAML and persist it with mode `0600`. The restrictive permission prevents other local users from reading sensitive configuration (model IDs, API keys embedded in Ollama settings).
-
-**Behavior:**
-```go
-func SaveConfig(cfg *config.Config, path string) error { ... }
-```
-
-Atomic write semantics: the file is created at mode 0644, then `chmod`'d to 0600. This avoids a race window where the intermediate world-readable state could be observed by concurrent processes. If the parent directory does not exist, the function returns a clear error rather than silently failing.
-
----
-
-## Precedence Resolution (`ResolveConfig`)
-
-**Purpose:** Produce a single resolved `Config` from four sources layered in strict precedence order: **system defaults → YAML file → environment variables → CLI flags**. The final value is used by every downstream component without any caller needing to know which layer supplied it.
-
-### Precedence contract
-
-| Layer | Override scope |
-| --- | --- |
-| System defaults | `Config` zero values (used when no file exists) |
-| YAML file | Full struct override where fields are non-empty |
-| Environment variables | Per-field env mapping (`CODE_REDUCER_MODEL_ID`, etc.) |
-| CLI flags | Final override; wins over everything above |
-
-### Implementation notes
-
-- Each layer is a pure function returning `(partial *Config, error)`. The resolver composes them left-to-right.
-- Partial configs are merged field-by-field with the higher-precedence layer winning on any non-zero value. This prevents partial overrides from corrupting defaults (e.g., an empty string in YAML does not reset a previously-set CLI flag).
-- The resolver returns a copy of the resolved struct to prevent accidental mutation by callers.
-
-### Failure modes
-
-If the YAML parse fails during `LoadConfig`, the resolver treats it as "no config file present" and falls through to env/CLI layers only. This allows users to ship partial configurations without being blocked by malformed files.
+This propagation pattern ensures that any process spawned from this application inherits the resolved configuration without requiring explicit re-configuration in downstream binaries.

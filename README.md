@@ -75,9 +75,21 @@ Runs an interactive setup flow in the current directory to generate the `.code-r
 
 ### 2. Initialize Documentation
 ```bash
-code-reducer init [message]
+code-reducer init
 ```
-Scans the repository, builds the hierarchical tree, and generates the initial set of wiki markdown pages. If no `.code-reducer.yaml` is found, the interactive setup flow is triggered automatically.
+Scans the repository, builds the hierarchical tree, and generates the initial set of wiki markdown pages. This command creates a metadata cache in `wiki/.metadata.json` containing the baseline Git commit SHA and file summaries.
+*Note: This command will fail if the project has already been initialized.*
+
+### 3. Update Documentation (Incremental Rebuilds)
+```bash
+code-reducer update
+```
+Detects files modified, added, renamed, or deleted since the last documented commit up to the current working tree. It performs an incremental documentation refresh:
+- Computes SHA256 hashes of modified files and calls the LLM to extract new technical facts only for files that actually changed.
+- Rebuilds only the directory-level module summaries (`wiki/modules/<module>.md`) that correspond to changed files.
+- Skips LLM calls for unchanged directories by reusing the cached summaries in `wiki/.metadata.json`.
+- Automatically syncs the global `architecture.md` and `quickstart.md` files if necessary.
+*Note: This command requires the project to have been initialized first.*
 
 ---
 
@@ -142,6 +154,9 @@ go build -o code-reducer main.go
 
 # Generate your codebase wiki
 ./code-reducer init
+
+# Refresh documentation incrementally when code changes
+./code-reducer update
 ```
 
 ---

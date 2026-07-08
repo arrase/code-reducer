@@ -1,74 +1,91 @@
-# internal/engine — Module Architecture
+# Module: internal/engine
 
-## Responsibility and Data Flow
+## Responsibility & Data Flow
 
-The `internal/engine` package implements a two-stage retrieval–generation pipeline: **BM25 lexical scoring** of candidate files followed by **LLM-driven synthesis** that consumes ranked content. The module ingests raw file paths, tokenizes their contents, ranks them against user queries using the BM25 formula, and streams LLM responses with retry logic for transient HTTP failures (429/500–504). A `Runner` orchestrates end-to-end execution: it acquires a lock, instantiates an `LLMClient`, and drives documentation generation within a bounded context window.
+The `internal/engine` package orchestrates the full lifecycle of automated documentation generation. It bridges raw repository state (Git diffs, file metadata) with LLM inference capabilities through a four-stage pipeline: **Indexing** (BM25 ranking and context preparation), **State Tracking** (diff parsing, cache persistence, affected node detection), **Inference** (LLM client abstraction with retry logic), and **Response Handling** (JSON extraction and deserialization).
 
----
-
-## BM25 Ranking & Indexing (`context.go`)
-
-### Constants
-
-| Constant | Purpose |
-|----------|---------|
-| `k1` | BM25 term-frequency saturation parameter (default 1.5). Controls the asymptotic growth of TF contribution per occurrence. |
-| `b` | BM25 document-length normalization factor (default 0.75). Reduces the weight assigned to documents as their length approaches the corpus mean. |
-
-### Types
-
-**`Document`** — Indexable unit holding a file path, raw content, tokenized tokens, per-term frequencies, and total token count (`n`). Populated before ingestion into the BM25 scorer.
-
-**`DocScore`** — Temporary key-value pair pairing each candidate path with its computed BM25 relevance score during ranking phase.
-
-### Functions
-
-- **`Tokenize`** — Splits input text into lowercase alphanumeric word tokens via regular expression matching (`[a-z0-9]+`). Returns a slice of trimmed token strings.
-- **`FilterFilesBM25`** — Orchestrates the full scoring pipeline: loads each candidate file, tokenizes content, computes smoothed IDF for query terms, scores every document with `TF · IDF`, sorts results by descending relevance, and returns the top *K* paths.
-- **`EstimateTokens`** — Approximates token count by dividing character length by 4 (assumes ~4 characters per average English word). Used for context-budget estimation when exact counting is unavailable.
-- **`WrapInXmlDelimiter`** — Encapsulates file path and content inside strict `<file_content>` XML-like tags to mitigate prompt-injection risks during LLM consumption.
-- **`AutoScaleContext`** — Returns a safe default of 8192 characters when the caller provides zero or negative context limits; otherwise passes through unchanged.
+The execution flow terminates at the `Runner` orchestrator, which acquires a lock to serialize repository writes, dispatches either an initialization or update mode based on input, and commits the resulting Git HEAD SHA upon success.
 
 ---
 
-## LLM Client & Interaction (`engine.go`)
+## Context & Indexing (`context.go`)
 
-### Types
+### Data Structures
 
-**`Message`** — Represents an LLM message with `role` and `content` fields for chat interaction (system, user, assistant).
-
-**`LLMClient`** — HTTP-based client struct configured with model ID, base URL, context length, and timeout. Wraps synchronous (`CallLLM`) and streaming (`StreamLLM`) invocation methods.
+- **Document**: Encapsulates file content alongside term frequency (TF) statistics required for BM25 scoring calculations.
+- **FileCacheEntry**: Stores a single cached entry's SHA256 hash and associated facts, utilized by the metadata cache to avoid redundant recomputation.
 
 ### Functions
 
-- **`NewLLMClient`** — Constructs an `LLMClient` instance from a configuration pointer containing model ID, base URL, context length, and timeout parameters.
-- **`CallLLM`** — Invokes a synchronous LLM call with retry logic for transient HTTP errors (status 429 Too Many Requests; 500–504 server/transport-level failures). Returns the parsed response or an error.
-- **`StreamLLM`** — Streams the LLM response in real time by reading line-by-line from the HTTP stream and invoking a callback function per chunk received.
+**Tokenize** splits an input string into lowercase alphanumeric tokens via a compiled regular expression. It provides the foundational token stream used for subsequent frequency analysis without character-level noise.
 
-### Prompt Loading
+**EstimateTokens** approximates LLM token counts by dividing character length by four. This heuristic avoids expensive tokenizer overhead during context budget calculations while maintaining sufficient accuracy for clamping logic.
 
-- **`Event`** — Represents an event occurrence with a type identifier and associated message string (used for logging pipeline events).
-- **`GetDefaultSystemPrompt`** — Returns a system prompt tailored to one of four commands: `extract_file`, `module_synthesis`, `architecture`, or `default`.
-- **`LoadSystemPrompt`** — Delegates directly to `GetDefaultSystemPrompt`; provides aliasing for external consumers.
+**WrapInXmlDelimiter** encapsulates provided file content in strict XML-like tags with the embedded file path. This structural wrapper mitigates prompt injection risks by isolating user-controlled data from system instructions within the LLM context window.
+
+**AutoScaleContext** validates and clamps the maximum context size for an LLM operation. If the input is non-positive, it returns a safe default of 8192 characters.
+
+**FilterFilesBM25** ranks repository files by relevance to a query using the BM25 ranking algorithm. It accepts a query string and returns a slice of top-K file paths ordered by inverse document frequency weighted term scores.
 
 ---
 
-## JSON Parsing Utilities (`json_parser.go`)
+## Repository State & Diff Engine (`engine.go`)
+
+### Data Structures
+
+- **MetadataCache**: Holds the last documented commit string plus maps for files and modules loaded from `.metadata.json`. Persists state across runs to track which entities have been processed.
+- **FileChange**: Represents a single path/status pair (Added, Modified, or Deleted) parsed from raw git diff output.
 
 ### Functions
 
-- **`CleanJSONResponse`** — Extracts raw JSON content from a response string by either stripping markdown code fences (`` ``` ``) or locating the first opening brace/bracket to the last closing brace/bracket in the payload.
-- **`UnmarshalJSONResponse`** — Chains `CleanJSONResponse` with `json.Unmarshal`, returning an error if parsing fails into the provided target interface value.
+**loadMetadataCache** deserializes the metadata cache from `.metadata.json`, returning an empty default cache on any I/O error to ensure forward compatibility with stale or corrupted state files.
+
+**saveMetadataCache** serializes the current `MetadataCache` instance to `.metadata.json` using indented JSON formatting for human-readable diffing during debugging.
+
+**computeSHA25** computes the SHA256 hex digest of a file's contents at a given virtual path relative to repo root, ensuring content-addressable integrity checks independent of filesystem location changes.
+
+**parseGitDiff** parses raw git diff output into a `[]FileChange` slice. It handles Added, Deleted, Modified, Renamed, Copied, and Type-changed entries by normalizing rename/copy operations into distinct change records for accurate state tracking.
+
+**isAllowedFile** validates file eligibility based on ignore rules (e.g., `.git`, `node_modules`), directory filters, binary detection heuristics, and path safety resolution to prevent processing of unsafe or irrelevant paths.
+
+**determineAffected** walks the directory tree to identify nodes marked as affected by checking changed files against cache module state and physical file existence. It returns a boolean map keyed by path.
+
+**propagateAffected** recursively walks a `DirNode` tree, marking parent directories as "affected" when any child reports an affected status. This ensures that structural changes (e.g., adding a new directory) invalidate all ancestor documentation entries automatically.
 
 ---
 
-## Runner Orchestrator (`runner.go`)
+## LLM Interaction Layer (`engine.go`)
 
-### Types
+### Data Structures
 
-**`Runner`** — Struct storing engine configuration and orchestrating repository processing workflows across BM25 ranking, LLM streaming, and documentation generation phases.
+- **LLMClient**: Represents the abstraction over an HTTP-based chat API, holding configuration for model identity and transport parameters.
 
 ### Functions
 
-- **`NewRunner`** — Constructs a new `Runner` instance by encapsulating the provided configuration pointer.
-- **`Run`** — Executes the full pipeline lifecycle: acquires a lock to serialize concurrent invocations, instantiates an `LLMClient`, and drives documentation generation within a bounded context window.
+**NewLLMClient** constructs a new `*LLMClient` with the provided model ID, base URL, context size, and an HTTP client configured with a 10-minute timeout to prevent hangs on slow providers.
+
+**(LLMClient) CallLLM** invokes the LLM via an HTTP chat API endpoint with retry logic for transient errors (connection resets, rate limits). It returns the streamed response string accumulated from successful chunks, discarding partial responses only after exhausting the retry budget.
+
+---
+
+## Response Parsing (`json_parser.go`)
+
+### Functions
+
+**CleanJSONResponse** extracts JSON content from raw LLM output by either stripping surrounding markdown code fences or locating the first opening brace/bracket and last closing brace/bracket pair in the text, returning a trimmed JSON string. This handles common model behaviors where structured output is wrapped in conversational scaffolding.
+
+**UnmarshalJSONResponse** chains `CleanJSONResponse` followed by standard Go deserialization into the provided target interface value (`interface{}`). It returns an error if the cleaned payload fails to unmarshal, ensuring type-safe consumption of LLM outputs downstream.
+
+---
+
+## Pipeline Orchestration (`runner.go`)
+
+### Data Structures
+
+- **Runner**: Holds a configuration pointer and orchestrates repository operations including locking, LLM client instantiation, and documentation pipeline execution. Acts as the entry point for all write operations to the documentation store.
+
+### Functions
+
+**NewRunner** exports a constructor that initializes a new `Runner` instance with the provided configuration, establishing initial state dependencies (lock file paths, cache locations) required for subsequent execution.
+
+**Run** is the primary execution method. It acquires an exclusive lock on the runner's state file to serialize concurrent invocations, dispatches to either `init` or `update` modes based on input arguments, and updates the Git HEAD SHA in the config upon successful completion.
