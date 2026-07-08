@@ -86,10 +86,53 @@ func RunSetupFlow(repoRoot string) {
 		}
 	}
 
+	existingIgnore := ""
+	if existingCfg != nil && len(existingCfg.Ignore) > 0 {
+		existingIgnore = strings.Join(existingCfg.Ignore, ", ")
+	}
+
+	fmt.Printf("Enter directories/files to ignore (comma-separated) [%s]: ", existingIgnore)
+	ignoreInput, _ := reader.ReadString('\n')
+	ignoreInput = strings.TrimSpace(ignoreInput)
+
+	var ignores []string
+	if ignoreInput == "" {
+		if existingCfg != nil && existingCfg.Ignore != nil {
+			ignores = existingCfg.Ignore
+		} else {
+			ignores = []string{}
+		}
+	} else {
+		parts := strings.Split(ignoreInput, ",")
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				ignores = append(ignores, trimmed)
+			}
+		}
+		if ignores == nil {
+			ignores = []string{}
+		}
+	}
+
+	existingDocsDir := "wiki"
+	if existingCfg != nil && existingCfg.DocsDir != "" {
+		existingDocsDir = existingCfg.DocsDir
+	}
+
+	fmt.Printf("Enter documentation directory [%s]: ", existingDocsDir)
+	docsDirInput, _ := reader.ReadString('\n')
+	docsDirInput = strings.TrimSpace(docsDirInput)
+	if docsDirInput == "" {
+		docsDirInput = existingDocsDir
+	}
+
 	newCfg := &config.Config{
 		ModelID:       modelInput,
 		OllamaBaseURL: urlInput,
 		OllamaNumCtx:  numCtx,
+		Ignore:        ignores,
+		DocsDir:       docsDirInput,
 	}
 
 	// Preserve optional fields if they existed

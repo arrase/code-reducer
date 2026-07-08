@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/arrase/code-reducer/internal/config"
 	"github.com/arrase/code-reducer/internal/security"
 	"github.com/arrase/code-reducer/internal/tools"
 )
@@ -282,14 +283,14 @@ func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []
 	return reduceInChunks(ctx, c, nodePath, intermediate, maxBatchSize, logEvent)
 }
 
-func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, logEvent func(string, string)) (string, error) {
+func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, docsDir string, logEvent func(string, string)) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 
 	childSummaries := make(map[string]string)
 	for name, child := range node.Children {
-		sum, err := synthesizeNode(ctx, c, child, repoRoot, logEvent)
+		sum, err := synthesizeNode(ctx, c, child, repoRoot, docsDir, logEvent)
 		if err != nil {
 			return "", err
 		}
@@ -337,7 +338,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	if safeName == "." || safeName == "" {
 		safeName = "root"
 	}
-	modulePath := filepath.Join("code-reducer", "modules", safeName+".md")
+	modulePath := filepath.Join(docsDir, "modules", safeName+".md")
 	tools.WriteFileSafely(repoRoot, modulePath, []byte(finalSum))
 
 	return finalSum, nil
@@ -355,33 +356,43 @@ func (c *LLMClient) RunInitOrUpdate(ctx context.Context, command string, repoRoo
 	_ = security.EnsureGitignoreHasLockfile(repoRoot)
 
 	logEvent("status", "Step 1: Code Discovery & Building Tree...")
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot)
+	var ignores []string
+	docsDir := "wiki"
+	if cfg, err := config.LoadConfig(repoRoot); err == nil && cfg != nil {
+		ignores = cfg.Ignore
+		if cfg.DocsDir != "" {
+			docsDir = cfg.DocsDir
+		}
+	}
+	ignores = append(ignores, docsDir)
+
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
 	if err != nil {
 		return err
 	}
 
 	tree := buildTree(codeFiles)
-	modulesDir := filepath.Join(repoRoot, "code-reducer", "modules")
+	modulesDir := filepath.Join(repoRoot, docsDir, "modules")
 	os.MkdirAll(modulesDir, 0755)
 
 	logEvent("status", "Step 2: Hierarchical Tree-Merging (Map-Reduce)...")
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, logEvent)
+	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, docsDir, logEvent)
 	if err != nil {
 		return err
 	}
 
 	logEvent("status", "Step 3: Global Architecture Synthesis...")
-	archMsg := fmt.Sprintf("Write the global architecture overview (code-reducer/architecture.md) based on the root summary.\n\n%s", rootSum)
+	archMsg := fmt.Sprintf("Write the global architecture overview (%s/architecture.md) based on the root summary.\n\n%s", docsDir, rootSum)
 	archDoc, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("architecture"), []Message{{Role: "user", Content: archMsg}}, false)
 	if err == nil {
-		tools.WriteFileSafely(repoRoot, "code-reducer/architecture.md", []byte(stripOuterMarkdownFence(archDoc)))
+		tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, "architecture.md"), []byte(stripOuterMarkdownFence(archDoc)))
 	}
 
 	logEvent("status", "Step 4: Generating Quickstart...")
-	qsMsg := fmt.Sprintf("Write the code-reducer/quickstart.md page based on this architecture.\n\n%s", rootSum)
+	qsMsg := fmt.Sprintf("Write the %s/quickstart.md page based on this architecture.\n\n%s", docsDir, rootSum)
 	qsDoc, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("architecture"), []Message{{Role: "user", Content: qsMsg}}, false)
 	if err == nil {
-		tools.WriteFileSafely(repoRoot, "code-reducer/quickstart.md", []byte(stripOuterMarkdownFence(qsDoc)))
+		tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, "quickstart.md"), []byte(stripOuterMarkdownFence(qsDoc)))
 	}
 
 	logEvent("status", "Pipeline completed successfully!")

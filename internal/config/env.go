@@ -26,12 +26,14 @@ const (
 
 // Config represents the schema of .code-reducer.yaml
 type Config struct {
-	ModelID            string `yaml:"model_id"`
-	OllamaBaseURL      string `yaml:"ollama_base_url"`
-	OllamaNumCtx       int    `yaml:"ollama_num_ctx"`
-	LangsmithAPIKey    string `yaml:"langsmith_api_key,omitempty"`
-	LangchainProject   string `yaml:"langchain_project,omitempty"`
-	LangchainTracingV2 string `yaml:"langchain_tracing_v2,omitempty"`
+	ModelID            string   `yaml:"model_id"`
+	OllamaBaseURL      string   `yaml:"ollama_base_url"`
+	OllamaNumCtx       int      `yaml:"ollama_num_ctx"`
+	LangsmithAPIKey    string   `yaml:"langsmith_api_key,omitempty"`
+	LangchainProject   string   `yaml:"langchain_project,omitempty"`
+	LangchainTracingV2 string   `yaml:"langchain_tracing_v2,omitempty"`
+	Ignore             []string `yaml:"ignore"`
+	DocsDir            string   `yaml:"docs_dir"`
 }
 
 // ConfigExists checks if .code-reducer.yaml exists in the specified directory.

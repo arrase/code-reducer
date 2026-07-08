@@ -59,8 +59,8 @@ func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
 }
 
 // DiscoverCodeFiles recursively walks the codebase to find high-signal source files.
-// It ignores build, dependency, and output files.
-func DiscoverCodeFiles(repoRoot string) ([]string, error) {
+// It ignores build, dependency, and output files, as well as any paths in the custom ignores list.
+func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 	var files []string
 	ignoredDirs := map[string]bool{
 		".git":             true,
@@ -84,10 +84,23 @@ func DiscoverCodeFiles(repoRoot string) ([]string, error) {
 			return nil // Skip items with errors
 		}
 
-		if d.IsDir() {
-			if path == repoRoot {
-				return nil
+		if path == repoRoot {
+			return nil
+		}
+
+		rel, err := filepath.Rel(repoRoot, path)
+		if err != nil {
+			return nil
+		}
+
+		if shouldIgnorePath(rel, ignores) {
+			if d.IsDir() {
+				return filepath.SkipDir
 			}
+			return nil
+		}
+
+		if d.IsDir() {
 			name := d.Name()
 			if ignoredDirs[name] || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") {
 				return filepath.SkipDir
@@ -109,15 +122,42 @@ func DiscoverCodeFiles(repoRoot string) ([]string, error) {
 			return nil
 		}
 
-		// Add relative path
-		rel, err := filepath.Rel(repoRoot, path)
-		if err == nil {
-			files = append(files, rel)
-		}
+		files = append(files, rel)
 		return nil
 	})
 
 	return files, err
+}
+
+func shouldIgnorePath(relPath string, ignores []string) bool {
+	relClean := filepath.Clean(relPath)
+	for _, pattern := range ignores {
+		patternClean := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(pattern, "/")))
+		if relClean == patternClean {
+			return true
+		}
+		prefix := patternClean + string(filepath.Separator)
+		if strings.HasPrefix(relClean, prefix) {
+			return true
+		}
+		components := strings.Split(relClean, string(filepath.Separator))
+		for _, comp := range components {
+			if comp == patternClean {
+				return true
+			}
+			if strings.ContainsAny(patternClean, "*?[]") {
+				if matched, _ := filepath.Match(patternClean, comp); matched {
+					return true
+				}
+			}
+		}
+		if strings.ContainsAny(patternClean, "*?[]") {
+			if matched, _ := filepath.Match(patternClean, relClean); matched {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // IsBinaryFile checks if a file is binary by scanning the first 1024 bytes for null bytes.
