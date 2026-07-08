@@ -1,62 +1,49 @@
-# cmd Package — CLI Orchestration Layer
+# CLI Architecture: Code Reducer Command Module
 
 ## Module Responsibility
 
-The `cmd` package implements the top-level command-line interface (CLI) using Cobra. It provides a root command with persistent global flags (`--model-id`, `--num-ctx`) that propagate to all subcommands, registers an interactive setup flow for initial configuration generation, and exposes an `update` subcommand for synchronizing wiki pages against repository changes since the last documented commit.
+The `cmd` package implements the top-level Cobra command hierarchy for the Code Reducer CLI tool. It owns three operational flows: **initialization** (`init`), **configuration setup** (`setup`), and **update operations** (`update`). Data flow terminates at an engine abstraction that resolves execution semantics per mode argument. Configuration state persists via `.code-reducer.yaml`, validated against LLM credential requirements before any engine invocation.
 
-## Data Flow
+## Command Registration & Entry Point
 
+### `init.go` — Init Command Instantiation
+
+```go
+var initCmd *cobra.Command // package-level singleton
+func init() { /* registration */ }
 ```
-user input (CLI args) → RootCmd.ParseFlags() → executeCommand(mode, userMessage)
-    │                                              │
-    ├── config resolution                         ├── signal handling
-    ├── repository validation                     └── engine execution + status/error event logging
-    └── NeedsCredentialSetup() check              ←  merge config resolution
+
+- **`initCmd`** instantiates the Cobra subcommand for `init`, binding usage documentation and execution logic that triggers repository scanning and wiki markdown page generation.
+- **`init()`** registers `initCmd` on the root command hierarchy at package initialization, ensuring the parser discovers it without explicit user invocation.
+
+### `root.go` — Root Command & Execution Delegation
+
+```go
+type root struct { /* Cobra.Command */ }
+func executeCommand(mode string) error
+func NeedsCredentialSetup(cfg *config.Config) bool
 ```
 
-## Initialization and Package Setup
+- **`RootCmd`** exposes the primary Cobra command instance; all subcommands (`init`, `update`) are children of this node.
+- **`executeCommand()`** performs three-stage validation: (1) git repository integrity check, (2) configuration resolution from persisted state, (3) initialization-state verification. It then delegates to an engine based on the supplied mode argument.
+- **`NeedsCredentialSetup()`** inspects the resolved project configuration; returns `true` if critical LLM model credentials are absent. Used by `executeCommand()` to gate engine invocation until credential setup completes.
 
-The package-level `init()` function registers two persistent flags on the root command:
+## Configuration Setup Flow
 
-- **`--model-id`** — LLM model identifier (user-provided)
-- **`--num-ctx`** — Ollama context window size (user-provided)
+### `setup.go` — Interactive Config Generation
 
-Both are stored in package-level string variables (`modelIdFlag`, `numCtxFlag`) and remain accessible throughout the CLI lifecycle. All identifiers in `init.go` are lowercase and private; no exported symbols exist from this file.
+```go
+func RunSetupFlow() error
+```
 
-## Root Command Entry Point
+- **`RunSetupFlow()`** drives an interactive terminal session that prompts the user for configuration parameters and persists them via `config.SaveConfig`. Output: `.code-reducer.yaml` written to project root. This function is invoked only when credential setup is required or initial configuration does not exist.
 
-**`RootCmd`** — Cobra command instance serving as the top-level entry point for all subcommand dispatching. The root command is constructed once during package initialization; subsequent invocations route to `executeCommand`.
+## Update Command — Internal Implementation
 
-### Execution Orchestration
+### `update.go` — Unexported Package-Private Operations
 
-**`executeCommand(mode, userMessage)`** orchestrates the full documentation workflow:
-1. **Repository validation** — verifies the target repository state
-2. **Implicit setup flow** — triggers interactive config generation when no `.code-reducer.yaml` exists (via `RunSetupFlow`)
-3. **Merged configuration resolution** — combines global, repo-level, and user-provided settings
-4. **Mode-specific checks** — validates required arguments for `init`/`update` modes
-5. **Signal handling** — installs SIGINT/SIGTERM handlers to gracefully terminate engine execution
-6. **Engine execution** — invokes the documentation engine with status/error event logging
+```go
+// No exported identifiers. All functions begin with lowercase letters.
+```
 
-### Credential Setup Check
-
-**`NeedsCredentialSetup()`** returns a boolean indicating whether critical configuration is missing by resolving the current config state and checking whether a model ID has been set. Used during mode-specific validation to prompt credential setup when necessary.
-
-## Interactive Configuration Flow
-
-**`RunSetupFlow`** — guides the user through an interactive session that generates or updates the local `.code-reducer.yaml` configuration file. It reads inputs via `bufio.Scanner`/prompt (package-private) and persists them by calling `config.SaveConfig`. This function is invoked implicitly when no existing config is detected during `executeCommand`.
-
-## Update Subcommand
-
-**`updateCmd`** — a Cobra command defining the "update" subcommand. Responsibilities:
-- Scans changed files since the last documented commit (diff against HEAD of the main branch)
-- Updates corresponding wiki pages with an optional user-supplied message argument
-- Routes through `executeCommand` for full orchestration (config resolution, signal handling, engine execution)
-
-## Component Summary
-
-| File | Exported Symbols | Role |
-|---|---|---|
-| `init.go` | none | Package-private init registration of persistent flags |
-| `root.go` | `RootCmd`, `modelIdFlag`, `numCtxFlag`, `executeCommand`, `NeedsCredentialSetup()` | CLI entry point, orchestration engine, credential validation |
-| `setup.go` | `RunSetupFlow` | Interactive config generation/update flow |
-| `update.go` | `updateCmd` | Wiki page sync subcommand |
+- Contains no exported functions, variables, structs, interfaces, or data structures. Identifiers (`updateCmd`, internal helpers) are package-private, meaning update-specific logic is scoped to the `cmd` package and not exposed externally.

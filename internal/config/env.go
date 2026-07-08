@@ -144,16 +144,7 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 		resolved.LangchainTracingV2 = cfg.LangchainTracingV2
 	}
 
-	// Propagate only necessary tracing variables to external process environment
-	if resolved.LangsmithAPIKey != "" {
-		_ = os.Setenv(LangsmithApiKeyEnvKey, resolved.LangsmithAPIKey)
-	}
-	if resolved.LangchainProject != "" {
-		_ = os.Setenv(LangchainProjectEnvKey, resolved.LangchainProject)
-	}
-	if resolved.LangchainTracingV2 != "" {
-		_ = os.Setenv(LangchainTracingEnvKey, resolved.LangchainTracingV2)
-	}
+
 
 	// 5. Resolve DocsDir: YAML > Default
 	if cfg.DocsDir != "" {

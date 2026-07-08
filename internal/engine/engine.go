@@ -75,43 +75,11 @@ func computeSHA256(repoRoot, virtualPath string) (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
+
+
 type FileChange struct {
 	Path   string
 	Status string // "Added", "Modified", "Deleted"
-}
-
-func parseGitDiff(diffOutput string) []FileChange {
-	var changes []FileChange
-	lines := strings.Split(diffOutput, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, "\t")
-		if len(parts) < 2 {
-			continue
-		}
-		statusField := parts[0]
-		switch {
-		case strings.HasPrefix(statusField, "R"): // Rename: R100 \t old_path \t new_path
-			if len(parts) >= 3 {
-				changes = append(changes, FileChange{Path: parts[1], Status: "Deleted"})
-				changes = append(changes, FileChange{Path: parts[2], Status: "Added"})
-			}
-		case strings.HasPrefix(statusField, "C"): // Copy: C100 \t old_path \t new_path
-			if len(parts) >= 3 {
-				changes = append(changes, FileChange{Path: parts[2], Status: "Added"})
-			}
-		case statusField == "A":
-			changes = append(changes, FileChange{Path: parts[1], Status: "Added"})
-		case statusField == "D":
-			changes = append(changes, FileChange{Path: parts[1], Status: "Deleted"})
-		case statusField == "M" || statusField == "T": // M = Modified, T = Type changed
-			changes = append(changes, FileChange{Path: parts[1], Status: "Modified"})
-		}
-	}
-	return changes
 }
 
 func isAllowedFile(repoRoot, relPath string, ignores []string) bool {
@@ -257,7 +225,7 @@ type ollamaChunk struct {
 	Done    bool    `json:"done"`
 }
 
-// CallLLM invokes the LLM via HTTP with retry logic for transient errors.
+// CallLLM invokes the LLM via HTTP failing fast without retries.
 func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error) {
 	baseURL := c.BaseURL
 	if baseURL == "" {
@@ -285,77 +253,37 @@ func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages [
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	const maxAttempts = 3
-	var lastErr error
-	backoff := 1 * time.Second
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := c.HTTPClient.Do(req)
-		if err != nil {
-			lastErr = err
-			// Check if context was canceled/timed out - if so, don't retry
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-			// Wait and retry
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(backoff):
-				backoff *= 2
-				continue
-			}
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			respData, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				return "", err
-			}
-
-			var result ollamaResponse
-			if err := json.Unmarshal(respData, &result); err != nil {
-				return "", fmt.Errorf("failed to parse response: %w", err)
-			}
-			return result.Message.Content, nil
-		}
-
-		// Handle HTTP status errors
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		resp.Body.Close()
-		lastErr = fmt.Errorf("ollama api error: status %d, response: %s", resp.StatusCode, string(body))
-
-		// Only retry on transient HTTP status codes (e.g. 429, 500, 502, 503, 504)
-		if resp.StatusCode == http.StatusTooManyRequests ||
-			resp.StatusCode == http.StatusInternalServerError ||
-			resp.StatusCode == http.StatusBadGateway ||
-			resp.StatusCode == http.StatusServiceUnavailable ||
-			resp.StatusCode == http.StatusGatewayTimeout {
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(backoff):
-				backoff *= 2
-				continue
-			}
-		}
-
-		// Permanent error, return immediately
-		return "", lastErr
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
-	return "", fmt.Errorf("after %d attempts, request failed: %w", maxAttempts, lastErr)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		respData, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", err
+		}
+
+		var result ollamaResponse
+		if err := json.Unmarshal(respData, &result); err != nil {
+			return "", fmt.Errorf("failed to parse response: %w", err)
+		}
+		return result.Message.Content, nil
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	return "", fmt.Errorf("ollama api error: status %d, response: %s", resp.StatusCode, string(body))
 }
 
 // StreamLLM streams responses in real time from the LLM.
@@ -497,13 +425,32 @@ func buildTree(files []string) *DirNode {
 	return root
 }
 
-func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []string, maxBatchSize int, logEvent func(string, string)) (string, error) {
+func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []string, logEvent func(string, string)) (string, error) {
 	if len(items) == 0 {
 		return "", nil
 	}
-	if len(items) <= maxBatchSize {
-		prompt := fmt.Sprintf("Synthesize architecture for %s:\n%s", nodePath, strings.Join(items, "\n\n"))
-		logEvent("status", fmt.Sprintf("➜ LLM Synthesizing chunk for %s (%d items)", nodePath, len(items)))
+
+	var batches [][]string
+	var currentBatch []string
+	currentLen := 0
+
+	for _, item := range items {
+		if currentLen+len(item) > 15000 && len(currentBatch) > 0 {
+			batches = append(batches, currentBatch)
+			currentBatch = []string{item}
+			currentLen = len(item)
+		} else {
+			currentBatch = append(currentBatch, item)
+			currentLen += len(item)
+		}
+	}
+	if len(currentBatch) > 0 {
+		batches = append(batches, currentBatch)
+	}
+
+	if len(batches) == 1 {
+		prompt := fmt.Sprintf("Synthesize architecture for %s:\n%s", nodePath, strings.Join(batches[0], "\n\n"))
+		logEvent("status", fmt.Sprintf("➜ LLM Synthesizing chunk for %s (%d items)", nodePath, len(batches[0])))
 		res, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("module_synthesis"), []Message{{Role: "user", Content: prompt}}, false)
 		if err != nil {
 			return "", fmt.Errorf("LLM error during synthesis: %w", err)
@@ -512,18 +459,14 @@ func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []
 	}
 
 	var intermediate []string
-	for i := 0; i < len(items); i += maxBatchSize {
-		end := i + maxBatchSize
-		if end > len(items) {
-			end = len(items)
-		}
-		chunkRes, err := reduceInChunks(ctx, c, nodePath, items[i:end], maxBatchSize, logEvent)
+	for _, batch := range batches {
+		chunkRes, err := reduceInChunks(ctx, c, nodePath, batch, logEvent)
 		if err != nil {
 			return "", err
 		}
 		intermediate = append(intermediate, chunkRes)
 	}
-	return reduceInChunks(ctx, c, nodePath, intermediate, maxBatchSize, logEvent)
+	return reduceInChunks(ctx, c, nodePath, intermediate, logEvent)
 }
 
 func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, docsDir string, cache *MetadataCache, affectedDirs map[string]bool, logEvent func(string, string)) (string, error) {
@@ -602,7 +545,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	}
 
 	logEvent("status", fmt.Sprintf("➜ Synthesizing directory: %s (%d total components)", node.Path, len(components)))
-	finalSum, err := reduceInChunks(ctx, c, node.Path, components, 5, logEvent)
+	finalSum, err := reduceInChunks(ctx, c, node.Path, components, logEvent)
 	if err != nil {
 		return "", err
 	}
@@ -725,8 +668,7 @@ Before making changes, analyze these files to align with existing design choices
 	}
 
 	// Save metadata cache
-	headSHA, _ := tools.GetGitHead(repoRoot)
-	cache.LastDocumentedCommit = headSHA
+	cache.LastDocumentedCommit = "local"
 	if err := saveMetadataCache(repoRoot, docsDir, cache); err != nil {
 		logEvent("status", fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
 	}
@@ -757,53 +699,40 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 		}
 	}
 
-	lastSHA := cache.LastDocumentedCommit
-	if lastSHA == "" {
-		return fmt.Errorf("no documented commit found in cache. please run 'init' first")
-	}
-	logEvent("status", fmt.Sprintf("Step 1: Detecting changed files since commit %s...", lastSHA))
+	logEvent("status", "Step 1: Detecting changed files...")
 
-	// Get git diff changes comparing last documented commit to the working tree
-	diffOut, err := tools.RunGit(repoRoot, "diff", "--name-status", lastSHA)
+	// 2. Discover all code files to build the current codebase tree
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
 	if err != nil {
-		return fmt.Errorf("git diff failed: %w", err)
+		return err
 	}
 
-	changes := parseGitDiff(diffOut)
-
-	// Add untracked files in the workspace
-	untrackedOut, err := tools.RunGit(repoRoot, "ls-files", "--others", "--exclude-standard")
-	if err == nil && untrackedOut != "" {
-		untrackedFiles := strings.Split(untrackedOut, "\n")
-		for _, f := range untrackedFiles {
-			f = strings.TrimSpace(f)
-			if f != "" {
-				changes = append(changes, FileChange{Path: f, Status: "Added"})
-			}
-		}
-	}
-
-	// 2. Filter changes
 	var filteredChanges []FileChange
-	for _, change := range changes {
-		if tools.ShouldIgnorePath(change.Path, ignores) {
-			continue
-		}
+	currentFilesMap := make(map[string]string)
+	var allowedCodeFiles []string
 
-		if change.Status == "Deleted" {
-			name := filepath.Base(change.Path)
-			ext := strings.ToLower(filepath.Ext(name))
-			if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".pdf" ||
-				ext == ".exe" || ext == ".dll" || ext == ".so" || ext == ".o" || ext == ".a" ||
-				ext == ".zip" || ext == ".gz" || ext == ".tar" || ext == ".lock" || ext == ".pyc" ||
-				ext == ".pyo" || ext == ".pyd" || tools.NameSuffixIgnored(name) {
-				continue
+	for _, f := range codeFiles {
+		if isAllowedFile(repoRoot, f, ignores) {
+			allowedCodeFiles = append(allowedCodeFiles, f)
+			hash, err := computeSHA256(repoRoot, f)
+			if err == nil {
+				currentFilesMap[f] = hash
 			}
-			filteredChanges = append(filteredChanges, change)
-		} else {
-			if isAllowedFile(repoRoot, change.Path, ignores) {
-				filteredChanges = append(filteredChanges, change)
-			}
+		}
+	}
+
+	for f, currentHash := range currentFilesMap {
+		cachedEntry, exists := cache.Files[f]
+		if !exists {
+			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: "Added"})
+		} else if cachedEntry.SHA256 != currentHash {
+			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: "Modified"})
+		}
+	}
+
+	for f := range cache.Files {
+		if _, exists := currentFilesMap[f]; !exists {
+			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: "Deleted"})
 		}
 	}
 
@@ -818,17 +747,11 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 		}
 	}
 
-	// 3. Discover all code files to build the current codebase tree
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
-	if err != nil {
-		return err
-	}
-
-	tree := buildTree(codeFiles)
+	tree := buildTree(allowedCodeFiles)
 
 	// Clean cache files that are no longer in the codebase (garbage collection)
 	codeFileMap := make(map[string]bool)
-	for _, f := range codeFiles {
+	for _, f := range allowedCodeFiles {
 		codeFileMap[f] = true
 	}
 	for f := range cache.Files {
@@ -897,8 +820,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 
 	// 6. Save metadata cache
-	headSHA, _ := tools.GetGitHead(repoRoot)
-	cache.LastDocumentedCommit = headSHA
+	cache.LastDocumentedCommit = "local"
 	if err := saveMetadataCache(repoRoot, docsDir, cache); err != nil {
 		logEvent("status", fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
 	}

@@ -1,104 +1,136 @@
-# Code Reducer — Quickstart & Architecture Overview
+# CodeReducer — Wiki / Quickstart
 
-## What It Does
+## What is CodeReducer?
 
-`code-reducer` is a Go application that generates automated documentation (wiki pages) from repository state through LLM inference. On each run it scans changed files since the last documented commit, ranks them by relevance via BM25, and feeds the results to an Ollama-backed LLM to produce updated wiki entries.
+**CodeReducer** is a CLI-driven code reduction engine that scans Go repositories and generates/updates Markdown documentation pages for affected directories. It uses BM25 relevance scoring to rank source files, LLM-powered generation to produce docs, and deterministic caching to avoid redundant reprocessing.
 
 ---
 
 ## System Boundaries & Module Interaction
 
 ```
-┌─────────────┐     ┌──────────┐     ┌──────────────┐     ┌──────────┐
-│  cmd         │────▶│  engine   │────▶│    LLM       │────▶│ Response │
-│  (Cobra CLI) │◀────│orchestrator│◀────│ client + retry│◀───│ parser   │
-└─────────────┘     └─────┬─────┘     └──────────────┘     └──────────┘
-                          │
-              ┌───────────┼───────────┐
-              ▼           ▼           ▼
-       ┌──────────┐  ┌──────────┐  ┌──────────┐
-       │ security  │  │   tools  │  │  config   │
-       │(path lock │  │fs/git/  │  │4-tier     │
-       │ isolation)│  │hashing)  │  │ resolution│
-       └──────────┘  └──────────┘  └──────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    CLI Entry Point                        │
+│              cmd/ (root.go, init.go, update.go)           │
+│         ┌──────┬────────┬────────┬────────┬────────┐     │
+│         │init  │update  │setup   │runner  │ tools  │     │
+│         └──┬───┴───┬────┴───┬────┴───┬────┴───┬────┘     │
+│            │       │        │       │            │        │
+│            ▼       ▼        ▼       ▼            ▼        │
+│    ┌──────────┐ ┌────────┐ ┌──────┐ ┌────────┐ ┌──────┐ │
+│    │config/   │ │engine/ │ │LLM   │ │cache   │ │git / │ │
+│    │YAML      │ │BM25    │ │client│ │I/O     │ │tools │ │
+│    │resolution│ │ranking │ │resp  │ │metadata│ │fs    │ │
+│    └──────────┘ └────────┘ │parse │ └────────┘ └──────┘ │
+│                            └──────┘                     │
+│                                                     ┌─────┐│
+│                    ┌──────────────────────────────▶│sec  ││
+│                    │                              │     ││
+│                    ▼                              ▼     ││
+│            ┌─────────────┐              ┌───────────┐   ││
+│            │runner.go    │◀────────────│security/  │   ││
+│            │orchestrator │            │path lock  │   ││
+│            └─────────────┘              └───────────┘   ││
+└─────────────────────────────────────────────────────────┘
 ```
 
-| Layer | Responsibility | Key Interaction |
-|---|---|---|
-| **cmd** | CLI entry point, signal handling, mode dispatch | Calls `engine.Run()` after resolving config and acquiring lock |
-| **security** | Path confinement + flock-based locking + gitignore hygiene | Gated before any filesystem/Git operation in engine/tools |
-| **tools** | Safe read/write, file discovery, Git queries, SHA-256 hashing | Consumed by engine for diff parsing, cache I/O, and content integrity |
-| **config** | 4-tier resolution (defaults → YAML → env → CLI flags), process env propagation | Provides `Config` to engine; persisted in `.code-reducer.yaml` |
-| **engine** | BM25 ranking, state tracking, LLM invocation, JSON extraction, pipeline orchestration | Top-level orchestrator; bridges raw repo state with LLM inference |
+**Execution flow:** `main.go` → Cobra dispatch (`cmd/`) → `runner.Run(mode)` → LLM client + BM25 ranking + cache I/O → Markdown output. Configuration follows four-tier precedence: **system defaults → YAML file → env vars → CLI flags**.
 
 ---
 
-## Initialization Order (Execution Model)
-
-1. `security` primitives gate all repository-accessing operations
-2. `tools` provide low-level filesystem/Git/hash primitives consumed by other subsystems
-3. `config` resolves runtime parameters via four-tier precedence chain, then propagates values into the OS process env
-4. `engine` orchestrates the full documentation-generation pipeline
-
----
-
-## Quickstart: First Run
+## Quick Start — First Run
 
 ```bash
-# 1. Ensure Ollama is running with your model available
-ollama serve
+# 1. Initialize configuration (interactive credential setup)
+code-reducer init
 
-# 2. Point Code Reducer at your repository root (or run from repo root)
-code-reducer --model-id <your-model> --num-ctx 8192 init
-```
-
-If no `.code-reducer.yaml` exists, an interactive setup flow prompts you for configuration and persists it to the repo root. On subsequent runs:
-
-```bash
+# 2. Generate wiki pages for the entire repo
 code-reducer update
+
+# 3. Override model/context without editing YAML:
+code-reducer update --modelId "my-model" --numCtx 4096
 ```
 
-`update` scans changed files since the last documented commit (HEAD), ranks them via BM25, invokes the LLM, and writes updated wiki pages back into the repository.
+**Config precedence order:** System defaults → `.code-reducer.yaml` → `os.Getenv(…)` → CLI flags. The resolved config is also propagated to downstream processes via environment variables (`CodeReducerModelIdEnvKey`, `OllamaBaseUrlEnvKey`, etc.).
 
 ---
 
-## Configuration Precedence
+## Key Architectural Decisions
 
-| Tier | Source | Example |
-|---|---|---|
-| 1 — Defaults | Hard-coded constants (`localhost:11434`, `8192` ctx) | Baseline when nothing else is set |
-| 2 — YAML file | `.code-reducer.yaml` in repo root | Persistent user preferences |
-| 3 — Environment variables | `CodeReducerModelIdEnvKey`, `OllamaBaseUrlEnvKey`, etc. | CI/CD overrides |
-| 4 — CLI flags | `--model-id`, `--num-ctx` | Highest priority; per-invocation |
+### 1. Two-mode branching
+- **`init`** — Scans the repo, generates initial wiki markdown pages for all affected directories.
+- **`update`** — Runs git diff, identifies changed files, processes only affected regions. Both modes share the same engine pipeline; they diverge at cache initialization (`loadMetadataCache` returns empty default on miss).
 
-Resolved config is also injected into the process environment via `os.Setenv`, so downstream packages (LangSmith tracing, LangChain) observe consistent values without explicit dependency on this module.
+### 2. Security gate before every state mutation
+Before any write operation:
+1. `SafeResolve` validates paths stay within repo root (blocks `..`, external symlinks)
+2. `AcquireLock` acquires `flock(2)` exclusive/shared lock with TOCTOU-safe checks
+3. `EnsureGitignoreHasLockfile` ensures `.gitignore` excludes the lock file
 
----
+### 3. Deterministic caching
+- **`MetadataCache`** (JSON on disk) stores per-file SHA256 hashes + generation facts
+- **`loadMetadataCache` / `saveMetadataCache`** use atomic write-to-temp + rename for safety
+- Subsequent runs skip already-cached files unless content hash changes
 
-## Key Data Structures
+### 4. BM25 relevance ranking
+- **`Document`** holds tokenized content with term frequencies
+- **`FilterFilesBM25`** computes IDF-normalized scores across the corpus; returns top-K paths per query
+- **`WrapInXmlDelimiter`** wraps file content in `<file path="…">content</file>` tags to prevent prompt injection
 
-| Type | Package | Purpose |
-|---|---|---|
-| `Config` | `internal/config` | Runtime config; all resolved values |
-| `MetadataCache` | `internal/engine` | Persisted state across runs (last commit SHA, processed files/modules) |
-| `FileChange` | `internal/engine` | Parsed git diff entries (Added/Modified/Deleted/Renamed/Copied) |
-| `Document` | `internal/engine/context` | File content + TF statistics for BM25 scoring |
-| `LLMClient` | `internal/engine` | Abstraction over Ollama HTTP chat API with retry logic |
-| `Runner` | `internal/engine/runner` | Pipeline entry point; acquires lock, dispatches init/update modes |
-
----
-
-## Security Guarantees
-
-- **Path confinement** — `SafeResolve()` rejects path traversal (`..`) and external symlinks before any filesystem call.
-- **Concurrent access control** — `AcquireLock()` uses `flock(2)` semantics; TOCTOU-safe checks prevent symlink hijacking of lock targets.
-- **State isolation** — Lock file is added to `.gitignore` so transient state isn't tracked by Git.
+### 5. LLM response parsing
+- **`CleanJSONResponse`** strips markdown code fences and extracts first/last `{}` or `[]` boundaries
+- **`UnmarshalJSONResponse`** deserializes cleaned text into target structs; returns error on failure
+- Malformed responses degrade gracefully (empty string returned)
 
 ---
 
-## Engine Pipeline Stages
+## Module Responsibilities at a Glance
 
-1. **Indexing** (`context.go`) — Tokenize, estimate context budget, wrap content in XML delimiters for prompt-injection safety
-2. **State Tracking** (`engine.go`) — Parse git diff → `[]FileChange`; detect affected nodes; update `MetadataCache`
-3. **Inference** (`engine.go`) — `LLMClient.CallLLM()` with retry logic on transient errors (connection resets, rate limits)
-4. **Response Handling** (`json_parser.go`) — Strip markdown code fences or locate JSON braces → unmarshal into target struct
+| Package | Role |
+|---------|------|
+| `cmd/` | Cobra CLI dispatch — `init`, `update`, `setup` subcommands |
+| `internal/config/` | YAML persistence, four-tier config resolution, env propagation |
+| `internal/engine/` | BM25 ranking, LLM orchestration, cache I/O, change detection |
+| `security.go` | Path confinement (`SafeResolve`), `flock(2)` locking (`AcquireLock`), `.gitignore` enforcement |
+| `internal/tools/file_tools/` | Safe read/write, recursive source discovery, binary detection, path hashing |
+| `internal/tools/git_tools/` | Git command execution, repo validation, HEAD retrieval |
+
+---
+
+## Common Patterns for Developers
+
+1. **Adding a new LLM provider** — Implement the `LLMClient` interface (messages + response parsing) and wire it into `NewRunner(cfg)` which delegates to the engine pipeline
+2. **Extending config resolution** — Register new env var keys in the four-tier resolver; ensure corresponding process propagation via `os.Setenv`
+3. **Custom file filtering** — Extend `isAllowedFile` (ignore lists + directory/component whitelists + extension allowlists); integration point is `discoverCodeFiles` → `filterChanges`
+4. **Debugging BM25 results** — Inspect `FilterFilesBM25` output; term frequencies are pre-computed in the `Document` struct during tokenization phase
+5. **Inspecting cache state** — Read `<repoRoot>/<docsDir>/metadata_cache.json` directly; contains last documented commit hash + per-file SHA256 hashes
+
+---
+
+## Error Handling Philosophy
+
+- Config load failures return an empty struct (not nil); callers must inspect the value, not treat nil as "not loaded"
+- Cache I/O failures degrade to default/empty state — no partial writes survive due to atomic temp+rename pattern
+- LLM response parsing returns empty string on malformed input rather than panicking; downstream code checks for empty responses
+
+---
+
+## Security Boundaries
+
+All filesystem operations are gated behind:
+- **Path confinement** (`SafeResolve`) — prevents traversal outside repo root
+- **Concurrent locking** (`AcquireLock` + `flock(2)`) — mutual exclusion across processes
+- **TOCTOU-safe writes** (`WriteFileSafely`) — symlink check before truncation
+- **Git isolation** — lock file excluded from `.gitignore` to prevent non-deterministic tracking
+
+---
+
+## Running the Engine Directly
+
+```go
+cfg := config.ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)
+runner := engine.NewRunner(cfg)
+err := runner.Run("init") // or "update"
+```
+
+The `Runner.Run(mode)` method: acquires locks → creates LLM client → loads cache (or fresh default on init) → runs git diff → filters changes → determines affected directories → re-processes only affected files through BM25 + LLM generation → updates metadata cache.

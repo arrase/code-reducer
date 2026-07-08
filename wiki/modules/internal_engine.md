@@ -1,87 +1,142 @@
-# Module: internal/engine
+# Code Reduction Engine Architecture
 
-## Responsibility & Data Flow
+## Module Responsibility
 
-The `internal/engine` package orchestrates the full lifecycle of automated documentation generation. It bridges raw repository state (Git diffs, file metadata) with LLM inference capabilities through a four-stage pipeline: **Indexing** (BM25 ranking and context preparation), **State Tracking** (diff parsing, cache persistence, affected node detection), **Inference** (LLM client abstraction with retry logic), and **Response Handling** (JSON extraction and deserialization).
-
-The execution flow terminates at the `Runner` orchestrator, which acquires a lock to serialize repository writes, dispatches either an initialization or update mode based on input, and commits the resulting Git HEAD SHA upon success.
+The `engine` package implements a deterministic code reduction pipeline that ranks repository files via BM25 relevance scoring, caches file fingerprints to avoid redundant reprocessing on subsequent runs, detects affected directories from parsed git diffs, and orchestrates LLM-powered code generation through a configurable chat-completion client. The runner entry point branches execution into initialization or update modes based on the supplied mode parameter.
 
 ---
 
-## Context & Indexing (`context.go`)
+## Data Model & BM25 Ranking (`context.go`)
 
-### Data Structures
+### File Content Representation — `Document`
 
-- **Document**: Encapsulates file content alongside term frequency (TF) statistics required for BM25 scoring calculations.
-- **FileCacheEntry**: Stores a single cached entry's SHA256 hash and associated facts, utilized by the metadata cache to avoid redundant recomputation.
+```go
+type Document struct {
+    // Content holds the raw file text.
+    Content string
+    // TermFrequencies maps token → occurrence count for BM25 scoring.
+    TermFrequencies map[string]int
+    // TokenCount is the total number of tokens in the document.
+    TokenCount int
+}
+```
 
-### Functions
+### Text Tokenization — `Tokenize`
 
-**Tokenize** splits an input string into lowercase alphanumeric tokens via a compiled regular expression. It provides the foundational token stream used for subsequent frequency analysis without character-level noise.
+Splits input text into lowercase alphanumeric tokens using a compiled regex tokenizer. Non-alphanumeric characters are discarded; whitespace and punctuation yield no tokens.
 
-**WrapInXmlDelimiter** encapsulates provided file content in strict XML-like tags with the embedded file path. This structural wrapper mitigates prompt injection risks by isolating user-controlled data from system instructions within the LLM context window.
+### Relevance Ranking — `FilterFilesBM25`
 
-**FilterFilesBM25** ranks repository files by relevance to a query using the BM25 ranking algorithm. It accepts a query string and returns a slice of top-K file paths ordered by inverse document frequency weighted term scores.
+Ranks repository files by relevance to an arbitrary query string using BM25 (Okapi). Returns the top-K file paths after computing term frequencies over each document's tokenized content. The ranking formula incorporates normalized IDF weighting against the total corpus size and a length normalization factor proportional to `avgdl`.
 
----
+### Prompt Injection Mitigation — `WrapInXmlDelimiter`
 
-## Repository State & Diff Engine (`engine.go`)
-
-### Data Structures
-
-- **MetadataCache**: Holds the last documented commit string plus maps for files and modules loaded from `.metadata.json`. Persists state across runs to track which entities have been processed.
-- **FileChange**: Represents a single path/status pair (Added, Modified, or Deleted) parsed from raw git diff output.
-
-### Functions
-
-**loadMetadataCache** deserializes the metadata cache from `.metadata.json`, returning an empty default cache on any I/O error to ensure forward compatibility with stale or corrupted state files.
-
-**saveMetadataCache** serializes the current `MetadataCache` instance to `.metadata.json` using indented JSON formatting for human-readable diffing during debugging.
-
-**computeSHA25** computes the SHA256 hex digest of a file's contents at a given virtual path relative to repo root, ensuring content-addressable integrity checks independent of filesystem location changes.
-
-**parseGitDiff** parses raw git diff output into a `[]FileChange` slice. It handles Added, Deleted, Modified, Renamed, Copied, and Type-changed entries by normalizing rename/copy operations into distinct change records for accurate state tracking.
-
-**isAllowedFile** validates file eligibility based on ignore rules (e.g., `.git`, `node_modules`), directory filters, binary detection heuristics, and path safety resolution to prevent processing of unsafe or irrelevant paths.
-
-**determineAffected** walks the directory tree to identify nodes marked as affected by checking changed files against cache module state and physical file existence. It returns a boolean map keyed by path.
-
-**propagateAffected** recursively walks a `DirNode` tree, marking parent directories as "affected" when any child reports an affected status. This ensures that structural changes (e.g., adding a new directory) invalidate all ancestor documentation entries automatically.
+Wraps file content in strict XML-like tags with the file path attribute: `<file path="...">content</file>`. This prevents prompt injection attacks by constraining LLM input to syntactically delimited regions.
 
 ---
 
-## LLM Interaction Layer (`engine.go`)
+## Caching Layer (`engine.go`)
 
-### Data Structures
+### Cached File Entry — `FileCacheEntry`
 
-- **LLMClient**: Represents the abstraction over an HTTP-based chat API, holding configuration for model identity and transport parameters.
+Stores a cached file's SHA256 hash and associated facts for retrieval without re-processing:
 
-### Functions
+```go
+type FileCacheEntry struct {
+    Hash   string      // SHA256 hex digest of the original content.
+    Facts  interface{} // Arbitrary metadata keyed by filename (e.g., code reduction results).
+}
+```
 
-**NewLLMClient** constructs a new `*LLMClient` with the provided model ID, base URL, context size, and an HTTP client configured with a 10-minute timeout to prevent hangs on slow providers.
+### Metadata Cache — `MetadataCache`
 
-**(LLMClient) CallLLM** invokes the LLM via an HTTP chat API endpoint with retry logic for transient errors (connection resets, rate limits). It returns the streamed response string accumulated from successful chunks, discarding partial responses only after exhausting the retry budget.
+Aggregates per-file cache entries, the last documented commit hash, and module mappings into a single JSON-deserializable structure:
+
+```go
+type MetadataCache struct {
+    LastDocumentedCommit string               // Commit hash of most recent successful documentation pass.
+    FileCache             map[string]FileCacheEntry `json:"file_cache"`
+    ModuleMappings        map[string]string         `json:"module_mappings"`
+}
+```
+
+### Cache I/O — `loadMetadataCache` / `saveMetadataCache`
+
+- **`loadMetadataCache(repoRoot, docsDir) (*MetadataCache, error)`** reads the metadata cache from disk at `<repoRoot>/<docsDir>/metadata_cache.json`. Returns an empty default cache if the file is missing or malformed.
+- **`saveMetadataCache(repoRoot, docsDir, cache *MetadataCache) error`** serializes the metadata cache to JSON and writes it safely to disk atomically (write-to-temp + rename).
+
+### File Fingerprinting — `computeSHA256`
+
+Reads a file at the given path and returns its SHA256 hex digest. Used for change detection between runs.
+
+---
+
+## Change Detection & Affected Directory Propagation (`engine.go`)
+
+### Git Diff Parsing — `parseGitDiff`
+
+Parses raw git diff output into structured `[]FileChange` entries, categorizing adds, deletes, renames (via rename detection logic), copies, modifications, and type changes. Each entry carries the relative file path and change classification.
+
+### File Filtering — `isAllowedFile`
+
+Filters files by:
+- Ignore lists (explicit path patterns)
+- Directory/component name whitelists
+- File extension allowlists (excludes binaries like `.exe`, `.dll`)
+- Safe path resolution to prevent traversal attacks
+
+Returns `true` if the file passes all filters.
+
+### Affected Region Detection — `determineAffected` / `propagateAffected`
+
+- **`determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataCache, filteredChanges []FileChange, affectedDirs map[string]bool)`** identifies which directories need updating by checking for changed files and verifying module existence against the metadata cache.
+- **`propagateAffected(node *DirNode, affectedDirs map[string]bool) bool`** recursively marks a directory tree as affected when any descendant is marked. Returns `true` if propagation occurred.
+
+---
+
+## LLM Client (`engine.go`)
+
+### Message — `Message`
+
+Represents an LLM role-content pair used in chat completions with JSON serialization support:
+
+```go
+type Message struct {
+    Role   string // "system", "user", "assistant"
+    Content string
+}
+```
+
+### Client Configuration — `LLMClient` / `NewLLMClient`
+
+- **`LLMClient`** holds configuration for an LLM provider including model ID, base URL, context size limit, and HTTP client instance.
+- **`NewLLMClient(modelID, baseURL string, numCtx int) *LLMClient`** initializes a new `LLMClient` with the given parameters and a 10-minute default timeout for HTTP requests.
 
 ---
 
 ## Response Parsing (`json_parser.go`)
 
-### Functions
+### JSON Extraction — `CleanJSONResponse`
 
-**CleanJSONResponse** extracts JSON content from raw LLM output by either stripping surrounding markdown code fences or locating the first opening brace/bracket and last closing brace/bracket pair in the text, returning a trimmed JSON string. This handles common model behaviors where structured output is wrapped in conversational scaffolding.
+Extracts JSON content from surrounding markdown code fences (`` ```json `` or `` ``` ``) or locates the first opening brace/bracket and last closing brace/bracket in raw text to return a trimmed JSON string. Handles malformed responses gracefully by returning an empty string if no valid JSON is found.
 
-**UnmarshalJSONResponse** chains `CleanJSONResponse` followed by standard Go deserialization into the provided target interface value (`interface{}`). It returns an error if the cleaned payload fails to unmarshal, ensuring type-safe consumption of LLM outputs downstream.
+### Deserialization — `UnmarshalJSONResponse`
+
+Cleans the raw response using `CleanJSONResponse`, then unmarshals the resulting JSON into the provided target interface value (e.g., `*struct`). Returns an error if deserialization fails or the cleaned text is empty.
 
 ---
 
-## Pipeline Orchestration (`runner.go`)
+## Execution Orchestration (`runner.go`)
 
-### Data Structures
+### Runner — `Runner` / `NewRunner` / `Run`
 
-- **Runner**: Holds a configuration pointer and orchestrates repository operations including locking, LLM client instantiation, and documentation pipeline execution. Acts as the entry point for all write operations to the documentation store.
-
-### Functions
-
-**NewRunner** exports a constructor that initializes a new `Runner` instance with the provided configuration, establishing initial state dependencies (lock file paths, cache locations) required for subsequent execution.
-
-**Run** is the primary execution method. It acquires an exclusive lock on the runner's state file to serialize concurrent invocations, dispatches to either `init` or `update` modes based on input arguments, and updates the Git HEAD SHA in the config upon successful completion.
+- **`Runner`**: A struct holding a reference to the engine configuration, serving as the primary entry point for executing code reduction workflows.
+- **`NewRunner(cfg *Config)`** initializes and returns a new `Runner` instance bound to a specific configuration pointer.
+- **`Run(mode string) error`** executes the core workflow by:
+  1. Acquiring repository locks (mutex or file-based, depending on environment).
+  2. Creating an LLM client via `NewLLMClient`.
+  3. Branching into initialization mode (`mode == "init"`) or update mode based on the provided mode parameter.
+  4. Loading the metadata cache from disk (or creating a fresh one for init).
+  5. Running git diff, filtering changes, and determining affected directories.
+  6. Re-processing only affected files through BM25 ranking followed by LLM code generation.
+  7. Updating the metadata cache with new SHA256 hashes and facts after completion.
