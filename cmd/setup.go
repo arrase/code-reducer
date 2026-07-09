@@ -37,7 +37,7 @@ func RunSetupFlow(repoRoot string) {
 	fmt.Println("Welcome to Code-Reducer CLI Setup")
 	fmt.Println("---------------------------------")
 
-	existingModel := "gemma4:26b-a4b-it-qat"
+	existingModel := "ornith:9b"
 	existingBaseURL := config.OllamaDefaultBaseURL
 	existingNumCtx := config.OllamaDefaultNumCtx
 

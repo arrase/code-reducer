@@ -68,22 +68,37 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 			facts = cachedEntry.Facts
 		} else {
 			contentStr := string(contentBytes)
-			runes := []rune(contentStr)
-			if len(runes) > fileLimit {
-				contentStr = string(runes[:fileLimit]) + "\n...(truncated)..."
+			overlap := 800
+			if overlap > fileLimit/4 {
+				overlap = fileLimit / 4
 			}
+			chunks := chunkTextWithOverlap(contentStr, fileLimit, overlap)
 
 			var factsBuilder strings.Builder
 			for i, step := range cfg.ExtractionSteps {
-				logEvent("status", fmt.Sprintf("➜ Extracting file (Step %d/%d - %s): %s", i+1, len(cfg.ExtractionSteps), step.Name, f))
-				
-				systemPrompt := c.GetBaseSystemPrompt() + step.Prompt
-				res, err := c.CallLLM(ctx, systemPrompt, []Message{{Role: "user", Content: fmt.Sprintf("File: %s\n```\n%s\n```", f, contentStr)}}, false)
-				if err != nil {
-					return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
+				var stepFacts []string
+				for chunkIdx, chunk := range chunks {
+					chunkMsg := ""
+					if len(chunks) > 1 {
+						chunkMsg = fmt.Sprintf(" (Chunk %d of %d)", chunkIdx+1, len(chunks))
+					}
+					logEvent("status", fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(cfg.ExtractionSteps), step.Name, chunkMsg, f))
+					
+					systemPrompt := c.GetBaseSystemPrompt() + step.Prompt
+					userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, node.Path, chunk)
+					res, err := c.CallLLM(ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
+					if err != nil {
+						return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
+					}
+					stepFacts = append(stepFacts, StripOuterMarkdownFence(res))
 				}
-				
-				factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, StripOuterMarkdownFence(res)))
+
+				consolidatedFact, err := reduceFileFacts(ctx, c, f, step.Name, stepFacts, logEvent)
+				if err != nil {
+					return "", err
+				}
+
+				factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, consolidatedFact))
 			}
 			facts = strings.TrimSpace(factsBuilder.String())
 
