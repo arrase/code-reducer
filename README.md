@@ -19,7 +19,7 @@ Designed specifically for **local development and private LLMs**, Code-Reducer u
 
 ### Prerequisites
 * **Go**: Version 1.21 or higher.
-* **Ollama**: Running locally with a compatible model downloaded (e.g., `ornith:9b` or `gemma4:26b-a4b-it-qat`).
+* **Ollama**: Running locally with a compatible model downloaded (e.g., `ornith:9b` or `gemma4:26b`).
 
 ### 1. Build from Source (or Download Release)
 *Note: Precompiled binaries are available attached to each release.*
@@ -53,7 +53,7 @@ Incrementally update the wiki whenever code files change:
 
 ### 1. `code-reducer setup`
 Runs an interactive setup flow in the current directory to generate the `.code-reducer.yaml` configuration file. You will be prompted for:
-* LLM Model ID (defaults to `gemma4:26b-a4b-it-qat` or reads from existing config)
+* LLM Model ID (defaults to `ornith:9b` or reads from existing config)
 * Ollama Base URL (defaults to `http://localhost:11434`)
 * Ollama Context Size (defaults to `8192` or reads from existing config)
 * Custom files and directories to ignore
@@ -120,7 +120,7 @@ Code-Reducer implements a four-tier configuration resolution chain (defined in `
    * `OLLAMA_NUM_CTX` overrides `ollama_num_ctx`
 3. **YAML File (`.code-reducer.yaml`)**: Read from the repository root.
 4. **Defaults**: Hardcoded fallbacks if no other configuration exists:
-   * Model ID: `gemma4:26b-a4b-it-qat`
+   * Model ID: `ornith:9b`
    * Ollama URL: `http://localhost:11434`
    * Context Size: `8192`
 
@@ -153,23 +153,27 @@ In `update` mode, the engine dynamically determines which directory nodes are "a
 * Its cached entry is missing from `.metadata.json` (as part of `MetadataCache.Modules`).
 * **Propagation**: If a child directory is affected, the status propagates recursively upwards to the parent directory. This triggers a bottom-up rebuild of parent and root summaries.
 
-#### The Map Phase (File Fact Extraction)
+#### The Map Phase (File Fact Extraction & Overlapping Chunking)
 For every code file in an affected directory, the engine calculates the `SHA256` of its contents:
 * **Cache Hit**: Reuses the stored facts string from the cache.
-* **Cache Miss**: Reads up to the first `8,000` characters and executes a **Configurable Multi-Prompt Extraction Pipeline**. By default, it runs 4 steps optimized for smaller ~10B LLMs:
+* **Cache Miss**: Analyzes the file using a **Configurable Multi-Prompt Extraction Pipeline**. To handle files that exceed the context window, the engine applies an **Overlapping Chunking Strategy**:
+  * Large files are split into overlapping fragments (chunks) calculated dynamically based on `c.NumCtx` (typically allocating 75% of context for code and reserving a ~800 character overlap margin to prevent context blindness at chunk boundaries).
+  * The Map phase loops through each extraction step. For each step, it executes isolated inference on every chunk of the file, injecting rich contextual metadata (like file name, chunk index, and module path) directly into the prompt to guide the LLM.
+
+  By default, it runs 4 steps optimized for smaller ~10B LLMs:
   1. **API_SIGNATURES**: Extracts public signatures and structural contracts.
   2. **BUSINESS_LOGIC**: Infers algorithmic intent and domain rules.
   3. **STATE_AND_CONCURRENCY**: Identifies mutable state, threading models, and sync primitives.
   4. **ERRORS_AND_SIDE_EFFECTS**: Maps I/O boundaries, network calls, and error-handling philosophies.
   
-  These steps can be completely overridden, removed, or expanded in your `.code-reducer.yaml` via the `extraction_steps` array. The results of all steps are automatically concatenated into a comprehensive "Developer Briefing" for the file. Outer markdown fences are stripped via regex.
+  These steps can be completely overridden, removed, or expanded in your `.code-reducer.yaml` via the `extraction_steps` array.
 
-#### The Reduce Phase (Recursive Chunk Synthesis)
-To prevent massive folders from blowing out Ollama's context window, component summaries (files and child directory summaries) are merged bottom-up in batches dynamically sized by character length:
-* **Length Limit**: The context budget is calculated as `c.NumCtx * 3` characters (defaulting to `24,576` characters).
-* **Chunk Merging**: Components are grouped into batches that fit within this limit.
-  * If a directory's components fit into a single batch, they are joined with double newlines and sent directly to the LLM with the `module_synthesis` prompt to yield a unified directory summary.
-  * If they exceed the limit, they are split recursively into sub-batches, reduced independently to intermediate summaries, and then recursively merged until a single module summary is achieved.
+#### The Reduce Phase (Hierarchical Consolidation)
+To prevent massive files and folders from blowing out Ollama's context window, Code-Reducer applies a recursive bottom-up consolidation strategy grouped in dynamically sized batches (capped at `c.NumCtx * 3` characters):
+* **File-Level Reduce**: If a single file was split into multiple chunks during the Map phase, their extracted facts are recursively deduplicated and consolidated into a unified "Developer Briefing" for the file using a specialized `reduceFileFacts` pipeline.
+* **Directory-Level Reduce**: File briefings and child directory summaries are grouped into batches.
+  * If a directory's components fit into a single batch, they are joined and sent to the LLM with the `module_synthesis` prompt to yield a unified directory summary.
+  * If they exceed the limit, they are split into sub-batches, reduced independently to intermediate summaries, and recursively merged until a single module summary is achieved.
 * Directory summaries are written to `wiki/modules/<path_with_underscores>.md` (root directory resolves to `wiki/modules/root.md`).
 
 #### Global Synthesis Phase

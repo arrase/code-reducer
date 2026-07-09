@@ -1,140 +1,137 @@
-# cmd Package — Technical Documentation
+# Module: `cmd` — Code-Reducer CLI Entry Point & Command Registry
 
-## Module Responsibility
+## Responsibility
 
-The `cmd` package implements a Cobra-based CLI entry-point layer for Code-Reducer, a documentation agent that writes and maintains project wikis. The module's scope is restricted to command definition, wiring, initialization sequencing, and user-facing I/O (terminal prompts, status/error output). All executable behavior—repository scanning, wiki generation, configuration resolution—is delegated to external functions defined in other packages or files within the same package; `cmd` itself contains no domain processing logic.
+The `cmd` package provides the Cobra-based CLI surface area for interacting with the Code-Reducer documentation engine. It owns three concerns:
 
-## Architecture Overview
+1. **Command registration** — wiring subcommands (`init`, `update`) to the root command tree via unexported `init()` functions in `cmd/init.go` and `cmd/update.go`.
+2. **Pre-flight environment validation & configuration resolution** — verifying the working directory is a git repository, resolving merged configuration from file + CLI flags, and detecting project initialization state (last documented commit SHA).
+3. **Engine orchestration** — spawning an engine runner with signal handlers active, feeding typed events (`"status"`, `"error"`) to stdout/stderr via `fmt` family functions.
 
-The module exposes four subcommands registered under an unexported root command (`RootCmd`). Registration is performed at package initialization via standard Go `init()` functions:
+All substantive behavior lives in the unexported `executeCommand(mode string)` function referenced from both subcommand files; neither file contains its own processing logic beyond delegation.
 
-| File | Registered Command | Role |
-|---|---|---|
-| `cmd/init.go` | `*cobra.Command` (unexported) | `init` subcommand — delegated to `executeCommand("init")` |
-| `cmd/update.go` | `*cobra.Command` (unexported) | `update` subcommand — delegates to `executeCommand("update")` |
-| `cmd/root.go` | `*cobra.Command` (`RootCmd`) | Root command — wires flags, validates environment, drives event loop |
-| `cmd/setup.go` | `*cobra.Command` (unexported) | Interactive setup wizard — produces `.code-reducer.yaml` config |
-
-The actual execution handler is an unexported function `executeCommand(mode string)` referenced from each subcommand's `Run`. Its definition is external to all four files; only the delegation call sites are observable.
-
-## Command Registration Layer
-
-### init.go
-
-Package-private `init()` registers the `init` subcommand with `RootCmd` at package initialization. No exported symbols, no mutable state, no concurrency primitives exist in this file. The global `initCmd *cobra.Command` is assigned once and never reassigned within its scope; it is effectively immutable for the lifetime of the process.
-
-### update.go
-
-Package-private `update()` registers the `update` subcommand with `RootCmd`. No exported symbols, no mutable state beyond a single unexported `*cobra.Command` variable, no concurrency primitives. The `Run` callback delegates entirely to the external `executeCommand("update")`; any errors from that call site are swallowed by Cobra's framework-level panic propagation path because the signature is `func(cmd *cobra.Command, args []string)` with no error return type.
-
-### root.go
-
-This file defines three observable items:
-
-- **`RootCmd *cobra.Command`** — exported variable holding the root command instance.
-- **Unexported `init()` function** — registers `updateCmd` with `RootCmd`.
-- **Package-private execution flow** — parses flags, validates environment (git repo root, config file existence), resolves merged configuration (CLI flag values + persisted config), validates init/update state consistency, installs a signal handler for graceful shutdown (`SIGINT`, `SIGTERM` via `signal.NotifyContext(context.Background(), ...)`), starts the engine runner in event-loop mode, and exits with appropriate status on completion or failure.
-
-The package-level flags `modelIdFlag` (string) and `numCtxFlag` (string) are set by Cobra's flag parser during init and read later inside `executeCommand`; they are not protected by any synchronization primitive and their mutation is observable only at the point of assignment.
-
-## Configuration Setup — setup.go
-
-### Public Surface Area
-
-| Function | Input Types | Output Type |
-|---|---|---|
-| `RunSetupFlow` | `repoRoot string` | void |
-| `promptStringList` | `reader *bufio.Reader`, `promptMsg string`, `existingList []string` | `[]string` |
-| `promptString` | `reader *bufio.Reader`, `promptMsg string`, `existingVal string` | `string` |
-
-### Algorithmic Flow
-
-1. **Resolve current working directory** via `os.Getwd()`; fail fast with `fmt.Printf(...)` + `os.Exit(1)` on error.
-2. **Load prior config** (if any) via `config.LoadConfig(repoRoot)`. A load failure is treated as "no existing config" — all fields fall back to hardcoded defaults (`existingModel`, `OllamaDefaultBaseURL`, `OllamaDefaultNumCtx`). No panic, no exit on this path.
-3. **Iterate prompts** for each configuration dimension:
-   - LLM Model ID → prompt string (fallback from existing value or default).
-   - Ollama Base URL → prompt string.
-   - Ollama Context Size → prompt string; validated via `strconv.Atoi` with condition `err == nil && n > 0`; failure keeps existing value.
-   - Custom ignore paths / extension list → comma-separated prompt; empty input yields no new entries.
-   - Documentation directory → prompt string (default `"wiki"`).
-4. **Build the complete config object** from all collected values. Extraction steps are filled in with defaults if absent.
-5. **Persist to disk** via `config.SaveConfig(repoRoot, newCfg)`. A save failure is fatal: printed + `os.Exit(1)`.
-
-### State and Concurrency
-
-- `setupCmd *cobra.Command` — initialized once in `init()`; never reassigned within this file.
-- All other variables are function-local parameters or temporaries. The `config.Config` struct is loaded into a local variable, then replaced by a new instance before being saved; no concurrent access observable within this file's scope.
-
-### Error Handling Classification
-
-| Path | Behavior | Notes |
-|---|---|---|
-| `os.Getwd()` fails | Fatal: stdout print + `os.Exit(1)` | Unwrapped error |
-| `config.SaveConfig` fails | Fatal: stdout print + `os.Exit(1)` | Unwrapped error |
-| `config.LoadConfig` returns error | Graceful fallback to defaults | No exit, no panic |
-| `strconv.Atoi` fails in context-size prompt | Graceful fallback to existing value | Conditionally preserved |
-| `reader.ReadString('\n')` fails (either helper) | Warning print + return existing value | Standard library path only |
-
-No error wrapping. All errors originate from the standard library (`os`, `bufio`, `strconv`) or the external `config` package; none are redefined locally. No panic recovery, no sentinel values, no custom error types in this file.
-
-## Entry Point and Execution Routing
-
-The module's entry point is `RootCmd`. Its execution path follows a deterministic pipeline:
+## Data Flow
 
 ```
-CLI invocation → parse flags & mode
-    ├─ verify git repo root (tools.VerifyGitRepo), exit if invalid
-    │
-    ├─ check config file existence (internal/config.ConfigExists)
-    │   ├─ missing + TTY       → implicit RunSetupFlow(repoRoot) [return value unobservable]
-    │   ├─ missing + !TTY      → error message to stderr, os.Exit(1)
-    │   └─ present              → proceed to mode validation
-    │
-    ├─ resolve merged config (internal/config.ResolveConfig: file + flags)
-    │
-    ├─ validate init/update state consistency
-        ├─ "init" + already initialized → reject with last documented commit
-        ├─ "update" + not initialized  → reject, suggest running init
-        └─ other modes                 → proceed
-    │
-    ├─ install signal handler for graceful shutdown (SIGINT, SIGTERM)
-    │
-    ├─ start engine runner in event loop mode
-    │   (propagates typed events to stdout/stderr via callback closure)
-    │
-    └─ on completion or failure, exit with appropriate status
+User invokes "code-reducer init|update"
+        │
+        ▼
+cmd/init.go ── Run() ──► executeCommand("init")
+cmd/update.go ── Run() ──► executeCommand("update")
+        │                          │
+        │                          ▼
+        │              root.go: Validate → Resolve Config → Query Last Commit SHA
+        │                                      │
+        │                                      ▼
+        │                              Route by mode (init|update)
+        │                                      │
+        │                                      ▼
+        └──────────── RootCmd.AddCommand(initCmd/updateCmd)
+                                  │
+                                  ▼
+                          engine.NewRunner().Run(callback)
 ```
 
-### I/O Operations Observed from Entry Point
+## 1. Command Registration
 
-| # | Operation | Direction | Notes |
-|---|-----------|-----------|-------|
-| S1 | Print status messages to stdout | Out → Terminal | `fmt.Println(ev.Message)` inside event handler callback passed to `engine.Runner` |
-| S2 | Print error events to stderr | Out → Terminal | `fmt.Fprintf(os.Stderr, "Error: %s\n", ev.Message)` for `"error"`-typed events only |
-| S3 | Print arbitrary events to stdout | Out → Terminal | `fmt.Println(ev.Message)` fallback for non-status, non-error event types |
-| S4 | Write error on `os.Getwd()` failure | Out → stderr | `fmt.Fprintf(os.Stderr, "Error: %v\n", err)` + `os.Exit(1)` |
-| S5 | Write error after `tools.VerifyGitRepo` return | Out → stderr | Same pattern as S4 |
-| S6 | Print setup-required message (missing config + non-TTY) | Out → stdout | `fmt.Printf("Error: Configuration file ... does not exist...")` + `os.Exit(1)` |
-| S7 | Print init-already-ran error | Out → stderr | `"The project has already been initialized..."` + `os.Exit(1)` |
-| S8 | Print not-initialized error | Out → stderr | `"The project has not been initialized yet..."` + `os.Exit(1)` |
-| S9 | Print run-failure message | Out → stdout | `fmt.Printf("Documentation Run Failed: %v\n", err)` after `runner.Run` returns error — notable deviation from other errors (stdout rather than stderr) |
+### `cmd/init.go` — Init Subcommand Entry Point
 
-### Concurrency and Signal Handling
+- Declares an unexported `initCmd = &cobra.Command{...}` and a package-level `init()` function that registers it via `RootCmd.AddCommand(initCmd)` during package initialization.
+- The exported `Run` handler calls `executeCommand("init")` with no error check on the return value — any failure from downstream logic is swallowed at this layer.
 
-- A background context is created via `signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)` for graceful shutdown on interrupt/term signals. This provides a cancellation scope; no shared state protection is observable within this file's scope.
-- No `sync.Mutex`, channels, or other synchronization primitives are used anywhere in the module.
+### `cmd/update.go` — Update Subcommand Entry Point
 
-## Error Handling Patterns Across Module
+- Mirrors the pattern of `init.go`: unexported `updateCmd = &cobra.Command{...}` and a package-level `init()` function that registers it under the root command tree.
+- The exported `Run` handler delegates to `executeCommand("update")`; no error handling is performed here.
 
-| # | Pattern | Location | Details |
-|---|---------|----------|---------|
-| E1 | Immediate exit on unrecoverable OS error | `os.Getwd()` failure | Calls `os.Exit(1)` directly after printing to stderr; no wrapping, no context preservation |
-| E2 | Immediate exit on validation failure | `tools.VerifyGitRepo` return | Same pattern as E1 |
-| E3 | Conditional exit with terminal check | Missing config + non-TTY stdin | Prints user-facing hint then calls `os.Exit(1)`; swallows the underlying "no config file" condition |
-| E4 | Immediate exit on engine failure | After `runner.Run` returns error | Printed to stdout (S9), then `os.Exit(1)`; error unwrapped for display only |
+### `cmd/root.go` — Root Command & Lifecycle Management
 
-### Notable Observations
+The package-level variable `RootCmd *cobra.Command` is initialized once via a struct literal and never reassigned. An unexported `init()` function registers persistent flags (`--model-id`, `--num-ctx`) on `RootCmd`.
 
-- **No panic recovery**: All errors are handled via explicit checks + `os.Exit(1)`. No `defer/recover` or panic handlers visible.
-- **Context cancellation setup**: A background context is created with signal notifications and deferred stop, but no observable code in this file reads from or responds to that signal beyond its creation — the `defer stop()` at function end only fires when the program exits non-normally (i.e., never returns normally).
-- **No error wrapping**: Every `fmt.Printf/Println` that prints an error does so with `%v` or `%s` on the raw error value. No use of `errors.Join`, `fmt.Errorf(wrap...)`, or custom sentinel types visible anywhere in this module's scope.
+## 2. Pre-flight Validation & Configuration Resolution (root.go)
+
+### Environment Prerequisites
+
+| Check | Mechanism | Failure Path |
+|---|---|---|
+| Current working directory exists | `os.Getwd()` | Fatal — prints `"Error getting current working directory: %v"`, exits with code 1 |
+| Git repository validity | `tools.VerifyGitRepo` (outbound call) | Fatal — prints `"Error: %v"` (raw error from verifier), exits with code 1 |
+| Configuration file existence | `config.ConfigExists` (disk stat) | Fatal if missing AND stdin is not a terminal — instructs user to run `code-reducer setup`; swallowed if non-interactive context, proceeds without config |
+
+### Mode Routing & Initialization State Detection
+
+After validation passes, the system queries the last documented commit SHA from git history and routes execution based on the mode argument:
+
+| Mode | Pre-condition Violation | Error Message |
+|---|---|---|
+| `init` | Project already initialized | `"Error: The project has already been initialized..."` → exit 1 |
+| `update` | Project not yet initialized | `"Error: The project has not been initialized yet..."` → exit 1 |
+
+### Configuration Resolution
+
+The effective configuration merges three sources in priority order at runtime (not on init): persisted `.code-reducer.yaml`, explicit CLI flags (`--model-id`, `--num-ctx`), and built-in defaults. This allows per-invocation overrides without modifying stored state.
+
+## 3. Interactive Setup Flow (cmd/setup.go)
+
+### Entry Point: `RunSetupFlow(repoRoot string)`
+
+The sole exported identifier in this file. Takes the repository root directory path as input; performs no return value.
+
+### Algorithmic Steps
+
+1. **Resolve working directory** — Fail fast with a message if `os.Getwd()` returns an error (calls `os.Exit(1)`).
+2. **Load existing configuration** — Calls `config.LoadConfig(repoRoot)`. If the read fails and `cfg == nil`, setup continues silently as if no prior config exists (load errors are swallowed, not reported to user).
+3. **Prompt user in sequence** — For each setting (model ID, Ollama URL, context size, ignore paths, ignore extensions, docs directory), prints `"Label [existingValue]:"`. If no existing value is present, only the label is printed.
+4. **Validate and sanitize input**:
+   - Context size parsed via `strconv.Atoi`; on failure or non-positive result, falls back to built-in default (`config.OllamaDefaultNumCtx`) with no warning print.
+   - Ignore lists split on commas, trimmed per token; empty tokens discarded.
+5. **Persist configuration** — Calls `config.SaveConfig(repoRoot, newCfg)`. On write failure, prints error and calls `os.Exit(1)`.
+
+### Business Rules for Setup Flow
+
+- **Non-destructive defaults**: Empty string input reverts every field to its stored or built-in default; prior configuration is never silently overwritten with blanks.
+- **Graceful degradation on stdin errors**: Terminal read failures in `promptString` and `promptStringList` print a warning line but return the existing value unchanged — no abort.
+- **Idempotent re-runs**: Re-executing setup preserves whatever was previously configured, only changing fields the user explicitly modifies.
+
+### I/O Summary for Setup Flow
+
+| Operation | Direction | Notes |
+|---|---|---|
+| `config.LoadConfig` | Read | Failure silently swallowed; setup proceeds with empty defaults |
+| `config.SaveConfig` | Write | Failure → stderr message, calls `os.Exit(1)` |
+| Stdout via `fmt` | Outbound | Welcome banner, per-prompt labels, warning lines, success confirmation |
+| Stdin via `bufio.Reader` | Inbound | Both prompt functions consume one line per interaction via `ReadString('\n')` |
+
+## 4. Engine Orchestration & Signal Handling (root.go)
+
+### Signal Registration
+
+The main execution loop registers interrupts (`os.Interrupt`) and termination signals (`syscall.SIGTERM`) via `signal.NotifyContext`, deferring their cleanup handlers to ensure the engine can be interrupted cleanly during long-running documentation tasks.
+
+### Engine Runner Invocation
+
+After validation, config resolution, and mode routing pass:
+- `engine.NewRunner` is created (implementation outside this file).
+- `runner.Run(callback)` is invoked with a callback that handles three event types (`"status"`, `"error"`, default): all print to stdout or stderr via `fmt` family — no state changes, no logging to file, no metrics emission.
+
+### Error Handling Strategy for Execution Path
+
+| Condition | Message Format | Output Stream |
+|---|---|---|
+| `runner.Run` returns non-nil error | `"Documentation Run Failed: %v"` | stdout (unlike other fatal paths which use stderr) |
+| Any validation failure above | Varies per condition | stderr, exits code 1 |
+
+## 5. Concurrency & State Analysis
+
+| Concern | Status |
+|---|---|
+| Package-level mutable state | None — `RootCmd`, `initCmd`, `updateCmd` are all assigned once at init and never modified after construction |
+| Concurrent primitives (mutex, channels, goroutines) | Absent across all four files |
+| I/O operations directly in these files | Minimal — only disk stat/read for config checks, stdout writes via `fmt`, signal registration; no network calls, no direct file access beyond config package |
+
+## 6. External Dependencies Referenced
+
+- **`github.com/spf13/cobra`** — CLI framework used for command tree construction and flag parsing across all four files.
+- **`tools.VerifyGitRepo`** — referenced in `root.go`; implementation outside this module.
+- **`config.ConfigExists`, `config.LoadConfig`, `config.SaveConfig`** — config package references; implementations outside this module.
+- **`engine.NewRunner`, `runner.Run`** — engine package references; implementations outside this module.

@@ -172,7 +172,7 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 	}
 
 	// 1. Resolve Model ID: Default > YAML > Env > Flag
-	resolved.ModelID = "gemma4:26b-a4b-it-qat"
+	resolved.ModelID = "ornith:9b"
 	if cfg.ModelID != "" {
 		resolved.ModelID = cfg.ModelID
 	}
