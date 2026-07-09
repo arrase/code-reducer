@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -41,38 +43,34 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	}
 
 	var components []string
+	
+	// Calculate a 100% dynamic file truncation limit based purely on the context size.
+	// Assuming ~4 characters per token, we allocate 75% of the total context window 
+	// for the file content, proportionally reserving the remaining 25% for prompts and output.
+	fileLimit := int(float64(c.NumCtx * 4) * 0.75)
+
 	for _, f := range node.Files {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
 
-		// Calculate current SHA256 of the file
-		fileHash, err := computeSHA256(repoRoot, f)
+		contentBytes, err := tools.ReadFileSafely(repoRoot, f)
 		if err != nil {
 			continue // Skip if file can't be read
 		}
+		
+		hashSum := sha256.Sum256(contentBytes)
+		fileHash := hex.EncodeToString(hashSum[:])
 
 		var facts string
 		cachedEntry, exists := cache.Files[f]
 		if exists && cachedEntry.SHA256 == fileHash {
 			facts = cachedEntry.Facts
 		} else {
-			contentBytes, err := tools.ReadFileSafely(repoRoot, f)
-			if err != nil {
-				continue
-			}
 			contentStr := string(contentBytes)
-
-			// Calculate a safe dynamic file truncation limit based on the context size
-			limit := c.NumCtx * 3
-			if limit > 12000 {
-				limit = limit - 4000
-			} else {
-				limit = 8000
-			}
-
-			if len(contentStr) > limit {
-				contentStr = contentStr[:limit] + "\n...(truncated)..."
+			runes := []rune(contentStr)
+			if len(runes) > fileLimit {
+				contentStr = string(runes[:fileLimit]) + "\n...(truncated)..."
 			}
 
 			var factsBuilder strings.Builder

@@ -48,6 +48,18 @@ func loadMetadataCache(repoRoot string, docsDir string) (*MetadataCache, error) 
 	return &cache, nil
 }
 
+// GetLastDocumentedCommit parses the cache metadata and returns the last documented commit SHA.
+func GetLastDocumentedCommit(repoRoot, docsDir string) (string, bool) {
+	cache, err := loadMetadataCache(repoRoot, docsDir)
+	if err != nil {
+		return "", false
+	}
+	if cache.LastDocumentedCommit != "" {
+		return cache.LastDocumentedCommit, true
+	}
+	return "", false
+}
+
 func saveMetadataCache(repoRoot string, docsDir string, cache *MetadataCache) error {
 	metadataPath := filepath.Join(docsDir, ".metadata.json")
 	data, err := json.MarshalIndent(cache, "", "  ")

@@ -182,7 +182,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []st
 			return nil
 		}
 
-		files = append(files, rel)
+		files = append(files, filepath.ToSlash(rel))
 		return nil
 	})
 

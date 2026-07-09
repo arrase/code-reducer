@@ -70,13 +70,13 @@ func RunSetupFlow(repoRoot string) {
 	var ignores []string
 	var ignoreExtensions []string
 
-	if existingCfg == nil {
-		ignores = promptAndAppend(reader, "Enter custom directories/files to ignore (in addition to standard defaults) []: ", nil, config.DefaultIgnores)
-		ignoreExtensions = promptAndAppend(reader, "Enter custom file extensions to ignore (in addition to standard defaults) []: ", nil, config.DefaultIgnoredExtensions)
-	} else {
-		ignores = promptAndAppend(reader, "Enter directories/files to ignore (comma-separated)", existingCfg.Ignore, nil)
-		ignoreExtensions = promptAndAppend(reader, "Enter file extensions to ignore (comma-separated)", existingCfg.IgnoreExtensions, nil)
+	if existingCfg != nil {
+		ignores = existingCfg.Ignore
+		ignoreExtensions = existingCfg.IgnoreExtensions
 	}
+
+	ignores = promptStringList(reader, "Enter custom directories/files to ignore (comma-separated)", ignores)
+	ignoreExtensions = promptStringList(reader, "Enter custom file extensions to ignore (comma-separated)", ignoreExtensions)
 
 	existingDocsDir := "wiki"
 	if existingCfg != nil && existingCfg.DocsDir != "" {
@@ -109,51 +109,38 @@ func RunSetupFlow(repoRoot string) {
 	fmt.Printf("Configuration successfully saved to local %s file.\n", config.ConfigFileName)
 }
 
-func promptAndAppend(reader *bufio.Reader, promptMsg string, existingList []string, defaults []string) []string {
+func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) []string {
 	var result []string
-	if existingList == nil {
-		fmt.Print(promptMsg)
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Printf("\nWarning: error reading input (%v), using defaults.\n", err)
-			return defaults
-		}
-		input = strings.TrimSpace(input)
-		result = append(result, defaults...)
-		if input != "" {
-			parts := strings.Split(input, ",")
-			for _, part := range parts {
-				trimmed := strings.TrimSpace(part)
-				if trimmed != "" {
-					result = append(result, trimmed)
-				}
-			}
-		}
+	existingStr := ""
+	if len(existingList) > 0 {
+		existingStr = strings.Join(existingList, ", ")
+	}
+	
+	if existingStr == "" {
+		fmt.Printf("%s: ", promptMsg)
 	} else {
-		existingStr := strings.Join(existingList, ", ")
 		fmt.Printf("%s [%s]: ", promptMsg, existingStr)
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Printf("\nWarning: error reading input (%v), keeping existing values.\n", err)
-			return existingList
-		}
-		input = strings.TrimSpace(input)
+	}
 
-		if input == "" {
-			result = existingList
-		} else {
-			parts := strings.Split(input, ",")
-			for _, part := range parts {
-				trimmed := strings.TrimSpace(part)
-				if trimmed != "" {
-					result = append(result, trimmed)
-				}
-			}
-			if result == nil {
-				result = []string{}
-			}
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Printf("\nWarning: error reading input (%v), keeping existing values.\n", err)
+		return existingList
+	}
+
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return existingList
+	}
+
+	parts := strings.Split(input, ",")
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
 		}
 	}
+	
 	return result
 }
 

@@ -35,17 +35,20 @@ type Config struct {
 	IgnoreExtensions []string         `yaml:"ignore_extensions"`
 }
 
+// getConfigPath returns the absolute path to the configuration file.
+func getConfigPath(cwd string) string {
+	return filepath.Join(cwd, ConfigFileName)
+}
+
 // ConfigExists checks if .code-reducer.yaml exists in the specified directory.
 func ConfigExists(cwd string) bool {
-	configPath := filepath.Join(cwd, ConfigFileName)
-	_, err := os.Stat(configPath)
+	_, err := os.Stat(getConfigPath(cwd))
 	return err == nil
 }
 
 // LoadConfig reads and parses .code-reducer.yaml from the specified directory.
 func LoadConfig(cwd string) (*Config, error) {
-	configPath := filepath.Join(cwd, ConfigFileName)
-	data, err := os.ReadFile(configPath)
+	data, err := os.ReadFile(getConfigPath(cwd))
 	if err != nil {
 		return nil, err
 	}
@@ -58,12 +61,11 @@ func LoadConfig(cwd string) (*Config, error) {
 
 // SaveConfig writes the configuration to .code-reducer.yaml in the specified directory.
 func SaveConfig(cwd string, cfg *Config) error {
-	configPath := filepath.Join(cwd, ConfigFileName)
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal yaml: %w", err)
 	}
-	if err := os.WriteFile(configPath, data, 0600); err != nil {
+	if err := os.WriteFile(getConfigPath(cwd), data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 	return nil
@@ -134,13 +136,7 @@ var DefaultExtractionSteps = []ExtractionStep{
 func MergeAndDeduplicate[T comparable](a, b []T) []T {
 	seen := make(map[T]bool)
 	var result []T
-	for _, item := range a {
-		if !seen[item] {
-			seen[item] = true
-			result = append(result, item)
-		}
-	}
-	for _, item := range b {
+	for _, item := range append(a, b...) {
 		if !seen[item] {
 			seen[item] = true
 			result = append(result, item)
@@ -175,55 +171,47 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 		ExtractionSteps:  resolvedSteps,
 	}
 
-	// 1. Resolve Model ID: Flag > Env > YAML > Default
+	// 1. Resolve Model ID: Default > YAML > Env > Flag
+	resolved.ModelID = "gemma4:26b-a4b-it-qat"
+	if cfg.ModelID != "" {
+		resolved.ModelID = cfg.ModelID
+	}
+	if envVal := os.Getenv(CodeReducerModelIdEnvKey); envVal != "" {
+		resolved.ModelID = envVal
+	}
 	if modelIdFlag != "" {
 		resolved.ModelID = modelIdFlag
-	} else if envVal := os.Getenv(CodeReducerModelIdEnvKey); envVal != "" {
-		resolved.ModelID = envVal
-	} else if cfg.ModelID != "" {
-		resolved.ModelID = cfg.ModelID
-	} else {
-		resolved.ModelID = "gemma4:26b-a4b-it-qat"
 	}
 
-	// 2. Resolve Ollama Base URL: Env > YAML > Default
+	// 2. Resolve Ollama Base URL: Default > YAML > Env
+	resolved.OllamaBaseURL = OllamaDefaultBaseURL
+	if cfg.OllamaBaseURL != "" {
+		resolved.OllamaBaseURL = cfg.OllamaBaseURL
+	}
 	if envVal := os.Getenv(OllamaBaseUrlEnvKey); envVal != "" {
 		resolved.OllamaBaseURL = envVal
-	} else if cfg.OllamaBaseURL != "" {
-		resolved.OllamaBaseURL = cfg.OllamaBaseURL
-	} else {
-		resolved.OllamaBaseURL = OllamaDefaultBaseURL
 	}
 
-	// 3. Resolve Ollama Context Size: Flag > Env > YAML > Default
-	var numCtx int
+	// 3. Resolve Ollama Context Size: Default > YAML > Env > Flag
+	resolved.OllamaNumCtx = OllamaDefaultNumCtx
+	if cfg.OllamaNumCtx > 0 {
+		resolved.OllamaNumCtx = cfg.OllamaNumCtx
+	}
+	if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
+		if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
+			resolved.OllamaNumCtx = n
+		}
+	}
 	if numCtxFlag != "" {
 		if n, err := strconv.Atoi(numCtxFlag); err == nil && n > 0 {
-			numCtx = n
+			resolved.OllamaNumCtx = n
 		}
 	}
-	if numCtx == 0 {
-		if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
-			if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
-				numCtx = n
-			}
-		}
-	}
-	if numCtx == 0 {
-		if cfg.OllamaNumCtx > 0 {
-			numCtx = cfg.OllamaNumCtx
-		}
-	}
-	if numCtx == 0 {
-		numCtx = OllamaDefaultNumCtx
-	}
-	resolved.OllamaNumCtx = numCtx
 
-	// 4. Resolve DocsDir: YAML > Default
+	// 4. Resolve DocsDir: Default > YAML
+	resolved.DocsDir = "wiki"
 	if cfg.DocsDir != "" {
 		resolved.DocsDir = cfg.DocsDir
-	} else {
-		resolved.DocsDir = "wiki"
 	}
 
 	return resolved
