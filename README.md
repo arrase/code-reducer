@@ -21,7 +21,9 @@ Designed specifically for **local development and private LLMs**, Code-Reducer u
 * **Go**: Version 1.21 or higher.
 * **Ollama**: Running locally with a compatible model downloaded (e.g., `ornith:9b` or `gemma4:26b-a4b-it-qat`).
 
-### 1. Build from Source
+### 1. Build from Source (or Download Release)
+*Note: Precompiled binaries are available attached to each release.*
+
 Compile the executable binary inside the repository root:
 ```bash
 go build -o code-reducer main.go
