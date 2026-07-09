@@ -36,6 +36,10 @@ ignore:
     - .gemini
     - .code-reducer.yaml
     - .code-reducer.lock
+    - AGENTS.md
+    - README.md
+    - go.sum
+    - .gitignore
 ignore_extensions:
     - .png
     - .jpg
