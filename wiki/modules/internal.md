@@ -1,290 +1,311 @@
-# Code Reducer — Internal Architecture Reference
+# Code-Reducer Engine Architecture
 
-## Module Overview & Data Flow
+## Module Overview and Data Flow
 
-The Code Reducer application is structured around four internal subsystems that compose an end-to-end pipeline for generating and maintaining Markdown architecture documentation from code repositories. The canonical data flow proceeds: **configuration resolution** → **repository verification** → **directory tree construction** → **recursive synthesis with LLM extraction** → **standard docs generation** → **metadata persistence**. Each subsystem enforces security boundaries (path validation, process locking) and idempotent operations where applicable; side-effecting writes enforce restricted permissions (`0600`).
+The Code-Reducer engine is an automatic software-documentation generation system driven by an Ollama-compatible large language model (LLM). It operates on a repository's source code tree to produce markdown artifacts describing the project's architecture, module boundaries, business logic, state management, error handling patterns, and agent guidelines. The system runs in two modes—**init**, which generates documentation from scratch against the full discovered codebase, and **update**, which performs incremental regeneration based on detected file changes.
 
----
+Execution is initiated through `internal/engine/runner.go` (`Runner.Run`), which acquires a repository-exclusive lock via `internal/security`, instantiates an LLM client, and dispatches to either `RunInit` or `RunUpdate`. All disk I/O flows through `internal/tools`; all network calls go through the `LLMClient` in `internal/engine/client.go`; concurrency protection is provided by OS-level file locking (`O_EXCL`) managed by `security.AcquireLock`.
 
-## Subsystem: config — Configuration Resolution Pipeline
+The data flow for an update run follows this sequence: safety preflight (lockfile gitignore entry verification) → lock acquisition → LLM client construction from configuration → cache restoration from `<docsDir>/.metadata.json` → code discovery respecting `.gitignore`, configured ignore lists, and `docsDir` exclusion → change detection via SHA256 hashing of current files against cached entries → affected-directory propagation (deleted files trigger immediate cache purging; ancestor directories are marked affected) → hierarchical synthesis walking the directory tree bottom-up with per-file LLM extraction for changed files only → chunked reduction collapsing intermediate summaries into a single module-level document → root documentation regeneration (`architecture.md`, `quickstart.md`) when missing or any top-level directory was affected → cache persistence to `.metadata.json`.
 
-Centralizes all configuration sources for the application and resolves them into a single authoritative `Config` value through a deterministic merge pipeline. Sources are layered from lowest to highest priority: system defaults → YAML file → environment variables → CLI flags. All operations are idempotent where applicable; side-effecting writes enforce restricted permissions (`0600`).
-
-### Constants
-
-Environment variable keys and fallback constants governing external override behavior:
-
-| Constant | Purpose |
-|---|---|
-| `CodeReducerModelIdEnvKey` | Runtime key for overriding the LLM model identifier. |
-| `OllamaBaseUrlEnvKey` | Runtime key for overriding the Ollama server address. |
-| `OllamaNumCtxEnvKey` | Runtime key for overriding the context/token count. |
-| `LangsmithApiKeyEnvKey` | LangSmith API tracing credential key. |
-| `LangchainProjectEnvKey` | LangChain project name setting. |
-| `LangchainTracingEnvKey` | Enables/disables LangChain v2 tracing. |
-| `OllamaDefaultBaseURL` | Fallback Ollama address when no env/config override is present. |
-| `OllamaDefaultNumCtx` | Default context size of 8192 tokens applied in the absence of overrides. |
-| `ConfigFileName` | Filesystem name `.code-reducer.yaml` used to locate the project configuration file. |
-
-### Types & Defaults
-
-#### `Config`
-
-Core application configuration schema aggregating: LLM model ID, Ollama server/connection settings (base URL, context size), LangSmith/LangChain tracing flags, ignored filesystem paths and extensions, and the docs directory path. Serves as the canonical resolved state consumed downstream by the analyzer pipeline.
-
-#### Default Exclusions
-
-Package-level slices defining filesystem paths excluded from analysis:
-
-- `DefaultIgnores` — Directory name exclusions (e.g., `.git`, `node_modules`, build artifacts).
-- `DefaultIgnoredExtensions` — File extension exclusions (e.g., images, binaries, lock files).
-
-### I/O Operations
-
-#### `ConfigExists(cwd string) bool`
-
-Returns `true` when `.code-reducer.yaml` exists under the given working directory. Used as a gate for conditional config loading in the resolution pipeline.
-
-#### `LoadConfig(cwd string) (*Config, error)`
-
-Reads and parses `.code-reducer.yaml` from `cwd` into a populated `Config` struct. Returns an error on parse failure or missing file; callers must check existence via `ConfigExists` first to avoid spurious errors.
-
-#### `SaveConfig(cwd string, cfg *Config) error`
-
-Serializes the provided configuration to `.code-reducer.yaml` under `cwd`. Writes with restricted file permissions (`0600`) to prevent unintended access by other users on shared filesystems.
-
-### Merge Utility
-
-#### `MergeAndDeduplicate[T comparable](a, b []T) []T`
-
-Generic slice concatenation and deduplication preserving insertion order. Applied when merging default ignore lists with user-provided overrides; preserves first-seen ordering to avoid reordering side effects in downstream path matching logic.
-
-### Resolution Pipeline
-
-#### `ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config`
-
-Orchestrates the full configuration resolution pipeline: merges CLI flags (`modelIdFlag`, `numCtxFlag`), environment variables (via the key constants above), YAML config (loaded by `LoadConfig`), and system defaults into a single resolved `Config`. Execution order enforces priority from lowest to highest: system defaults → YAML file → environment variables → CLI flags. The returned value is authoritative; downstream components read only this struct, never individual sources.
+The init run follows an equivalent flow but skips change detection and affected-directory propagation, synthesizing all nodes from discovered code. Module summaries are persisted under `<docsDir>/modules/` keyed by a sanitized filename derived via `internal/tools/utils.ToSafeMarkdownFilename`.
 
 ---
 
-## Subsystem: engine — AI-Powered Documentation Synthesis System
+## Subsystem: config — Multi-Source Configuration Resolution
 
-Implements an end-to-end pipeline for generating and maintaining Markdown architecture documentation from code repositories using LLM inference. Performs recursive directory traversal with SHA256-based caching, incremental change detection via metadata persistence, and LLM-driven synthesis of per-node summaries aggregated into global architecture files.
+### Responsibility
 
-**Data Flow:** Configuration → `Runner` instantiation → repository discovery → `DirNode` tree construction → recursive `synthesizeNode` (LLM extraction + cache lookup) → root summary → standard docs generation → metadata serialization via `MetadataCache`.
+Centralizes all configuration state for the engine: loading, persisting, resolving, and validating a `config.Config` struct from CLI flags, environment variables, YAML files, or hardcoded defaults in a strict four-tier priority chain. Persisted state lives at `.code-reducer.yaml` in the current working directory with restricted owner-only permissions (`0600`).
 
-### LLM Client Abstraction (`client.go`)
-
-Core inference interface wrapping HTTP communication with an Ollama-compatible backend.
-
-#### `Message` Struct
+### Data Structures
 
 ```go
-type Message struct {
-    Role   string // "system", "user", "assistant"
-    Content string
+type Config struct {
+    ModelID            string   // Ollama model identifier (falls back to gemma4:26b-a4b-it-qat)
+    OllamaBaseURL      string   // Base URL for the Ollama API endpoint
+    OllamaNumCtx       int      // Context window size
+    DocsDir            string   // Path to source documentation directory
+    ExtractionSteps    []ExtractionStep  // Ordered pipeline of analysis tasks
+    Ignore             []string            // Directories to exclude from scanning
+    IgnoreExtensions   []string            // File extensions to skip
+}
+
+type ExtractionStep struct {
+    Name   string `yaml:"name"`
+    Prompt string `yaml:"prompt"`
 }
 ```
 
-Stores a single turn in the conversation payload for serialization into API requests.
+Four extraction steps are defined by default:
 
-#### `LLMClient`
+| Priority | Step | Purpose |
+|---|---|---|
+| 1 | API_SIGNATURES | Extract exported structs, interfaces, methods and their types |
+| 2 | BUSINESS_LOGIC | Analyze domain concepts and high-level algorithmic flow |
+| 3 | STATE_AND_CONCURRENCY | Identify mutable state and concurrency protections (mutexes, channels) |
+| 4 | ERRORS_AND_SIDE_EFFECTS | Document external communication (I/O) and error handling patterns |
 
-Holds configuration parameters (`modelID`, `baseURL`, `contextLength`) alongside an HTTP client used to communicate with the Ollama backend.
+The step list is overridable in the YAML file; if empty at resolve time it falls back to defaults.
 
-- **NewLLMClient** — Constructs and returns a new `LLMClient` instance initialized with provided model identifier, API endpoint, and maximum context size.
-- **CallLLM** — Sends a non-streaming request to the language model via HTTP; returns the full text response or an error upon failure.
-- **StreamLLM** — Initiates a streaming session; processes incoming chunks by calling a user-defined function for each content segment until the stream completes.
-- **GetDefaultSystemPrompt** — Returns a contextualized system prompt string based on current operation mode, supporting tasks like code extraction, module synthesis, and architecture documentation.
+### Module Constants & Defaults
 
-### Caching Layer (`cache.go`)
+Package-level read-only constants consumed exclusively by `ResolveConfig`:
 
-Persistent state management for incremental updates by storing file-level integrity hashes and global cache metadata.
+| Variable | Purpose | Reassignable? |
+|---|---|---|
+| `DefaultIgnores` | Hardcoded directories to skip (`.git`, `node_modules`, `venv`, etc.) | No — read-only after init |
+| `DefaultIgnoredExtensions` | Hardcoded file extensions to skip (`.pyc`, `.class`, etc.) | No — read-only after init |
+| `DefaultExtractionSteps` | Ordered list of default analysis tasks | No — read-only after init |
 
-#### `FileCacheEntry`
+### Functions
 
-Stores the SHA256 hash and facts string for individual files within the cache. Enables detection of content changes without re-reading source files during update cycles.
+**`ConfigExists(cwd string) bool`** — Returns `true` when `.code-reducer.yaml` exists under `cwd`. Treats any `os.Stat` error as "file does not exist" — permission denial and I/O failures are silently swallowed.
 
-#### `MetadataCache`
+**`LoadConfig(cwd string) (*Config, error)`** — Reads the persisted config from `<cwd>/.code-reducer.yaml`. Returns a nil pointer with an unwrapped `os.ReadFile` error if the file cannot be read at all. If YAML parsing fails, returns a wrapped error (`failed to parse yaml config`). On success, returns the raw parsed struct without applying overrides — callers must chain this into `ResolveConfig` for final resolution.
 
-Aggregates global cache state including: last documented commit reference, file entries (path → `FileCacheEntry` mapping), and module mappings.
+**`SaveConfig(cwd string, cfg *Config) error`** — Marshals the provided `cfg` pointer and writes it to `<cwd>/.code-reducer.yaml` with `0600` permissions via `os.WriteFile`. Marshaling errors and write errors are both wrapped with `%w`, preserving the chain for unwrapping. A nil config is not explicitly guarded; marshaling a nil will result in an empty YAML document.
 
-**Cache Operations:**
-- **loadMetadataCache** — Loads or creates an empty `MetadataCache` by reading from a `.metadata.json` file path relative to the docs directory.
-- **saveMetadataCache** — Serializes the provided `MetadataCache` into indented JSON and writes it to the specified metadata cache path.
-- **computeSHA256** — Computes the SHA256 hex digest of content read from a virtual file path relative to the repository root.
+**`MergeAndDeduplicate(a []T, b []T) []T`** (where T is comparable) — Merges two slices into one deduplicated slice using a map-based seen-set pattern. System defaults are merged first, then user-provided config additions follow — this ordering ensures user values take precedence when duplicates exist across the merge boundary. No error return; any panic from non-comparable types would be a caller-side bug.
 
-### Directory Tree Representation (`tree.go`)
-
-Encodes the discovered code structure as a navigable tree for recursive processing.
-
-#### `FileChange`
-
-A struct holding `Path` and `Status` fields representing a single file change operation ("Added", "Modified", or "Deleted"). Used during incremental update cycles to report detected differences.
-
-#### `DirNode`
-
-Tree node struct containing: directory path, list of files (with their SHA256 hashes), and child nodes keyed by subdirectory name.
-
-### Synthesis Engine (`synthesize.go`)
-
-Recursive directory traversal that synthesizes Markdown summaries for code modules. The sole function `synthesizeNode` is unexported and processes child directories and files with LLM extraction, caching results via SHA256 hashing to avoid redundant work on unchanged nodes.
-
-### JSON Response Parsing (`json_parser.go`)
-
-Strips markdown/JSON code fences from raw LLM responses before deserialization.
-
-- **StripOuterMarkdownFence** — Strips surrounding markdown or JSON code fences from input strings; returns the inner content.
-- **CleanJSONResponse** — Removes markdown code fences, then uses brace/bracket matching to extract a complete JSON object or array from remaining text.
-- **UnmarshalJSONResponse** — Cleans raw response string with `CleanJSONResponse` and deserializes it into provided target interface value.
-
-### Pipeline Orchestrator (`orchestrator.go`)
-
-Coordinates the full Map-Reduce pipeline for repository initialization and incremental updates.
-
-#### `Event` Struct
-
-Lightweight struct carrying `Type` (string) and `Message` (string), used to pass pipeline status updates back through callback interfaces.
-
-#### `GenerateStandardDocs`
-
-Exported method on `*LLMClient` that generates global architecture and quickstart Markdown files from a root summary via LLM calls; writes results safely to disk.
-
-#### `RunInit`
-
-Exported method on `*LLMClient` executing the full Map-Reduce pipeline for repository initialization:
-1. Discovers code
-2. Builds directory tree (`DirNode`)
-3. Synthesizes root summary through hierarchical merging
-4. Regenerates standard docs
-5. Updates AGENTS.md with AI agent guidelines
-
-#### `RunUpdate`
-
-Exported method on `*LLMClient` for incremental operation:
-1. Detects file changes (added/modified/deleted) by SHA256 comparison against metadata cache
-2. Determines affected directories via tree traversal
-3. Re-synthesizes summaries only where needed
-4. Conditionally regenerates architecture or quickstart docs
-
-### Configuration and Runner (`runner.go`)
-
-#### `NewRunner`
-
-Factory constructor that instantiates and returns a new `*Runner` with provided configuration pointer. Serves as the entry point for initializing the documentation generation system.
+**`ResolveConfig(repoRoot, modelIdFlag string, numCtxFlag string) *Config`** — Orchestrates the full resolution pipeline: (1) calls `LoadConfig` to read persisted state (errors swallowed — falls back to empty struct); (2) applies CLI flag overrides in order: `modelIdFlag` → `OllamaBaseURL`, then `numCtxFlag` → `OllamaNumCtx`; (3) merges default ignore lists (`DefaultIgnores`, `DefaultIgnoredExtensions`) with user-provided values via `MergeAndDeduplicate`; (4) falls back to hardcoded defaults for extraction steps if the slice is empty; (5) returns a pointer to the final resolved config; no error return — any failure path results in an empty `&Config{}`.
 
 ---
 
-## Subsystem: security — Filesystem Isolation & Process Synchronization
+## Subsystem: security — Path-Boundary Enforcement and Mutual Exclusion
 
-Enforces filesystem isolation and process synchronization primitives for repository-level operations. Centralizes path validation against an absolute root boundary, manages concurrent access via atomic file-based locking (PID-pinned), and maintains version control hygiene by integrating lock artifacts into `.gitignore`. All state transitions revolve around the `repoRoot` absolute path as a constant security boundary.
+### Responsibility
 
-### Path Validation & Traversal Protection
+Implements three infrastructure contracts for the Code-Reducer agent: path-boundary enforcement against directory-traversal attacks, process mutual exclusion via file locking, and lockfile version-control exclusion through `.gitignore` management. No synchronization primitives (`sync.Mutex`, channels, atomics) are used; concurrency safety is delegated to the OS-level `O_EXCL` semantics on lock acquisition.
 
-#### `SafeResolve(repoRoot, inputPath string) (string, error)`
+### Domain Concepts and Business Rules
 
-Resolves an arbitrary user-supplied `inputPath` against the canonical absolute `repoRoot`. Performs cleanup of the input string to neutralize relative references (`..`, single-dot), then resolves the resulting path against the repository root. Returns a fully qualified absolute path if the resolved target remains within the `repoRoot` boundary; otherwise, returns an error to signal a traversal attempt or invalidation.
+1. **Path-boundary enforcement** — `SafeResolve` requires any user-supplied path to resolve strictly inside the repository root. If a resolved absolute path escapes the root (detected via the `..` prefix check), the operation fails with an explicit violation error. This is a defense-in-depth rule against directory-traversal attacks.
 
-**Data Flow:**
-1. **Input:** `inputPath` (untrusted string) + `repoRoot` (absolute, trusted constant).
-2. **Sanitization:** `inputPath` is normalized to eliminate relative components and redundant separators.
-3. **Resolution:** OS-level path resolution joins the sanitized input with `repoRoot`.
-4. **Boundary Check:** The resolved string is compared against the prefix of `repoRoot`.
-5. **Output:** Validated absolute path or error indicating traversal/invalidation failure.
+2. **Process mutual exclusion** — The lock mechanism ensures only one Code-Reducer instance operates on a given repository at a time. Acquisition requires creating the lockfile atomically (via `O_EXCL`); if it already exists, acquisition fails with a "lock held" error. Release closes the file and removes the lockfile.
 
-### File-Based Process Locking
+3. **Lockfile version-control exclusion** — The rule that `.code-reducer.lock` must appear in `.gitignore`. If the ignore file doesn't exist or lacks this entry, one is created/updated so the lockfile is not tracked by git.
 
-#### `SimpleLock` Struct
+### Data Structures
 
-Encapsulates the state required to manage a single process-level lock:
-- **LockFilePath** — Absolute filesystem location of the lockfile (typically `<repoRoot>/.code-reducer.lock`).
-- **FileHandle** — OS file descriptor representing an acquired exclusive hold on the lockfile.
+```go
+type SimpleLock struct {
+    lockPath string // Absolute path to the lock file. Set in AcquireLock; read in Unlock.
+    file     *os.File // File handle opened during acquisition. After Unlock() the underlying file is closed and removed from disk but the field is never nilled out.
+}
+```
 
-#### `AcquireLock(repoRoot string) (*SimpleLock, error)`
+**`SimpleLock.Unlock() error`** — Closes the lock file and removes it from disk. Returns an error if either step fails; individual errors are captured into local vars (`err1`, `err2`) and only one is ever returned (the second operation's error may be silently discarded in favor of the first).
 
-Establishes a new process-level lock using atomic file semantics:
-1. Opens `<repoRoot>/.code-reducer.lock` with `O_EXCL` (exclusive creation).
-2. Writes the current process PID (`os.Getpid()`) to the newly created file handle.
-3. Returns a pointer to the resulting `SimpleLock`, holding the open file handle for subsequent lifecycle management.
+### Public Functions
 
-#### `Unlock() error`
+**`SafeResolve(repoRoot, inputPath string) (string, error)`** — Resolves and validates an input path against a repository root. Returns the cleaned absolute path or an error on traversal detection. Uses pure path manipulation: `filepath.Abs`, `filepath.Clean`, `filepath.Rel`. No actual disk read/write occurs during this call. The security check is performed via prefix inspection of the relative path after resolution.
 
-Releases the acquired lock:
-1. Flushes and closes the underlying OS file handle associated with the `SimpleLock`.
-2. Removes the lockfile from disk via filesystem delete operation.
-3. Returns an error if removal fails (e.g., permission denied, path not found).
+**`AcquireLock(repoRoot string) (*SimpleLock, error)`** — Acquires a simple file lock in the repo root. Requires creating the lockfile atomically (via `O_CREATE|O_EXCL`); if it already exists, acquisition fails with a "lock held" sentinel message. On success writes PID (newline-terminated). If PID write subsequently fails, `f.Close()` and `os.Remove(lockPath)` are called explicitly — this cleans up the partially-created lockfile so another process can retry.
 
-### Repository Configuration Maintenance
+**`EnsureGitignoreHasLockfile(repoRoot string) error`** — Ensures `.code-reducer.lock` is present in `.gitignore`. If the ignore file doesn't exist, one is created with a single line. Otherwise: scans for existing entry; if not found, appends a commented block plus the lockfile name. Opens `.gitignore` for appending with `O_APPEND|O_WRONLY`; if append fails, returns a wrapped error. No partial state change occurs beyond the open handle (deferred close); no explicit cleanup of any partial content is performed on write failure after opening.
 
-#### `EnsureGitignoreHasLockfile(repoRoot string) error`
+### Error Handling Patterns
 
-Ensures the repository's `.gitignore` file tracks the lock artifact to prevent accidental version control inclusion:
-1. Locates `<repoRoot>/.gitignore`.
-2. Checks for existing content containing the entry `.code-reducer.lock`.
-3. If absent, appends the entry to the file (creating it if nonexistent).
+1. **Wrap pattern (`fmt.Errorf %w`)** — Used in every failure path:
+   - `SafeResolve`: wraps `filepath.Abs` error as `"failed to get absolute root path"`; wraps traversal detection as a hardcoded sentinel message.
+   - `AcquireLock`: wraps the raw `os.OpenFile` error when it's not `IsExist`.
+   - `EnsureGitignoreHasLockfile`: wraps stat/read/write errors individually.
+
+2. **Sentinel / Hardcoded messages** — Not wrapped with `%w`, returned as-is:
+   - `"security violation: path traversal detected"` — in `SafeResolve` when relative path starts with `..`.
+   - `"lock at %s is already held by another process..."` — when `os.IsExist(err)` on OpenFile. Domain-specific sentinel for lock contention.
+
+3. **Error swallowing** — `Unlock()` captures each step's error into local vars (`err1`, `err2`) and returns whichever is non-nil (or nil if both succeed). The second operation's error may be silently discarded in favor of the first, or vice versa — only one error is ever returned.
+
+4. **No panic recovery** — None of these functions recover from panics. Any unexpected panic propagates to the caller with an empty stack trace in `runtime` (Go's default).
 
 ---
 
-## Subsystem: tools — Repository Verification & Safe File I/O
+## Subsystem: tools — Repository Traversal, Safe File I/O, and Git Utilities
 
-Provides foundational utilities for interacting with git repositories and handling filesystem operations with security-focused semantics. All functions operate within a verified repository context established by `VerifyGitRepo`.
+### Responsibility
 
-### 1. Repository Verification & Git Operations (`git_tools.go`)
+Provides three independent capability groups: **repository code discovery**, **safe file read/write operations** with TOCTOU race mitigation, **gitignore-aware filtering**, and **Git subprocess execution**. All functions are standalone (no methods on types); no exported structs or interfaces exist. No goroutines, channels, or sync primitives are used anywhere in the package—every call is synchronous and single-threaded.
 
-#### `VerifyGitRepo(repoPath string) error`
+### Repository Code Discovery
 
-Validates that:
-- The `git` binary is present on the system PATH.
-- The specified directory is a recognized git working tree by executing `rev-parse --is-inside-work-tree`.
+**`DiscoverCodeFiles(repoRoot string) ([]string, error)`** — Walks `repoRoot` recursively via `filepath.WalkDir`, skipping directories matching `.gitignore` patterns (compiled by `LoadGitignore`) or any dot-prefixed component (`.build`, `.svn`, etc.), then filters each leaf through `ShouldIgnoreFile`. Valid source paths are accumulated into a slice and returned. Walk callback errors from `filepath.WalkDir` are swallowed—individual directory entries that fail to stat return `nil` to the caller, making it impossible to distinguish an intentional skip from a walk failure downstream.
 
-Returns an error if either precondition fails. Callers should invoke this before any repository-aware operation.
+### Safe File Read / Write Operations
 
-#### `RunGit(repoPath string, args ...string) (string, error)`
+**`ReadFileSafely(repoRoot, virtualPath) ([]byte, error)`** — Resolves `virtualPath` through `security.SafeResolve` (path-traversal guard), then reads the resulting absolute path via `os.ReadFile`. Errors from both `SafeResolve` and `os.ReadFile` are wrapped with prefix `"failed to read file:"` using `%w`.
 
-Executes arbitrary git commands scoped to the verified working tree:
-- Captures stdout and trims trailing whitespace.
-- Propagates non-zero exit codes as errors.
+**`WriteFileSafely(repoRoot, virtualPath, content []byte) error`** — Performs TOCTOU-safe writes:
+1. Resolve the safe absolute path via `security.SafeResolve`.
+2. Call `os.MkdirAll(dir, 0755)` to create parent directories if missing; wraps with `"failed to create directory"`.
+3. Open for write+create (`O_WRONLY|O_CREATE`, mode `0644`); wraps open failure with `"failed to open file for writing"`.
+4. Call `os.Lstat(safePath)` (no symlink follow) and `f.Stat()`; compare via `os.SameFile(fiLstat, fiFstat)`. If they differ—indicating a symlink swap or race condition—return an error prefixed `"security violation"` or `"TOCTOU symlink race detected"`.
+5. Truncate (`f.Truncate(0)`), then write content; wrap each with `"failed to truncate file:"` / `"failed to write file content:"`.
 
-Used for lightweight queries such as resolving relative paths, checking branch state, or retrieving repository metadata without requiring manual shell invocation by callers.
+### Gitignore Handling and Binary Classification
 
-### 2. Safe File I/O Operations (`file_tools.go`)
+**`LoadGitignore(repoRoot) ([]string, error)`** — Reads `.gitignore` from `repoRoot`, scanner processes line-by-line. Empty file returns `nil, nil`; non-existence (`os.IsNotExist`) also returns `nil, nil`. All other errors are wrapped. Patterns returned are active non-comment entries.
 
-#### `ReadFileSafely(repoPath string) ([]byte, error)`
+**`ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ignoredExtensions []string) bool`** — Applies layered ignore rules:
+- Compiles user-supplied patterns via the external `github.com/sabhiram/go-gitignore` package (`*ignore.GitIgnore`).
+- Rejects paths with dot-prefixed components or `.egg-info` suffixes (build artifacts).
+- Checks file extension against a provided blacklist.
+- For unknown extensions, reads the first 1024 bytes and scans for null bytes via `IsBinaryFile`. If null bytes are present, returns `true` (binary → ignore).
 
-Resolves a virtual repository-relative path to its absolute filesystem location and returns raw byte content. Performs an error-checked open/read/close cycle; returns the complete file payload or an error if the operation cannot be completed within expected bounds.
+**`IsBinaryFile(path string) bool`** — Opens the path; if `os.Open` fails, returns `false` (treats unreadable as non-binary). Reads up to 1024 bytes. Only wraps `io.EOF` (expected EOF) without error—other read errors return `false`. No error wrapping for open or other read failures beyond EOF handling.
 
-#### `WriteFileSafely(repoPath string, content []byte) error`
+### Git Subprocess Execution
 
-Writes arbitrary content to a resolved repository path with three safety measures:
-- **Directory creation**: Parent directories are created if absent (with appropriate mode preservation).
-- **Symlink detection**: Existing symlinks at the target path are detected and rejected to prevent silent redirect attacks.
-- **TOCTOU-safe truncation**: The file is opened in exclusive-truncate mode (`O_RDWR | O_CREATE | O_TRUNC`) to eliminate race conditions between read and write phases.
+**`RunGit(repoRoot string, args ...string) (stdout string, err error)`** — Constructs an `exec.Command` for `git`, prepends `--no-pager` to user-supplied arguments, sets `cmd.Dir = repoRoot`. Captures stdout into a `bytes.Buffer`, reads it back, trims whitespace. On success returns trimmed output; on failure wraps the original error with stderr text: `"git command failed: %v, stderr: %s"`.
 
-#### `IsBinaryFile(path string) bool`
+**`VerifyGitRepo(repoRoot string) error`** — Two-stage validation:
+1. Calls `exec.LookPath("git")`; if unavailable, returns a fresh error without wrapping—no reference to any prior failure since none exists at that point.
+2. Otherwise delegates to `RunGit(repoRoot, "rev-parse", "--is-inside-work-tree")`. If the inner call fails, discards its returned error entirely and returns a new message: `"not a git repository (or any of the parent directories)"`.
 
-Scans the first 1024 bytes of a file for null byte (`\x00`) presence. Returns `true` if binary content is detected within that boundary. Used as a quick heuristic filter during code discovery to exclude non-source artifacts (images, compiled binaries, etc.) without loading entire files into memory.
+### Error Handling Summary
 
-### 3. Code Discovery & Filtering Pipeline (`file_tools.go`)
+| Function | Failure Mode | Strategy |
+|---|---|---|
+| `ReadFileSafely` | Resolve or read failure | Wrap with `"failed to read file:"`, `%w` |
+| `WriteFileSafely` | Directory open, file open, lstat/stat mismatch, truncate, write | Contextual prefix per step; symlink race → `"security violation"` / `"TOCTOU symlink race detected"` |
+| `LoadGitignore` | Non-existence or read error | `nil, nil` on missing/empty; wrap everything else |
+| `DiscoverCodeFiles` | Walk entry failure | Swallowed—caller sees no signal |
+| `IsBinaryFile` | Open failure or non-EOF read error | Returns `false`; EOF is expected and ignored |
+| `RunGit` | Non-zero exit / exec error | Wrap original + stderr text with `%v`, `%s` |
+| `VerifyGitRepo` | Missing git binary | Fresh error, no wrapping |
+| `VerifyGitRepo` | Git query failure | Discard inner error; return fresh message only |
 
-#### `LoadGitignore(repoRoot string) ([]string, error)`
+---
 
-Reads `.gitignore` from the given repository root, strips comment lines (`#`) and blank lines, and returns the active pattern set. Returns `nil` if the file does not exist or cannot be parsed. Patterns are returned as-is for downstream evaluation; callers should match them against relative paths using standard gitignore matching semantics.
+## Subsystem: engine — Documentation Generation Pipeline
 
-#### `ShouldIgnoreFile(relPath string) bool`
+### Responsibility
 
-Determines whether a given relative path matches any exclusion rule by evaluating:
-- Active `.gitignore` patterns from `LoadGitignore`.
-- Dot-prefixed directory components (e.g., `.build`, `.cache`).
-- Known binary file extensions (detected via `IsBinaryFile` or extension whitelist).
-- Null-byte presence in the path string.
+Implements an automatic software-documentation generation pipeline that uses a large language model (Ollama-compatible API) to analyze repository structure and produce markdown artifacts. The system operates in two modes—**init**, which generates fresh documentation from scratch, and **update**, which performs incremental regeneration based on detected code changes.
 
-Returns `true` if any exclusion rule matches, indicating the file should be skipped during discovery.
+### LLM Client (`client.go`)
 
-#### `DiscoverCodeFiles(repoRoot string) ([]string, error)`
+Provides synchronous and streaming communication with an Ollama-compatible LLM API. The client is immutable after construction; all fields are assigned only in `NewLLMClient`. Both modes share a base system prompt that establishes agent identity and operating rules.
 
-Recursively walks the codebase rooted at `repoRoot`, collecting source files while skipping:
-- Build directories (e.g., `node_modules`, `.git`, `target`).
-- Paths matching any active `.gitignore` pattern from `LoadGitignore`.
-- Files flagged as binary by `IsBinaryFile`.
+**`CallLLM(messages []Message) (*Response, error)`** — Builds a JSON request body combining the configured model ID, user-supplied messages, and a leading system prompt message. The request is POSTed to `<BaseURL>/api/chat` with `"Content-Type: application/json"`. On success (200), the full response body is read into memory and parsed once; on non-200 status, up to 1024 bytes of the error body are captured for reporting. The HTTP client has a 10-minute timeout applied globally.
 
-Returns a sorted slice of relative path strings representing the discovered codebase. The walk order is deterministic; results are suitable for direct consumption by analysis or transformation pipelines.
+**`StreamLLM(messages []Message, onChunk func(string)) error`** — Performs an identical outbound POST but with streaming enabled. Each line from the response is read via `bufio.NewReader`, trimmed, and parsed as JSON. Non-empty content segments invoke the caller-supplied `onChunk` callback immediately. The loop exits on EOF or when a chunk's `Done` flag is true. Invalid JSON lines inside the stream are silently skipped—no error returned to the caller unless the reader itself fails.
+
+**`GetBaseSystemPrompt() string`** — Returns static base prompt text.
+
+**`GetDefaultSystemPrompt(command) string`** — Switches on `command`: `"module_synthesis"` returns a composition for per-module documentation; `"architecture"` returns a composition for global architecture documents.
+
+### Response Parsing (`json_parser.go`)
+
+Normalizes raw LLM output into parseable JSON before downstream consumption. The parser tolerates markdown code fences (with or without language tags) and handles bracket/brace mismatches within embedded text by walking character-by-character while respecting string boundaries.
+
+**`StripOuterMarkdownFence(input string) string`** — Trims whitespace at entry, then applies a compiled regex to match content between ```` ``` ` (with optional `markdown`/`json` tag) and captures the inner text. No match returns input unchanged.
+
+**`CleanJSONResponse(input string) (string, error)`** — Scans for the first `{` or `[`. Walks forward tracking an `inString` flag to skip escaped characters inside quoted strings. Pushes opening delimiters onto a stack; pops on matching close. Returns the substring from start index up to and including the closing character once the stack drains. If neither delimiter is found, input passes through unchanged.
+
+**`UnmarshalJSONResponse(input string) (interface{}, error)`** — The cleaned string is passed directly to `encoding/json.Unmarshal`. Errors are wrapped with context: `failed to unmarshal JSON (cleaned: %q): <original>`.
+
+### Chunk Reduction (`chunking.go`)
+
+Implements a recursive chunk-reduction algorithm that processes collections of code/architecture items through an LLM-based synthesis pipeline and produces a single consolidated output. Items are grouped into batches bounded by `maxChunkChars` (3× the LLM context window), then each batch is synthesized independently, and intermediate results are concatenated and reduced again until one item remains—a tree-like reduction pattern.
+
+**`ReduceInChunks(items []string) (string, error)`** — Algorithmic flow:
+1. **Empty input** — Returns `("", nil)` immediately.
+2. **Single-item truncation** — When exactly one item exceeds the context window, it is mutated in-place to `<items[0][:maxChunkChars]>\n...[truncated]>`. No error is returned; processing continues.
+3. **Batching phase** — Items are greedily grouped into batches where each batch's combined length stays within `maxChunkChars`. Overflow starts a new batch.
+4. **Fallback truncation** — If every item exceeds limits individually, each item is proportionally truncated and forced into a single batch. This prevents deadlock on unbatchable inputs.
+5. **Single-batch terminal** — When exactly one batch exists after grouping, the entire set is sent directly to `CallLLM` for synthesis; the result is stripped of markdown fences before return.
+6. **Multi-batch recursion** — Each batch is recursively reduced via `ReduceInChunks`. Intermediate results are concatenated into a single list, which then triggers another recursive call until reaching the base case where all items fit in one context window.
+
+Error handling: Recursive-call errors and LLM synthesis errors propagate directly. Synthesis errors are wrapped with `"LLM error during synthesis: %w"`. Truncation is a silent side effect, not an error path—no warning logged unless it's the only item (in which case `logEvent` is invoked).
+
+### Hierarchical Synthesis (`synthesize.go`)
+
+Recursively walks a directory tree (`DirNode`), producing synthesized textual summaries for each node. Each directory's summary is built from child summaries plus per-file facts extracted by LLM calls. Unchanged files reuse cached SHA256 hashes and previously extracted facts; changed or new files trigger fresh extraction via configurable `ExtractionSteps`.
+
+**`SynthesizeNode(node *DirNode, cache MetadataCache) (string, error)`** — Algorithmic flow:
+1. **Context check** — Aborts early if context is cancelled.
+2. **Cache hit short-circuit** — If node is not affected (`affectedDirs` map) and a cached summary exists, returns immediately without LLM calls.
+3. **Recursive child synthesis** — Children are sorted; each is synthesized in order. Non-empty summaries accumulate into `childSummaries`.
+4. **File fact extraction loop** — For each file: compute SHA256 via `computeSHA256`; decide cache hit vs. LLM-driven extraction; accumulate facts. Read errors on individual files are swallowed (`continue`).
+5. **Component assembly** — File components followed by child subsystem summaries form an ordered slice.
+6. **Chunked reduction** — All assembled components feed `ReduceInChunks` to produce the directory's final summary.
+7. **Cache update & persist** — The result is stored in both `MetadataCache.Files[f]` (with new hash and facts) and `MetadataCache.Modules[node.Path]`. Module docs are written under `<docsDir>/modules/<safe-filename>.md` via `tools.WriteFileSafely`; write errors are wrapped.
+
+Error propagation: LLM call failure during extraction is fatal for the node: wrapped as `"LLM error extracting %s for %s: %w"` and stops all further processing. No partial results returned. SHA256 computation or file read failures on individual files are swallowed; other files still contribute components. The result may be incomplete but not an error.
+
+### Directory Tree (`tree.go`)
+
+Defines the in-memory `DirNode` hierarchy and implements affected-directory propagation logic that distinguishes between directories containing changed files and unaffected ones, enabling incremental synthesis without re-analyzing unchanged subtrees.
+
+**`FileChange`** — `Path string`, `Status string` (`"Added" | "Modified" | "Deleted"`). Input primitive for tracking changes across the repository.
+
+**`DirNode`** — `Path string`, `Files []string`, `Children map[string]*DirNode`. Each node holds its own file list and a map of child subdirectories keyed by name.
+
+**Affected-Directory Propagation**:
+1. Individual directories are flagged as affected if any direct file appears in the change set, or if no cached module entry exists for the path, or if `modules/<safe-filename>.md` does not exist at the expected location under `docsDir/modules`.
+2. Once individual nodes are flagged, ancestors are recursively marked affected by walking upward—ensuring parent summaries reflect changes even when they themselves contain no direct file modifications.
+
+Error handling: `SafeResolve` errors in `determineAffected` are caught and ignored; the entire block is skipped silently. `os.Stat(absModulePath)` errors: only `os.IsNotExist(err)` triggers the affected flag; other Stat errors (permission denied, etc.) are treated as non-existence and silently ignored.
+
+### Orchestrator (`orchestrator.go`)
+
+Implements the automatic documentation generation pipeline for software repositories. Coordinates code discovery, tree building, hierarchical synthesis, metadata cache operations, standard doc regeneration, AGENTS.md maintenance, and module cleanup. Emits typed `Event` objects (type + message) so callers can observe pipeline progress without parsing log output.
+
+**`Event`** — `Type string`, `Message string`. Typed event used for cross-cutting logging.
+
+**RunInit Flow**:
+1. Load `.gitignore`, apply configured ignore lists, scan repository for source-code files.
+2. Convert flat file list into a hierarchical `DirNode` tree rooted at the repo root via `buildTree`.
+3. Walk the tree bottom-up; each node is summarized by LLM invocation. The root node's summary becomes `rootSum`.
+4. Invoke LLM to write `architecture.md` and `quickstart.md`, passing `rootSum` as context. Errors are wrapped with `"failed to generate ...: %w"`.
+5. Append or create an "AI Agent Guidelines" section in `AGENTS.md`; if file exists and already contains the marker, skip. Write errors are swallowed.
+6. Persist cache via `saveMetadataCache` with a `"local"` commit marker.
+
+**RunUpdate Flow**:
+1. Re-discover code files using identical filtering logic.
+2. Detect changes via SHA256 comparison against cached hashes in `MetadataCache.Files`. Differences classify into `"Added"`, `"Modified"`, or `"Deleted"`.
+3. For every changed file, walk upward from its parent to the root directory, marking each ancestor as affected. Deleted files are removed from cache immediately; modules whose directories are no longer active are purged via `os.Remove` (errors ignored).
+4. Rebuild tree and prune cache so it reflects only currently existing code.
+5. Propagate affect markers through the tree via `propagateAffected`. If no directories are affected, short-circuit with a "no modifications" message; return without further LLM calls.
+6. Synthesize only affected nodes via `SynthesizeNode`, skipping unaffected subtrees entirely—reusing cached summaries for them.
+7. Regenerate `architecture.md`/`quickstart.md` if they are missing or any top-level directory was affected; otherwise reuse existing files.
+8. Persist updated cache with `"local"` commit marker.
+
+Cross-cutting rules: **Gitignore stacking** — `.gitignore`, configured ignore lists, and the `docsDir` itself are all applied together when discovering code files. **Safe file resolution** — All paths resolved through `security.SafeResolve` before any filesystem operation. **Atomic writes** — Documentation written via `tools.WriteFileSafely`. **Module cleanup** — Modules whose directories no longer appear in the active set are removed from disk; removal errors are ignored (`_ = os.Remove`).
+
+### Runner (`runner.go`)
+
+Acts as the orchestrator for code analysis or documentation pipelines. Manages lifecycle execution from initialization through completion, handling state transitions based on a provided mode string. Ensures repository integrity by verifying that the lockfile is excluded from version control before executing pipeline logic.
+
+**`Runner`** — Internal field `cfg *config.Config`. No exported fields; construction and configuration are external to this file's scope.
+
+**`NewRunner(cfg *config.Config) *Runner`** — Factory for creating a new runner instance.
+
+**`Run(ctx context.Context, repoRoot string, mode string, onEvent func(Event)) error`** — Main entry point. Acquires an exclusive lock on the repository; if acquisition fails, returns immediately with wrapped error. A deferred unlock releases the lock unconditionally regardless of how the function exits.
+
+Mode dispatch:
+- `"init"` → calls `client.RunInit(ctx, repoRoot, r.cfg, onEvent)`
+- `"update"` → calls `client.RunUpdate(ctx, repoRoot, r.cfg, onEvent)`
+- Any other value → returns `fmt.Errorf("unsupported mode: %s", mode)` as a fatal error.
+
+Error handling summary:
+
+| Step | Behavior on Failure |
+|---|---|
+| `EnsureGitignoreHasLockfile` | Swallowed; logged as warning via `onEvent`. Execution continues. |
+| `AcquireLock` | Fatal, wrapped: `"failed to acquire repository lock: %w"`. Caller sees original error wrapped. |
+| `client.RunInit` / `RunUpdate` | Propagated raw without wrapping. Deferred lock cleanup still runs. |
+| Unsupported mode | Fatal, wrapped: `"unsupported mode: %s"`. |
+
+### Utilities (`utils.go`)
+
+Maps internal identifiers (module paths) onto safe, human-readable filenames for markdown output. Operates at the boundary between the engine and the documentation generation system.
+
+**`ToSafeMarkdownFilename(modulePath string) string`**:
+1. All filesystem separator characters are replaced with underscores (`_`). This normalizes platform-specific path separators into a single ASCII character.
+2. If the resulting string is empty or equals `"."`, it is replaced with the literal string `"root"`.
+3. A `.md` suffix is appended, signaling that the output is a markdown document file.
+
+The mapping is deterministic and pure—same input always yields the same filename. No error return for invalid inputs. All transformations are best-effort with silent normalization.

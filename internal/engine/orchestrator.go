@@ -93,7 +93,7 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 	}
 	markAllAffected(tree)
 
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, docsDir, cache, affectedDirs, func(m, t string) { logEvent(m, t) })
+	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, func(m, t string) { logEvent(m, t) })
 	if err != nil {
 		return err
 	}
@@ -266,7 +266,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 
 	logEvent("status", fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, docsDir, cache, affectedDirs, func(m, t string) { logEvent(m, t) })
+	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, func(m, t string) { logEvent(m, t) })
 	if err != nil {
 		return err
 	}

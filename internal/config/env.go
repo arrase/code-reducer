@@ -13,26 +13,26 @@ const (
 	CodeReducerModelIdEnvKey = "CODE_REDUCER_MODEL_ID"
 	OllamaBaseUrlEnvKey      = "OLLAMA_BASE_URL"
 	OllamaNumCtxEnvKey       = "OLLAMA_NUM_CTX"
-	LangsmithApiKeyEnvKey    = "LANGSMITH_API_KEY"
-	LangchainProjectEnvKey   = "LANGCHAIN_PROJECT"
-	LangchainTracingEnvKey   = "LANGCHAIN_TRACING_V2"
 
 	OllamaDefaultBaseURL = "http://localhost:11434"
 	OllamaDefaultNumCtx  = 8192
 	ConfigFileName       = ".code-reducer.yaml"
 )
 
+type ExtractionStep struct {
+	Name   string `yaml:"name"`
+	Prompt string `yaml:"prompt"`
+}
+
 // Config represents the schema of .code-reducer.yaml
 type Config struct {
-	ModelID            string   `yaml:"model_id"`
-	OllamaBaseURL      string   `yaml:"ollama_base_url"`
-	OllamaNumCtx       int      `yaml:"ollama_num_ctx"`
-	LangsmithAPIKey    string   `yaml:"langsmith_api_key,omitempty"`
-	LangchainProject   string   `yaml:"langchain_project,omitempty"`
-	LangchainTracingV2 string   `yaml:"langchain_tracing_v2,omitempty"`
-	Ignore             []string `yaml:"ignore"`
-	IgnoreExtensions   []string `yaml:"ignore_extensions"`
-	DocsDir            string   `yaml:"docs_dir"`
+	ModelID          string           `yaml:"model_id"`
+	OllamaBaseURL    string           `yaml:"ollama_base_url"`
+	OllamaNumCtx     int              `yaml:"ollama_num_ctx"`
+	DocsDir          string           `yaml:"docs_dir"`
+	ExtractionSteps  []ExtractionStep `yaml:"extraction_steps"`
+	Ignore           []string         `yaml:"ignore"`
+	IgnoreExtensions []string         `yaml:"ignore_extensions"`
 }
 
 // ConfigExists checks if .code-reducer.yaml exists in the specified directory.
@@ -111,6 +111,25 @@ var DefaultIgnoredExtensions = []string{
 	"pnpm-lock.yaml",
 }
 
+var DefaultExtractionSteps = []ExtractionStep{
+	{
+		Name:   "API_SIGNATURES",
+		Prompt: "Task: Extract the public surface area of the file.\nOutput: A strict Markdown list of all exported structs, interfaces, and methods. For each, note the actual input and output types. Ignore internal logic.",
+	},
+	{
+		Name:   "BUSINESS_LOGIC",
+		Prompt: "Task: Analyze the business logic and domain concepts.\nOutput: Explain what business rules or domain concepts this file solves. Describe the high-level algorithmic flow. Ignore implementation details.",
+	},
+	{
+		Name:   "STATE_AND_CONCURRENCY",
+		Prompt: "Task: Analyze state mutation and concurrency.\nOutput: List all mutable state (global variables, changing struct fields) and what concurrency mechanisms (e.g., sync.Mutex, channels) protect them. If none, state 'No mutable state'.",
+	},
+	{
+		Name:   "ERRORS_AND_SIDE_EFFECTS",
+		Prompt: "Task: Analyze side effects and error handling.\nOutput: Detail how this code communicates with the outside world (I/O like network, disk, DB) and how it handles/returns errors (wrap, sentinel, panic).",
+	},
+}
+
 // MergeAndDeduplicate merges two slices and removes duplicates.
 func MergeAndDeduplicate[T comparable](a, b []T) []T {
 	seen := make(map[T]bool)
@@ -132,7 +151,6 @@ func MergeAndDeduplicate[T comparable](a, b []T) []T {
 
 // ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
 // It returns a fully resolved Config struct ready to be used by the pipeline runner and LLM client.
-// It also sets required external environment variables (such as Langchain/Langsmith tracing variables).
 func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 	cfg, err := LoadConfig(repoRoot)
 	if err != nil {
@@ -145,9 +163,16 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 	// Deduplicate extensions: start with default extensions, then add user config extensions
 	resolvedExtensions := MergeAndDeduplicate(DefaultIgnoredExtensions, cfg.IgnoreExtensions)
 
+	// Extraction steps
+	resolvedSteps := cfg.ExtractionSteps
+	if len(resolvedSteps) == 0 {
+		resolvedSteps = DefaultExtractionSteps
+	}
+
 	resolved := &Config{
 		Ignore:           resolvedIgnore,
 		IgnoreExtensions: resolvedExtensions,
+		ExtractionSteps:  resolvedSteps,
 	}
 
 	// 1. Resolve Model ID: Flag > Env > YAML > Default
@@ -194,26 +219,7 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 	}
 	resolved.OllamaNumCtx = numCtx
 
-	// 4. Resolve Langsmith API Key, Langchain Project, and Langchain Tracing V2
-	if envVal := os.Getenv(LangsmithApiKeyEnvKey); envVal != "" {
-		resolved.LangsmithAPIKey = envVal
-	} else {
-		resolved.LangsmithAPIKey = cfg.LangsmithAPIKey
-	}
-
-	if envVal := os.Getenv(LangchainProjectEnvKey); envVal != "" {
-		resolved.LangchainProject = envVal
-	} else {
-		resolved.LangchainProject = cfg.LangchainProject
-	}
-
-	if envVal := os.Getenv(LangchainTracingEnvKey); envVal != "" {
-		resolved.LangchainTracingV2 = envVal
-	} else {
-		resolved.LangchainTracingV2 = cfg.LangchainTracingV2
-	}
-
-	// 5. Resolve DocsDir: YAML > Default
+	// 4. Resolve DocsDir: YAML > Default
 	if cfg.DocsDir != "" {
 		resolved.DocsDir = cfg.DocsDir
 	} else {

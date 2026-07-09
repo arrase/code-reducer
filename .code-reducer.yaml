@@ -1,8 +1,25 @@
 model_id: ornith:9b
 ollama_base_url: http://localhost:11434
-ollama_num_ctx: 15000
+ollama_num_ctx: 20000
+docs_dir: wiki
+extraction_steps:
+    - name: API_SIGNATURES
+      prompt: |-
+        Task: Extract the public surface area of the file.
+        Output: A strict Markdown list of all exported structs, interfaces, and methods. For each, note the actual input and output types. Ignore internal logic.
+    - name: BUSINESS_LOGIC
+      prompt: |-
+        Task: Analyze the business logic and domain concepts.
+        Output: Explain what business rules or domain concepts this file solves. Describe the high-level algorithmic flow. Ignore implementation details.
+    - name: STATE_AND_CONCURRENCY
+      prompt: |-
+        Task: Analyze state mutation and concurrency.
+        Output: List all mutable state (global variables, changing struct fields) and what concurrency mechanisms (e.g., sync.Mutex, channels) protect them. If none, state 'No mutable state'.
+    - name: ERRORS_AND_SIDE_EFFECTS
+      prompt: |-
+        Task: Analyze side effects and error handling.
+        Output: Detail how this code communicates with the outside world (I/O like network, disk, DB) and how it handles/returns errors (wrap, sentinel, panic).
 ignore:
-    - .github
     - .git
     - node_modules
     - bower_components
@@ -19,10 +36,6 @@ ignore:
     - .gemini
     - .code-reducer.yaml
     - .code-reducer.lock
-    - .gitignore
-    - README.md
-    - go.sum
-    - AGENTS.md
 ignore_extensions:
     - .png
     - .jpg
@@ -41,4 +54,6 @@ ignore_extensions:
     - .pyc
     - .pyo
     - .pyd
-docs_dir: wiki
+    - -lock.json
+    - .lock.yaml
+    - pnpm-lock.yaml

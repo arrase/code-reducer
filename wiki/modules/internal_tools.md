@@ -1,63 +1,80 @@
-# Internal Tools Module — Architecture Reference
+# internal/tools — Repository Traversal, Safe File I/O, and Git Utilities
 
-## 1. Repository Verification & Git Operations
-
-**`git_tools.go`** provides the foundational layer for interacting with git repositories. These functions establish a verified working tree before any subsequent file operations occur, ensuring that all downstream utilities operate within a valid repository context.
-
-### `VerifyGitRepo(repoPath string) error`
-Validates that:
-- The `git` binary is present on the system PATH.
-- The specified directory is a recognized git working tree by executing `rev-parse --is-inside-work-tree`.
-
-Returns an error if either precondition fails. This function serves as a gatekeeper; callers should invoke it before any repository-aware operation.
-
-### `RunGit(repoPath string, args ...string) (string, error)`
-Executes arbitrary git commands scoped to the verified working tree. The implementation:
-- Captures stdout and trims trailing whitespace.
-- Propagates non-zero exit codes as errors.
-
-Used for lightweight queries such as resolving relative paths, checking branch state, or retrieving repository metadata without requiring manual shell invocation by callers.
+This module provides three independent capability groups: **repository code discovery**, **safe file read/write operations** with TOCTOU race mitigation, **gitignore-aware filtering**, and **Git subprocess execution**. All functions are standalone (no methods on types); no exported structs or interfaces exist. No goroutines, channels, or sync primitives are used anywhere in the package—every call is synchronous and single-threaded.
 
 ---
 
-## 2. Safe File I/O Operations
+## Repository Code Discovery
 
-**`file_tools.go`** handles read/write primitives with security-focused semantics: path resolution, TOCTOU mitigation, and symlink awareness.
+`DiscoverCodeFiles` walks `repoRoot` recursively via `filepath.WalkDir`, skipping directories matching `.gitignore` patterns (compiled by `LoadGitignore`) or any dot-prefixed component (`.build`, `.svn`, etc.), then filters each leaf through `ShouldIgnoreFile`. Valid source paths are accumulated into a slice and returned.
 
-### `ReadFileSafely(repoPath string) ([]byte, error)`
-Resolves a virtual repository-relative path to its absolute filesystem location and returns raw byte content. The implementation performs an error-checked open/read/close cycle, returning the complete file payload or an error if the operation cannot be completed within expected bounds.
-
-### `WriteFileSafely(repoPath string, content []byte) error`
-Writes arbitrary content to a resolved repository path with three safety measures:
-- **Directory creation**: Parent directories are created if absent (with appropriate mode preservation).
-- **Symlink detection**: Existing symlinks at the target path are detected and rejected to prevent silent redirect attacks.
-- **TOCTOU-safe truncation**: The file is opened in exclusive-truncate mode (`O_RDWR | O_CREATE | O_TRUNC`) to eliminate race conditions between read and write phases.
-
-### `IsBinaryFile(path string) bool`
-Scans the first 1024 bytes of a file for null byte (`\x00`) presence. Returns `true` if binary content is detected within that boundary. Used as a quick heuristic filter during code discovery to exclude non-source artifacts (images, compiled binaries, etc.) without loading entire files into memory.
+Walk callback errors from `filepath.WalkDir` are swallowed—individual directory entries that fail to stat return `nil` to the caller, making it impossible to distinguish an intentional skip from a walk failure downstream.
 
 ---
 
-## 3. Code Discovery & Filtering Pipeline
+## Safe File Read / Write Operations
 
-**`file_tools.go`** also contains higher-level utilities for walking the repository tree and applying exclusion rules derived from `.gitignore` semantics. These functions compose to produce a final list of source code files suitable for downstream processing (linting, analysis, migration).
+### `ReadFileSafely(repoRoot, virtualPath)` → `(data []byte, err error)`
 
-### `LoadGitignore(repoRoot string) ([]string, error)`
-Reads `.gitignore` from the given repository root, strips comment lines (`#`) and blank lines, and returns the active pattern set. Returns `nil` if the file does not exist or cannot be parsed. Patterns are returned as-is for downstream evaluation; callers should match them against relative paths using standard gitignore matching semantics.
+Resolves `virtualPath` through `security.SafeResolve` (path-traversal guard), then reads the resulting absolute path via `os.ReadFile`. Errors from both `SafeResolve` and `os.ReadFile` are wrapped with prefix `"failed to read file:"` using `%w`.
 
-### `ShouldIgnoreFile(relPath string) bool`
-Determines whether a given relative path matches any exclusion rule by evaluating:
-- Active `.gitignore` patterns from `LoadGitignore`.
-- Dot-prefixed directory components (e.g., `.build`, `.cache`).
-- Known binary file extensions (detected via `IsBinaryFile` or extension whitelist).
-- Null-byte presence in the path string.
+### `WriteFileSafely(repoRoot, virtualPath, content []byte)` → `error`
 
-Returns `true` if any exclusion rule matches, indicating the file should be skipped during discovery.
+Performs TOCTOU-safe writes:
 
-### `DiscoverCodeFiles(repoRoot string) ([]string, error)`
-Recursively walks the codebase rooted at `repoRoot`, collecting source files while skipping:
-- Build directories (e.g., `node_modules`, `.git`, `target`).
-- Paths matching any active `.gitignore` pattern from `LoadGitignore`.
-- Files flagged as binary by `IsBinaryFile`.
+1. Resolve the safe absolute path via `security.SafeResolve`.
+2. Call `os.MkdirAll(dir, 0755)` to create parent directories if missing; wraps with `"failed to create directory"`.
+3. Open for write+create (`O_WRONLY|O_CREATE`, mode `0644`); wraps open failure with `"failed to open file for writing"`.
+4. Call `os.Lstat(safePath)` (no symlink follow) and `f.Stat()`; compare via `os.SameFile(fiLstat, fiFstat)`. If they differ—indicating a symlink swap or race condition—return an error prefixed `"security violation"` or `"TOCTOU symlink race detected"`.
+5. Truncate (`f.Truncate(0)`), then write content; wrap each with `"failed to truncate file:"` / `"failed to write file content:"`.
 
-Returns a sorted slice of relative path strings representing the discovered codebase. The walk order is deterministic; results are suitable for direct consumption by analysis or transformation pipelines.
+---
+
+## Gitignore Handling and Binary Classification
+
+### `LoadGitignore(repoRoot)` → `(patterns []string, err error)`
+
+Reads `.gitignore` from `repoRoot`, scanner processes line-by-line. Empty file returns `nil, nil`; non-existence (`os.IsNotExist`) also returns `nil, nil`. All other errors are wrapped. Patterns returned are active non-comment entries.
+
+### `ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ignoredExtensions []string)` → `bool`
+
+Applies layered ignore rules:
+
+- Compiles user-supplied patterns via the external `github.com/sabhiram/go-gitignore` package (`*ignore.GitIgnore`).
+- Rejects paths with dot-prefixed components or `.egg-info` suffixes (build artifacts).
+- Checks file extension against a provided blacklist.
+- For unknown extensions, reads the first 1024 bytes and scans for null bytes via `IsBinaryFile`. If null bytes are present, returns `true` (binary → ignore).
+
+### `IsBinaryFile(path string)` → `bool`
+
+Opens the path; if `os.Open` fails, returns `false` (treats unreadable as non-binary). Reads up to 1024 bytes. Only wraps `io.EOF` (expected EOF) without error—other read errors return `false`. No error wrapping for open or other read failures beyond EOF handling.
+
+---
+
+## Git Subprocess Execution
+
+### `RunGit(repoRoot string, args ...string)` → `(stdout string, err error)`
+
+Constructs an `exec.Command` for `git`, prepends `--no-pager` to user-supplied arguments, sets `cmd.Dir = repoRoot`. Captures stdout into a `bytes.Buffer`, reads it back, trims whitespace. On success returns trimmed output; on failure wraps the original error with stderr text: `"git command failed: %v, stderr: %s"`.
+
+### `VerifyGitRepo(repoRoot string)` → `error`
+
+Two-stage validation:
+
+1. Calls `exec.LookPath("git")`; if unavailable, returns a fresh error without wrapping—no reference to any prior failure since none exists at that point.
+2. Otherwise delegates to `RunGit(repoRoot, "rev-parse", "--is-inside-work-tree")`. If the inner call fails, discards its returned error entirely and returns a new message: `"not a git repository (or any of the parent directories)"`.
+
+---
+
+## Error Handling Summary
+
+| Function | Failure Mode | Strategy |
+|---|---|---|
+| `ReadFileSafely` | Resolve or read failure | Wrap with `"failed to read file:"`, `%w` |
+| `WriteFileSafely` | Directory open, file open, lstat/stat mismatch, truncate, write | Contextual prefix per step; symlink race → `"security violation"` / `"TOCTOU symlink race detected"` |
+| `LoadGitignore` | Non-existence or read error | `nil, nil` on missing/empty; wrap everything else |
+| `DiscoverCodeFiles` | Walk entry failure | Swallowed—caller sees no signal |
+| `IsBinaryFile` | Open failure or non-EOF read error | Returns `false`; EOF is expected and ignored |
+| `RunGit` | Non-zero exit / exec error | Wrap original + stderr text with `%v`, `%s` |
+| `VerifyGitRepo` | Missing git binary | Fresh error, no wrapping |
+| `VerifyGitRepo` | Git query failure | Discard inner error; return fresh message only |

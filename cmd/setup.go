@@ -84,20 +84,21 @@ func RunSetupFlow(repoRoot string) {
 	}
 	docsDirInput := promptString(reader, "Enter documentation directory", existingDocsDir)
 
+	var extractionSteps []config.ExtractionStep
+	if existingCfg != nil && len(existingCfg.ExtractionSteps) > 0 {
+		extractionSteps = existingCfg.ExtractionSteps
+	} else {
+		extractionSteps = config.DefaultExtractionSteps
+	}
+
 	newCfg := &config.Config{
 		ModelID:          modelInput,
 		OllamaBaseURL:    urlInput,
 		OllamaNumCtx:     numCtx,
+		DocsDir:          docsDirInput,
+		ExtractionSteps:  extractionSteps,
 		Ignore:           ignores,
 		IgnoreExtensions: ignoreExtensions,
-		DocsDir:          docsDirInput,
-	}
-
-	// Preserve optional fields if they existed
-	if existingCfg != nil {
-		newCfg.LangsmithAPIKey = existingCfg.LangsmithAPIKey
-		newCfg.LangchainProject = existingCfg.LangchainProject
-		newCfg.LangchainTracingV2 = existingCfg.LangchainTracingV2
 	}
 
 	err = config.SaveConfig(repoRoot, newCfg)
