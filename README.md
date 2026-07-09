@@ -98,6 +98,12 @@ ignore:
 
 # Target directory to write generated markdown documentation
 docs_dir: "wiki"
+
+# Optional: Customize the LLM extraction pipeline steps
+# If omitted, defaults to 4 steps: API_SIGNATURES, BUSINESS_LOGIC, STATE_AND_CONCURRENCY, ERRORS_AND_SIDE_EFFECTS
+extraction_steps:
+  - name: "SECURITY_AUDIT"
+    prompt: "Task: Audit the file for security vulnerabilities.\nOutput: List any potential security risks."
 ```
 
 ### Precedence Order
@@ -117,9 +123,6 @@ Code-Reducer implements a four-tier configuration resolution chain (defined in `
    * Model ID: `gemma4:26b-a4b-it-qat`
    * Ollama URL: `http://localhost:11434`
    * Context Size: `8192`
-
-### LangChain Tracing Setup
-On configuration resolution, tracing parameters (`LANGSMITH_API_KEY`, `LANGCHAIN_PROJECT`, `LANGCHAIN_TRACING_V2`) are parsed from environment variables or the YAML configuration file directly into the internal configuration struct for integration with the execution framework.
 
 ---
 
@@ -153,7 +156,13 @@ In `update` mode, the engine dynamically determines which directory nodes are "a
 #### The Map Phase (File Fact Extraction)
 For every code file in an affected directory, the engine calculates the `SHA256` of its contents:
 * **Cache Hit**: Reuses the stored facts string from the cache.
-* **Cache Miss**: Reads up to the first `8,000` characters, wraps it in a prompt, and calls the LLM with the `extract_file` instructions. The model returns a markdown list of exported functions, classes, structs, and interfaces, with exactly a one-sentence technical explanation of their purpose. Outer markdown fences are stripped via regex.
+* **Cache Miss**: Reads up to the first `8,000` characters and executes a **Configurable Multi-Prompt Extraction Pipeline**. By default, it runs 4 steps optimized for smaller ~10B LLMs:
+  1. **API_SIGNATURES**: Extracts public signatures and structural contracts.
+  2. **BUSINESS_LOGIC**: Infers algorithmic intent and domain rules.
+  3. **STATE_AND_CONCURRENCY**: Identifies mutable state, threading models, and sync primitives.
+  4. **ERRORS_AND_SIDE_EFFECTS**: Maps I/O boundaries, network calls, and error-handling philosophies.
+  
+  These steps can be completely overridden, removed, or expanded in your `.code-reducer.yaml` via the `extraction_steps` array. The results of all steps are automatically concatenated into a comprehensive "Developer Briefing" for the file. Outer markdown fences are stripped via regex.
 
 #### The Reduce Phase (Recursive Chunk Synthesis)
 To prevent massive folders from blowing out Ollama's context window, component summaries (files and child directory summaries) are merged bottom-up in batches dynamically sized by character length:
@@ -250,37 +259,20 @@ $ code-reducer init
 Starting Map-Reduce pipeline: init
 Step 1: Code Discovery & Building Tree...
 Step 2: Hierarchical Tree-Merging (Map-Reduce)...
-➜ Extracting file: cmd/init.go
-➜ Extracting file: cmd/root.go
-➜ Extracting file: cmd/setup.go
-➜ Extracting file: cmd/update.go
+➜ Extracting file (Step 1/4 - API_SIGNATURES): cmd/init.go
+➜ Extracting file (Step 2/4 - BUSINESS_LOGIC): cmd/init.go
+➜ Extracting file (Step 3/4 - STATE_AND_CONCURRENCY): cmd/init.go
+➜ Extracting file (Step 4/4 - ERRORS_AND_SIDE_EFFECTS): cmd/init.go
+➜ Extracting file (Step 1/4 - API_SIGNATURES): cmd/root.go
+...
 ➜ Synthesizing directory: cmd (4 total components)
 ➜ LLM Synthesizing chunk for cmd (4 items)
-➜ Extracting file: internal/config/env.go
+...
+➜ Extracting file (Step 1/4 - API_SIGNATURES): internal/config/env.go
+...
 ➜ Synthesizing directory: internal/config (1 total components)
 ➜ LLM Synthesizing chunk for internal/config (1 items)
-➜ Extracting file: internal/engine/cache.go
-➜ Extracting file: internal/engine/chunking.go
-➜ Extracting file: internal/engine/client.go
-➜ Extracting file: internal/engine/json_parser.go
-➜ Extracting file: internal/engine/orchestrator.go
-➜ Extracting file: internal/engine/runner.go
-➜ Extracting file: internal/engine/synthesize.go
-➜ Extracting file: internal/engine/tree.go
-➜ Extracting file: internal/engine/utils.go
-➜ Synthesizing directory: internal/engine (9 total components)
-➜ LLM Synthesizing chunk for internal/engine (9 items)
-➜ Extracting file: internal/security/security.go
-➜ Synthesizing directory: internal/security (1 total components)
-➜ LLM Synthesizing chunk for internal/security (1 items)
-➜ Extracting file: internal/tools/file_tools.go
-➜ Extracting file: internal/tools/git_tools.go
-➜ Synthesizing directory: internal/tools (2 total components)
-➜ LLM Synthesizing chunk for internal/tools (2 items)
-➜ Synthesizing directory: internal (4 total components)
-➜ LLM Synthesizing chunk for internal (4 items)
-➜ Extracting file: go.mod
-➜ Extracting file: main.go
+...
 ➜ Synthesizing directory: . (4 total components)
 ➜ LLM Synthesizing chunk for . (4 items)
 Step 3: Global Architecture Synthesis...

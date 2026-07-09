@@ -2,14 +2,18 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 
+	"github.com/arrase/code-reducer/internal/config"
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
-func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, docsDir string, cache *MetadataCache, affectedDirs map[string]bool, logEvent func(string, string)) (string, error) {
+func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, cfg *config.Config, cache *MetadataCache, affectedDirs map[string]bool, logEvent func(string, string)) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -29,7 +33,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	childSummaries := make(map[string]string)
 	for _, name := range childNames {
 		child := node.Children[name]
-		sum, err := synthesizeNode(ctx, c, child, repoRoot, docsDir, cache, affectedDirs, logEvent)
+		sum, err := synthesizeNode(ctx, c, child, repoRoot, cfg, cache, affectedDirs, logEvent)
 		if err != nil {
 			return "", err
 		}
@@ -39,47 +43,49 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	}
 
 	var components []string
+	
+	// Calculate a 100% dynamic file truncation limit based purely on the context size.
+	// Assuming ~4 characters per token, we allocate 75% of the total context window 
+	// for the file content, proportionally reserving the remaining 25% for prompts and output.
+	fileLimit := int(float64(c.NumCtx * 4) * 0.75)
+
 	for _, f := range node.Files {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
 
-		// Calculate current SHA256 of the file
-		fileHash, err := computeSHA256(repoRoot, f)
+		contentBytes, err := tools.ReadFileSafely(repoRoot, f)
 		if err != nil {
 			continue // Skip if file can't be read
 		}
+		
+		hashSum := sha256.Sum256(contentBytes)
+		fileHash := hex.EncodeToString(hashSum[:])
 
 		var facts string
 		cachedEntry, exists := cache.Files[f]
 		if exists && cachedEntry.SHA256 == fileHash {
 			facts = cachedEntry.Facts
 		} else {
-			contentBytes, err := tools.ReadFileSafely(repoRoot, f)
-			if err != nil {
-				continue
-			}
 			contentStr := string(contentBytes)
-
-			// Calculate a safe dynamic file truncation limit based on the context size
-			limit := c.NumCtx * 3
-			if limit > 12000 {
-				limit = limit - 4000
-			} else {
-				limit = 8000
+			runes := []rune(contentStr)
+			if len(runes) > fileLimit {
+				contentStr = string(runes[:fileLimit]) + "\n...(truncated)..."
 			}
 
-			if len(contentStr) > limit {
-				contentStr = contentStr[:limit] + "\n...(truncated)..."
+			var factsBuilder strings.Builder
+			for i, step := range cfg.ExtractionSteps {
+				logEvent("status", fmt.Sprintf("➜ Extracting file (Step %d/%d - %s): %s", i+1, len(cfg.ExtractionSteps), step.Name, f))
+				
+				systemPrompt := c.GetBaseSystemPrompt() + step.Prompt
+				res, err := c.CallLLM(ctx, systemPrompt, []Message{{Role: "user", Content: fmt.Sprintf("File: %s\n```\n%s\n```", f, contentStr)}}, false)
+				if err != nil {
+					return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
+				}
+				
+				factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, StripOuterMarkdownFence(res)))
 			}
-
-			logEvent("status", fmt.Sprintf("➜ Extracting file: %s", f))
-			userMsg := fmt.Sprintf("Analyze this file: %s\n\n```\n%s\n```\n\nOutput ONLY a Markdown list of exported functions, classes, and data structures with a 1-sentence technical description for each. No fluff.", f, contentStr)
-			res, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("extract_file"), []Message{{Role: "user", Content: userMsg}}, false)
-			if err != nil {
-				return "", fmt.Errorf("LLM error extracting %s: %w", f, err)
-			}
-			facts = StripOuterMarkdownFence(res)
+			facts = strings.TrimSpace(factsBuilder.String())
 
 			// Update cache
 			cache.Files[f] = FileCacheEntry{
@@ -111,7 +117,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	// Update module cache
 	cache.Modules[node.Path] = finalSum
 
-	modulePath := filepath.Join(docsDir, "modules", ToSafeMarkdownFilename(node.Path))
+	modulePath := filepath.Join(cfg.DocsDir, "modules", ToSafeMarkdownFilename(node.Path))
 	if err := tools.WriteFileSafely(repoRoot, modulePath, []byte(finalSum)); err != nil {
 		return "", fmt.Errorf("failed to write module documentation for %s: %w", node.Path, err)
 	}

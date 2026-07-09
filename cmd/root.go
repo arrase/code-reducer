@@ -2,11 +2,9 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/mattn/go-isatty"
@@ -62,19 +60,8 @@ func executeCommand(mode string) {
 	// Resolve the merged configuration
 	cfg := config.ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)
 
-	// Command flow checks (Presence/Absence of .metadata.json and last_documented_commit)
-	metadataPath := filepath.Join(repoRoot, cfg.DocsDir, ".metadata.json")
-	lastSHA := ""
-	hasInit := false
-	if data, err := os.ReadFile(metadataPath); err == nil {
-		var meta struct {
-			LastDocumentedCommit string `json:"last_documented_commit"`
-		}
-		if json.Unmarshal(data, &meta) == nil && meta.LastDocumentedCommit != "" {
-			lastSHA = meta.LastDocumentedCommit
-			hasInit = true
-		}
-	}
+	// Command flow checks
+	lastSHA, hasInit := engine.GetLastDocumentedCommit(repoRoot, cfg.DocsDir)
 
 	if mode == "init" {
 		if hasInit {
@@ -106,14 +93,4 @@ func executeCommand(mode string) {
 		fmt.Printf("Documentation Run Failed: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-// NeedsCredentialSetup checks if critical configuration is missing
-func NeedsCredentialSetup() bool {
-	repoRoot, err := os.Getwd()
-	if err != nil {
-		return true
-	}
-	cfg := config.ResolveConfig(repoRoot, "", "")
-	return cfg.ModelID == ""
 }

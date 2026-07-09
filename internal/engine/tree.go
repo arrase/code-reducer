@@ -2,21 +2,16 @@ package engine
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/arrase/code-reducer/internal/security"
-	"github.com/arrase/code-reducer/internal/tools"
-	ignore "github.com/sabhiram/go-gitignore"
 )
 
 type FileChange struct {
 	Path   string
 	Status string // "Added", "Modified", "Deleted"
-}
-
-func isAllowedFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ignoredExtensions []string) bool {
-	return !tools.ShouldIgnoreFile(repoRoot, relPath, gitIgnore, ignoredExtensions)
 }
 
 func propagateAffected(node *DirNode, affectedDirs map[string]bool) bool {
@@ -47,11 +42,8 @@ func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataC
 			}
 		}
 
-		safeName := strings.ReplaceAll(n.Path, string(filepath.Separator), "_")
-		if safeName == "." || safeName == "" {
-			safeName = "root"
-		}
-		modulePath := filepath.Join(docsDir, "modules", safeName+".md")
+		safeName := ToSafeMarkdownFilename(n.Path)
+		modulePath := filepath.Join(docsDir, "modules", safeName)
 		absModulePath, err := security.SafeResolve(repoRoot, modulePath)
 		if err == nil {
 			if _, err := os.Stat(absModulePath); os.IsNotExist(err) {
@@ -79,20 +71,20 @@ type DirNode struct {
 func buildTree(files []string) *DirNode {
 	root := &DirNode{Path: ".", Children: make(map[string]*DirNode)}
 	for _, f := range files {
-		d := filepath.Dir(f)
+		d := path.Dir(f)
 		if d == "." {
 			root.Files = append(root.Files, f)
 			continue
 		}
 
-		parts := strings.Split(d, string(filepath.Separator))
+		parts := strings.Split(d, "/")
 		curr := root
 		currPath := ""
 		for _, part := range parts {
 			if currPath == "" {
 				currPath = part
 			} else {
-				currPath = currPath + string(filepath.Separator) + part
+				currPath = currPath + "/" + part
 			}
 			if _, ok := curr.Children[part]; !ok {
 				curr.Children[part] = &DirNode{Path: currPath, Children: make(map[string]*DirNode)}

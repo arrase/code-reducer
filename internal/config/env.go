@@ -13,39 +13,42 @@ const (
 	CodeReducerModelIdEnvKey = "CODE_REDUCER_MODEL_ID"
 	OllamaBaseUrlEnvKey      = "OLLAMA_BASE_URL"
 	OllamaNumCtxEnvKey       = "OLLAMA_NUM_CTX"
-	LangsmithApiKeyEnvKey    = "LANGSMITH_API_KEY"
-	LangchainProjectEnvKey   = "LANGCHAIN_PROJECT"
-	LangchainTracingEnvKey   = "LANGCHAIN_TRACING_V2"
 
 	OllamaDefaultBaseURL = "http://localhost:11434"
 	OllamaDefaultNumCtx  = 8192
 	ConfigFileName       = ".code-reducer.yaml"
 )
 
+type ExtractionStep struct {
+	Name   string `yaml:"name"`
+	Prompt string `yaml:"prompt"`
+}
+
 // Config represents the schema of .code-reducer.yaml
 type Config struct {
-	ModelID            string   `yaml:"model_id"`
-	OllamaBaseURL      string   `yaml:"ollama_base_url"`
-	OllamaNumCtx       int      `yaml:"ollama_num_ctx"`
-	LangsmithAPIKey    string   `yaml:"langsmith_api_key,omitempty"`
-	LangchainProject   string   `yaml:"langchain_project,omitempty"`
-	LangchainTracingV2 string   `yaml:"langchain_tracing_v2,omitempty"`
-	Ignore             []string `yaml:"ignore"`
-	IgnoreExtensions   []string `yaml:"ignore_extensions"`
-	DocsDir            string   `yaml:"docs_dir"`
+	ModelID          string           `yaml:"model_id"`
+	OllamaBaseURL    string           `yaml:"ollama_base_url"`
+	OllamaNumCtx     int              `yaml:"ollama_num_ctx"`
+	DocsDir          string           `yaml:"docs_dir"`
+	ExtractionSteps  []ExtractionStep `yaml:"extraction_steps"`
+	Ignore           []string         `yaml:"ignore"`
+	IgnoreExtensions []string         `yaml:"ignore_extensions"`
+}
+
+// getConfigPath returns the absolute path to the configuration file.
+func getConfigPath(cwd string) string {
+	return filepath.Join(cwd, ConfigFileName)
 }
 
 // ConfigExists checks if .code-reducer.yaml exists in the specified directory.
 func ConfigExists(cwd string) bool {
-	configPath := filepath.Join(cwd, ConfigFileName)
-	_, err := os.Stat(configPath)
+	_, err := os.Stat(getConfigPath(cwd))
 	return err == nil
 }
 
 // LoadConfig reads and parses .code-reducer.yaml from the specified directory.
 func LoadConfig(cwd string) (*Config, error) {
-	configPath := filepath.Join(cwd, ConfigFileName)
-	data, err := os.ReadFile(configPath)
+	data, err := os.ReadFile(getConfigPath(cwd))
 	if err != nil {
 		return nil, err
 	}
@@ -58,12 +61,11 @@ func LoadConfig(cwd string) (*Config, error) {
 
 // SaveConfig writes the configuration to .code-reducer.yaml in the specified directory.
 func SaveConfig(cwd string, cfg *Config) error {
-	configPath := filepath.Join(cwd, ConfigFileName)
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal yaml: %w", err)
 	}
-	if err := os.WriteFile(configPath, data, 0600); err != nil {
+	if err := os.WriteFile(getConfigPath(cwd), data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 	return nil
@@ -111,17 +113,30 @@ var DefaultIgnoredExtensions = []string{
 	"pnpm-lock.yaml",
 }
 
+var DefaultExtractionSteps = []ExtractionStep{
+	{
+		Name:   "API_SIGNATURES",
+		Prompt: "Task: Extract the public surface area of the file.\nOutput: A strict Markdown list of all exported structs, interfaces, and methods. For each, note the actual input and output types. Ignore internal logic.",
+	},
+	{
+		Name:   "BUSINESS_LOGIC",
+		Prompt: "Task: Analyze the business logic and domain concepts.\nOutput: Explain what business rules or domain concepts this file solves. Describe the high-level algorithmic flow. Ignore implementation details.",
+	},
+	{
+		Name:   "STATE_AND_CONCURRENCY",
+		Prompt: "Task: Analyze state mutation and concurrency.\nOutput: List all mutable state (global variables, changing struct fields) and what concurrency mechanisms (e.g., sync.Mutex, channels) protect them. If none, state 'No mutable state'.",
+	},
+	{
+		Name:   "ERRORS_AND_SIDE_EFFECTS",
+		Prompt: "Task: Analyze side effects and error handling.\nOutput: Detail how this code communicates with the outside world (I/O like network, disk, DB) and how it handles/returns errors (wrap, sentinel, panic).",
+	},
+}
+
 // MergeAndDeduplicate merges two slices and removes duplicates.
 func MergeAndDeduplicate[T comparable](a, b []T) []T {
 	seen := make(map[T]bool)
 	var result []T
-	for _, item := range a {
-		if !seen[item] {
-			seen[item] = true
-			result = append(result, item)
-		}
-	}
-	for _, item := range b {
+	for _, item := range append(a, b...) {
 		if !seen[item] {
 			seen[item] = true
 			result = append(result, item)
@@ -132,7 +147,6 @@ func MergeAndDeduplicate[T comparable](a, b []T) []T {
 
 // ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
 // It returns a fully resolved Config struct ready to be used by the pipeline runner and LLM client.
-// It also sets required external environment variables (such as Langchain/Langsmith tracing variables).
 func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 	cfg, err := LoadConfig(repoRoot)
 	if err != nil {
@@ -145,79 +159,59 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 	// Deduplicate extensions: start with default extensions, then add user config extensions
 	resolvedExtensions := MergeAndDeduplicate(DefaultIgnoredExtensions, cfg.IgnoreExtensions)
 
+	// Extraction steps
+	resolvedSteps := cfg.ExtractionSteps
+	if len(resolvedSteps) == 0 {
+		resolvedSteps = DefaultExtractionSteps
+	}
+
 	resolved := &Config{
 		Ignore:           resolvedIgnore,
 		IgnoreExtensions: resolvedExtensions,
+		ExtractionSteps:  resolvedSteps,
 	}
 
-	// 1. Resolve Model ID: Flag > Env > YAML > Default
+	// 1. Resolve Model ID: Default > YAML > Env > Flag
+	resolved.ModelID = "gemma4:26b-a4b-it-qat"
+	if cfg.ModelID != "" {
+		resolved.ModelID = cfg.ModelID
+	}
+	if envVal := os.Getenv(CodeReducerModelIdEnvKey); envVal != "" {
+		resolved.ModelID = envVal
+	}
 	if modelIdFlag != "" {
 		resolved.ModelID = modelIdFlag
-	} else if envVal := os.Getenv(CodeReducerModelIdEnvKey); envVal != "" {
-		resolved.ModelID = envVal
-	} else if cfg.ModelID != "" {
-		resolved.ModelID = cfg.ModelID
-	} else {
-		resolved.ModelID = "gemma4:26b-a4b-it-qat"
 	}
 
-	// 2. Resolve Ollama Base URL: Env > YAML > Default
+	// 2. Resolve Ollama Base URL: Default > YAML > Env
+	resolved.OllamaBaseURL = OllamaDefaultBaseURL
+	if cfg.OllamaBaseURL != "" {
+		resolved.OllamaBaseURL = cfg.OllamaBaseURL
+	}
 	if envVal := os.Getenv(OllamaBaseUrlEnvKey); envVal != "" {
 		resolved.OllamaBaseURL = envVal
-	} else if cfg.OllamaBaseURL != "" {
-		resolved.OllamaBaseURL = cfg.OllamaBaseURL
-	} else {
-		resolved.OllamaBaseURL = OllamaDefaultBaseURL
 	}
 
-	// 3. Resolve Ollama Context Size: Flag > Env > YAML > Default
-	var numCtx int
+	// 3. Resolve Ollama Context Size: Default > YAML > Env > Flag
+	resolved.OllamaNumCtx = OllamaDefaultNumCtx
+	if cfg.OllamaNumCtx > 0 {
+		resolved.OllamaNumCtx = cfg.OllamaNumCtx
+	}
+	if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
+		if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
+			resolved.OllamaNumCtx = n
+		}
+	}
 	if numCtxFlag != "" {
 		if n, err := strconv.Atoi(numCtxFlag); err == nil && n > 0 {
-			numCtx = n
+			resolved.OllamaNumCtx = n
 		}
 	}
-	if numCtx == 0 {
-		if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
-			if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
-				numCtx = n
-			}
-		}
-	}
-	if numCtx == 0 {
-		if cfg.OllamaNumCtx > 0 {
-			numCtx = cfg.OllamaNumCtx
-		}
-	}
-	if numCtx == 0 {
-		numCtx = OllamaDefaultNumCtx
-	}
-	resolved.OllamaNumCtx = numCtx
 
-	// 4. Resolve Langsmith API Key, Langchain Project, and Langchain Tracing V2
-	if envVal := os.Getenv(LangsmithApiKeyEnvKey); envVal != "" {
-		resolved.LangsmithAPIKey = envVal
-	} else {
-		resolved.LangsmithAPIKey = cfg.LangsmithAPIKey
-	}
-
-	if envVal := os.Getenv(LangchainProjectEnvKey); envVal != "" {
-		resolved.LangchainProject = envVal
-	} else {
-		resolved.LangchainProject = cfg.LangchainProject
-	}
-
-	if envVal := os.Getenv(LangchainTracingEnvKey); envVal != "" {
-		resolved.LangchainTracingV2 = envVal
-	} else {
-		resolved.LangchainTracingV2 = cfg.LangchainTracingV2
-	}
-
-	// 5. Resolve DocsDir: YAML > Default
+	// 4. Resolve DocsDir: Default > YAML
+	resolved.DocsDir = "wiki"
 	if cfg.DocsDir != "" {
 		resolved.DocsDir = cfg.DocsDir
-	} else {
-		resolved.DocsDir = "wiki"
 	}
 
 	return resolved

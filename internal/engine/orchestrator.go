@@ -11,7 +11,6 @@ import (
 	"github.com/arrase/code-reducer/internal/config"
 	"github.com/arrase/code-reducer/internal/security"
 	"github.com/arrase/code-reducer/internal/tools"
-	ignore "github.com/sabhiram/go-gitignore"
 )
 
 type Event struct {
@@ -45,6 +44,30 @@ func (c *LLMClient) GenerateStandardDocs(ctx context.Context, repoRoot, docsDir,
 	return nil
 }
 
+func setupPipeline(repoRoot string, cfg *config.Config, logEvent func(string, string)) (string, []string, *MetadataCache) {
+	docsDir := cfg.DocsDir
+	gitignorePatterns, err := tools.LoadGitignore(repoRoot)
+	if err != nil {
+		logEvent("status", fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
+	}
+	ignores := append(cfg.Ignore, docsDir)
+	ignores = append(ignores, gitignorePatterns...)
+
+	cache, err := loadMetadataCache(repoRoot, docsDir)
+	if err != nil {
+		logEvent("status", fmt.Sprintf("Warning: failed to load metadata cache: %v", err))
+	}
+	return docsDir, ignores, cache
+}
+
+func teardownPipeline(repoRoot, docsDir string, cache *MetadataCache, logEvent func(string, string), successMsg string) {
+	cache.LastDocumentedCommit = "local"
+	if err := saveMetadataCache(repoRoot, docsDir, cache); err != nil {
+		logEvent("status", fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
+	}
+	logEvent("status", successMsg)
+}
+
 func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
 	logEvent := func(t, m string) {
 		if onEvent != nil {
@@ -54,13 +77,7 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 	logEvent("status", "Starting Map-Reduce pipeline: init")
 	logEvent("status", "Step 1: Code Discovery & Building Tree...")
 	
-	docsDir := cfg.DocsDir
-	gitignorePatterns, err := tools.LoadGitignore(repoRoot)
-	if err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
-	}
-	ignores := append(cfg.Ignore, docsDir)
-	ignores = append(ignores, gitignorePatterns...)
+	docsDir, ignores, cache := setupPipeline(repoRoot, cfg, logEvent)
 
 	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores, cfg.IgnoreExtensions)
 	if err != nil {
@@ -74,14 +91,6 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 	}
 
 	logEvent("status", "Step 2: Hierarchical Tree-Merging (Map-Reduce)...")
-	cache, err := loadMetadataCache(repoRoot, docsDir)
-	if err != nil || cache == nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to load metadata cache: %v", err))
-		cache = &MetadataCache{
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}
-	}
 
 	affectedDirs := make(map[string]bool)
 	var markAllAffected func(n *DirNode)
@@ -93,12 +102,12 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 	}
 	markAllAffected(tree)
 
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, docsDir, cache, affectedDirs, func(m, t string) { logEvent(m, t) })
+	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, logEvent)
 	if err != nil {
 		return err
 	}
 
-	if err := c.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, func(m, t string) { logEvent(m, t) }); err != nil {
+	if err := c.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, logEvent); err != nil {
 		return err
 	}
 
@@ -132,12 +141,7 @@ Before making changes, analyze these files to align with existing design choices
 		}
 	}
 
-	cache.LastDocumentedCommit = "local"
-	if err := saveMetadataCache(repoRoot, docsDir, cache); err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
-	}
-
-	logEvent("status", "Pipeline completed successfully!")
+	teardownPipeline(repoRoot, docsDir, cache, logEvent, "Pipeline completed successfully!")
 	return nil
 }
 
@@ -149,22 +153,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 	logEvent("status", "Starting Map-Reduce pipeline: update")
 
-	docsDir := cfg.DocsDir
-	gitignorePatterns, err := tools.LoadGitignore(repoRoot)
-	if err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
-	}
-	ignores := append(cfg.Ignore, docsDir)
-	ignores = append(ignores, gitignorePatterns...)
-
-	cache, err := loadMetadataCache(repoRoot, docsDir)
-	if err != nil || cache == nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to load metadata cache: %v", err))
-		cache = &MetadataCache{
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}
-	}
+	docsDir, ignores, cache := setupPipeline(repoRoot, cfg, logEvent)
 
 	logEvent("status", "Step 1: Detecting changed files...")
 
@@ -177,15 +166,11 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	currentFilesMap := make(map[string]string)
 	var allowedCodeFiles []string
 
-	gitIgnore := ignore.CompileIgnoreLines(ignores...)
-
 	for _, f := range codeFiles {
-		if isAllowedFile(repoRoot, f, gitIgnore, cfg.IgnoreExtensions) {
-			allowedCodeFiles = append(allowedCodeFiles, f)
-			hash, err := computeSHA256(repoRoot, f)
-			if err == nil {
-				currentFilesMap[f] = hash
-			}
+		allowedCodeFiles = append(allowedCodeFiles, f)
+		hash, err := computeSHA256(repoRoot, f)
+		if err == nil {
+			currentFilesMap[f] = hash
 		}
 	}
 
@@ -219,9 +204,6 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 				break
 			}
 			curr = filepath.Dir(curr)
-		}
-		if change.Status == "Deleted" {
-			delete(cache.Files, change.Path)
 		}
 	}
 
@@ -266,7 +248,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 
 	logEvent("status", fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, docsDir, cache, affectedDirs, func(m, t string) { logEvent(m, t) })
+	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, logEvent)
 	if err != nil {
 		return err
 	}
@@ -287,18 +269,13 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 
 	if affectedDirs["."] || !archExists || !qsExists {
-		if err := c.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, func(m, t string) { logEvent(m, t) }); err != nil {
+		if err := c.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, logEvent); err != nil {
 			return err
 		}
 	} else {
 		logEvent("status", "Global architecture and quickstart pages are up to date. Skipping regeneration.")
 	}
 
-	cache.LastDocumentedCommit = "local"
-	if err := saveMetadataCache(repoRoot, docsDir, cache); err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
-	}
-
-	logEvent("status", "Pipeline update completed successfully!")
+	teardownPipeline(repoRoot, docsDir, cache, logEvent, "Pipeline update completed successfully!")
 	return nil
 }

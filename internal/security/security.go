@@ -1,7 +1,6 @@
 package security
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,15 +32,14 @@ type SimpleLock struct {
 
 // Unlock releases the lock by closing the file and removing it.
 func (l *SimpleLock) Unlock() error {
-	var err1, err2 error
+	var err error
 	if l.file != nil {
-		err1 = l.file.Close()
+		err = l.file.Close()
 	}
-	err2 = os.Remove(l.lockPath)
-	if err1 != nil {
-		return err1
+	if removeErr := os.Remove(l.lockPath); removeErr != nil && err == nil {
+		err = removeErr
 	}
-	return err2
+	return err
 }
 
 // AcquireLock acquires a simple file lock in the repoRoot.
@@ -73,44 +71,26 @@ func AcquireLock(repoRoot string) (*SimpleLock, error) {
 func EnsureGitignoreHasLockfile(repoRoot string) error {
 	gitignorePath := filepath.Join(repoRoot, ".gitignore")
 
-	// If .gitignore doesn't exist, create it with the lockfile
-	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
-		return os.WriteFile(gitignorePath, []byte(LockFileName+"\n"), 0644)
+	data, err := os.ReadFile(gitignorePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("error reading .gitignore: %w", err)
 	}
 
-	file, err := os.Open(gitignorePath)
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == LockFileName {
+			return nil
+		}
+	}
+
+	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open .gitignore: %w", err)
+		return fmt.Errorf("failed to open .gitignore for appending: %w", err)
 	}
+	defer f.Close()
 
-	scanner := bufio.NewScanner(file)
-	found := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == LockFileName {
-			found = true
-			break
-		}
-	}
-
-	scanErr := scanner.Err()
-	file.Close()
-
-	if scanErr != nil {
-		return fmt.Errorf("error reading .gitignore: %w", scanErr)
-	}
-
-	if !found {
-		// Append LockFileName to .gitignore
-		f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open .gitignore for appending: %w", err)
-		}
-		defer f.Close()
-
-		if _, err := f.WriteString("\n# Code-Reducer Lockfile\n" + LockFileName + "\n"); err != nil {
-			return fmt.Errorf("failed to write to .gitignore: %w", err)
-		}
+	if _, err := f.WriteString("\n# Code-Reducer Lockfile\n" + LockFileName + "\n"); err != nil {
+		return fmt.Errorf("failed to write to .gitignore: %w", err)
 	}
 
 	return nil
