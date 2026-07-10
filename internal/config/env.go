@@ -87,6 +87,7 @@ var DefaultIgnores = []string{
 	".venv",
 	"code-reducer",
 	".gemini",
+	"AGENTS.md",
 	".code-reducer.yaml",
 	".code-reducer.lock",
 }

@@ -66,16 +66,45 @@ func RunSetupFlow(repoRoot string) error {
 		numCtx = existingNumCtx
 	}
 
-	var ignores []string
-	var ignoreExtensions []string
+	var customIgnores []string
+	var customExtensions []string
 
 	if existingCfg != nil {
-		ignores = existingCfg.Ignore
-		ignoreExtensions = existingCfg.IgnoreExtensions
+		customIgnores = subtractSlice(existingCfg.Ignore, config.DefaultIgnores)
+		customExtensions = subtractSlice(existingCfg.IgnoreExtensions, config.DefaultIgnoredExtensions)
 	}
 
-	ignores = promptStringList(reader, "Enter custom directories/files to ignore (comma-separated)", ignores)
-	ignoreExtensions = promptStringList(reader, "Enter custom file extensions to ignore (comma-separated)", ignoreExtensions)
+	userInputIgnores, ignoresModified := promptStringList(reader, "Enter custom directories/files to ignore (comma-separated)", customIgnores)
+	var ignores []string
+	if ignoresModified {
+		if len(userInputIgnores) > 0 {
+			ignores = config.MergeAndDeduplicate(config.DefaultIgnores, userInputIgnores)
+		} else {
+			ignores = []string{}
+		}
+	} else {
+		if existingCfg != nil {
+			ignores = existingCfg.Ignore
+		} else {
+			ignores = config.DefaultIgnores
+		}
+	}
+
+	userInputExtensions, extensionsModified := promptStringList(reader, "Enter custom file extensions to ignore (comma-separated)", customExtensions)
+	var ignoreExtensions []string
+	if extensionsModified {
+		if len(userInputExtensions) > 0 {
+			ignoreExtensions = config.MergeAndDeduplicate(config.DefaultIgnoredExtensions, userInputExtensions)
+		} else {
+			ignoreExtensions = []string{}
+		}
+	} else {
+		if existingCfg != nil {
+			ignoreExtensions = existingCfg.IgnoreExtensions
+		} else {
+			ignoreExtensions = config.DefaultIgnoredExtensions
+		}
+	}
 
 	existingDocsDir := "wiki"
 	if existingCfg != nil && existingCfg.DocsDir != "" {
@@ -108,7 +137,7 @@ func RunSetupFlow(repoRoot string) error {
 	return nil
 }
 
-func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) []string {
+func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) ([]string, bool) {
 	var result []string
 	existingStr := ""
 	if len(existingList) > 0 {
@@ -124,17 +153,17 @@ func promptStringList(reader *bufio.Reader, promptMsg string, existingList []str
 	input, err := reader.ReadString('\n')
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nWarning: error reading input (%v), keeping existing values.\n", err)
-		return existingList
+		return existingList, false
 	}
 
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return existingList
+		return existingList, false
 	}
 
 	lowerInput := strings.ToLower(input)
 	if lowerInput == "clear" || lowerInput == "none" {
-		return []string{}
+		return []string{}, true
 	}
 
 	parts := strings.Split(input, ",")
@@ -145,7 +174,7 @@ func promptStringList(reader *bufio.Reader, promptMsg string, existingList []str
 		}
 	}
 	
-	return result
+	return result, true
 }
 
 func promptString(reader *bufio.Reader, promptMsg, existingVal string) string {
@@ -160,4 +189,18 @@ func promptString(reader *bufio.Reader, promptMsg, existingVal string) string {
 		return existingVal
 	}
 	return input
+}
+
+func subtractSlice[T comparable](a, b []T) []T {
+	bMap := make(map[T]bool)
+	for _, item := range b {
+		bMap[item] = true
+	}
+	var result []T
+	for _, item := range a {
+		if !bMap[item] {
+			result = append(result, item)
+		}
+	}
+	return result
 }
