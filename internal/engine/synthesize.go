@@ -13,7 +13,7 @@ import (
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
-func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, cfg *config.Config, cache *MetadataCache, affectedDirs map[string]bool, logEvent func(string, string)) (string, error) {
+func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, cfg *config.Config, cache *MetadataCache, affectedDirs map[string]bool, precalculatedHashes map[string]string, logEvent func(string, string)) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -33,7 +33,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	childSummaries := make(map[string]string)
 	for _, name := range childNames {
 		child := node.Children[name]
-		sum, err := synthesizeNode(ctx, c, child, repoRoot, cfg, cache, affectedDirs, logEvent)
+		sum, err := synthesizeNode(ctx, c, child, repoRoot, cfg, cache, affectedDirs, precalculatedHashes, logEvent)
 		if err != nil {
 			return "", err
 		}
@@ -47,26 +47,51 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	// Calculate a 100% dynamic file truncation limit based purely on the context size.
 	// Assuming ~4 characters per token, we allocate 75% of the total context window 
 	// for the file content, proportionally reserving the remaining 25% for prompts and output.
-	fileLimit := int(float64(c.NumCtx * 4) * 0.75)
+	numCtx := c.NumCtx
+	if numCtx < 512 {
+		numCtx = 512
+	}
+	fileLimit := int(float64(numCtx * 4) * 0.75)
 
 	for _, f := range node.Files {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
 
-		contentBytes, err := tools.ReadFileSafely(repoRoot, f)
-		if err != nil {
-			continue // Skip if file can't be read
+		var fileHash string
+		var ok bool
+		if precalculatedHashes != nil {
+			fileHash, ok = precalculatedHashes[f]
 		}
-		
-		hashSum := sha256.Sum256(contentBytes)
-		fileHash := hex.EncodeToString(hashSum[:])
 
+		var contentBytes []byte
+		var err error
+
+		// Check cache hit using precalculated hash without reading file
 		var facts string
 		cachedEntry, exists := cache.Files[f]
-		if exists && cachedEntry.SHA256 == fileHash {
+		if ok && exists && cachedEntry.SHA256 == fileHash {
 			facts = cachedEntry.Facts
 		} else {
+			// Read file only on cache miss
+			contentBytes, err = tools.ReadFileSafely(repoRoot, f)
+			if err != nil {
+				logEvent("status", fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
+				continue
+			}
+
+			if !ok {
+				hashSum := sha256.Sum256(contentBytes)
+				fileHash = hex.EncodeToString(hashSum[:])
+				
+				// Re-check cache in case hash was not precalculated but exists in cache
+				if exists && cachedEntry.SHA256 == fileHash {
+					facts = cachedEntry.Facts
+				}
+			}
+		}
+
+		if facts == "" {
 			contentStr := string(contentBytes)
 			overlap := 800
 			if overlap > fileLimit/4 {

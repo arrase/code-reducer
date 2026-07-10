@@ -5,39 +5,92 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const LockFileName = ".code-reducer.lock"
 
 // SafeResolve cleans the input path and ensures it lies strictly inside the repository.
+// It resolves symlinks on the existing ancestor parts to prevent path traversal via symlinks.
 func SafeResolve(repoRoot, inputPath string) (string, error) {
 	absRoot, err := filepath.Abs(repoRoot)
 	if err != nil {
 		return "", fmt.Errorf("failed to get absolute root path: %w", err)
 	}
+	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve symlinks for root path: %w", err)
+	}
 
-	resolved := filepath.Clean(filepath.Join(absRoot, inputPath))
-	rel, err := filepath.Rel(absRoot, resolved)
+	target := filepath.Clean(filepath.Join(resolvedRoot, inputPath))
+	current := target
+	var nonExistentSuffix []string
+
+	// Find the closest physically existing ancestor
+	for {
+		_, err := os.Lstat(current)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("failed to stat path component: %w", err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		nonExistentSuffix = append([]string{filepath.Base(current)}, nonExistentSuffix...)
+		current = parent
+	}
+
+	// Evaluate symlinks on the existing ancestor path
+	resolvedAncestor, err := filepath.EvalSymlinks(current)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve symlinks for ancestor path: %w", err)
+	}
+
+	// Rebuild the resolved full path
+	resolvedPath := resolvedAncestor
+	if len(nonExistentSuffix) > 0 {
+		resolvedPath = filepath.Join(append([]string{resolvedAncestor}, nonExistentSuffix...)...)
+	}
+	resolvedPath = filepath.Clean(resolvedPath)
+
+	// Verify that resolvedPath is inside resolvedRoot
+	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return "", fmt.Errorf("security violation: path traversal detected: %q", inputPath)
 	}
 
-	return resolved, nil
+	return resolvedPath, nil
 }
 
 type SimpleLock struct {
 	lockPath string
 	file     *os.File
+	mu       sync.Mutex
+	closed   bool
 }
 
 // Unlock releases the lock by closing the file and removing it.
+// It is idempotent and thread-safe.
 func (l *SimpleLock) Unlock() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+
 	var err error
 	if l.file != nil {
 		err = l.file.Close()
+		l.file = nil
 	}
-	if removeErr := os.Remove(l.lockPath); removeErr != nil && err == nil {
-		err = removeErr
+	if removeErr := os.Remove(l.lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		if err == nil {
+			err = removeErr
+		}
 	}
 	return err
 }

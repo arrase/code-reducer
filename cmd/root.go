@@ -25,6 +25,8 @@ var RootCmd = &cobra.Command{
 	Short:             "Code-Reducer is a documentation agent that writes and maintains a project wiki.",
 	Long:              `A pure Go port of Code-Reducer CLI, optimized for performance and local LLM execution.`,
 	CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+	SilenceUsage:      true,
+	SilenceErrors:     true,
 }
 
 func init() {
@@ -32,16 +34,14 @@ func init() {
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
 }
 
-func executeCommand(mode string) {
+func executeCommand(mode string) error {
 	repoRoot, err := os.Getwd()
 	if err != nil {
-		fmt.Printf("Error getting current working directory: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to get current working directory: %w", err)
 	}
 
 	if err := tools.VerifyGitRepo(repoRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	needsSetup := !config.ConfigExists(repoRoot)
@@ -49,29 +49,31 @@ func executeCommand(mode string) {
 
 	if needsSetup {
 		if !isTTY {
-			fmt.Printf("Error: Configuration file %s does not exist in the current directory. Please run 'code-reducer setup' to configure the application.\n", config.ConfigFileName)
-			os.Exit(1)
+			return fmt.Errorf("configuration file %s does not exist in the current directory. Please run 'code-reducer setup' to configure the application", config.ConfigFileName)
 		}
 
 		// Run implicit setup flow
-		RunSetupFlow(repoRoot)
+		if err := RunSetupFlow(repoRoot); err != nil {
+			return err
+		}
 	}
 
 	// Resolve the merged configuration
-	cfg := config.ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)
+	cfg, err := config.ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)
+	if err != nil {
+		return err
+	}
 
 	// Command flow checks
-	lastSHA, hasInit := engine.GetLastDocumentedCommit(repoRoot, cfg.DocsDir)
+	hasInit := engine.IsInitialized(repoRoot, cfg.DocsDir)
 
 	if mode == "init" {
 		if hasInit {
-			fmt.Fprintf(os.Stderr, "Error: The project has already been initialized (last documented commit: %s). Please use 'code-reducer update' to refresh documentation.\n", lastSHA)
-			os.Exit(1)
+			return fmt.Errorf("the project has already been initialized. Please use 'code-reducer update' to refresh documentation")
 		}
 	} else if mode == "update" {
 		if !hasInit {
-			fmt.Fprintf(os.Stderr, "Error: The project has not been initialized yet. Please run 'code-reducer init' first.\n")
-			os.Exit(1)
+			return fmt.Errorf("the project has not been initialized yet. Please run 'code-reducer init' first")
 		}
 	}
 
@@ -90,7 +92,8 @@ func executeCommand(mode string) {
 	})
 
 	if err != nil {
-		fmt.Printf("Documentation Run Failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("documentation run failed: %w", err)
 	}
+
+	return nil
 }
