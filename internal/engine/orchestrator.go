@@ -61,7 +61,6 @@ func setupPipeline(repoRoot string, cfg *config.Config, logEvent func(string, st
 }
 
 func teardownPipeline(repoRoot, docsDir string, cache *MetadataCache, logEvent func(string, string), successMsg string) {
-	cache.LastDocumentedCommit = "local"
 	if err := saveMetadataCache(repoRoot, docsDir, cache); err != nil {
 		logEvent("status", fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
 	}
@@ -84,6 +83,14 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 		return err
 	}
 
+	precalculatedHashes := make(map[string]string)
+	for _, f := range codeFiles {
+		hash, err := computeSHA256(repoRoot, f)
+		if err == nil {
+			precalculatedHashes[f] = hash
+		}
+	}
+
 	tree := buildTree(codeFiles)
 	modulesDir := filepath.Join(repoRoot, docsDir, "modules")
 	if err := os.MkdirAll(modulesDir, 0755); err != nil {
@@ -102,7 +109,7 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 	}
 	markAllAffected(tree)
 
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, logEvent)
+	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, precalculatedHashes, logEvent)
 	if err != nil {
 		return err
 	}
@@ -126,7 +133,9 @@ Before making changes, analyze these files to align with existing design choices
 
 	agentFileBytes, err := tools.ReadFileSafely(repoRoot, agentFilePath)
 	if err != nil {
-		_ = tools.WriteFileSafely(repoRoot, agentFilePath, []byte(agentGuidelines))
+		if err := tools.WriteFileSafely(repoRoot, agentFilePath, []byte(agentGuidelines)); err != nil {
+			return fmt.Errorf("failed to write AGENTS.md: %w", err)
+		}
 	} else {
 		content := string(agentFileBytes)
 		if !strings.Contains(content, "AI Agent Guidelines") {
@@ -137,7 +146,9 @@ Before making changes, analyze these files to align with existing design choices
 				separator = "\n"
 			}
 			newContent := content + separator + agentGuidelines
-			_ = tools.WriteFileSafely(repoRoot, agentFilePath, []byte(newContent))
+			if err := tools.WriteFileSafely(repoRoot, agentFilePath, []byte(newContent)); err != nil {
+				return fmt.Errorf("failed to append to AGENTS.md: %w", err)
+			}
 		}
 	}
 
@@ -196,16 +207,6 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 
 	affectedDirs := make(map[string]bool)
-	for _, change := range filteredChanges {
-		curr := filepath.Dir(change.Path)
-		for {
-			affectedDirs[curr] = true
-			if curr == "." || curr == "" {
-				break
-			}
-			curr = filepath.Dir(curr)
-		}
-	}
 
 	tree := buildTree(allowedCodeFiles)
 
@@ -248,7 +249,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 
 	logEvent("status", fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, logEvent)
+	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, currentFilesMap, logEvent)
 	if err != nil {
 		return err
 	}

@@ -15,6 +15,7 @@ const (
 	OllamaNumCtxEnvKey       = "OLLAMA_NUM_CTX"
 
 	OllamaDefaultBaseURL = "http://localhost:11434"
+	OllamaDefaultModelID = "ornith:9b"
 	OllamaDefaultNumCtx  = 8192
 	ConfigFileName       = ".code-reducer.yaml"
 )
@@ -147,9 +148,12 @@ func MergeAndDeduplicate[T comparable](a, b []T) []T {
 
 // ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
 // It returns a fully resolved Config struct ready to be used by the pipeline runner and LLM client.
-func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
+func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) (*Config, error) {
 	cfg, err := LoadConfig(repoRoot)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to load configuration file: %w", err)
+		}
 		cfg = &Config{}
 	}
 
@@ -172,7 +176,7 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 	}
 
 	// 1. Resolve Model ID: Default > YAML > Env > Flag
-	resolved.ModelID = "ornith:9b"
+	resolved.ModelID = OllamaDefaultModelID
 	if cfg.ModelID != "" {
 		resolved.ModelID = cfg.ModelID
 	}
@@ -214,5 +218,5 @@ func ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) *Config {
 		resolved.DocsDir = cfg.DocsDir
 	}
 
-	return resolved
+	return resolved, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 func reduceInChunks(ctx context.Context, c *LLMClient, nodePath string, items []string, logEvent func(string, string)) (string, error) {
@@ -44,8 +45,9 @@ func reduceFileFacts(ctx context.Context, c *LLMClient, filePath string, stepNam
 
 func reduceItems(items []string, maxChars int, reduceFn func(batch []string) (string, error)) (string, error) {
 	// If there is exactly one item and it exceeds the max allowed character limit, truncate it.
-	if len(items) == 1 && len([]rune(items[0])) > maxChars {
-		items[0] = string([]rune(items[0])[:maxChars]) + "\n...[truncated]"
+	if len(items) == 1 && utf8.RuneCountInString(items[0]) > maxChars {
+		runes := []rune(items[0])
+		items[0] = string(runes[:maxChars]) + "\n...[truncated]"
 	}
 
 	var batches [][]string
@@ -71,8 +73,8 @@ func reduceItems(items []string, maxChars int, reduceFn func(batch []string) (st
 		allowedPerItem := maxChars / len(items)
 		var truncatedItems []string
 		for _, item := range items {
-			runes := []rune(item)
-			if len(runes) > allowedPerItem {
+			if utf8.RuneCountInString(item) > allowedPerItem {
+				runes := []rune(item)
 				truncatedItems = append(truncatedItems, string(runes[:allowedPerItem])+"\n...[truncated]")
 			} else {
 				truncatedItems = append(truncatedItems, item)
@@ -99,11 +101,20 @@ func reduceItems(items []string, maxChars int, reduceFn func(batch []string) (st
 // chunkTextWithOverlap splits text into chunks of maxRunes length, with overlapRunes of overlap between adjacent chunks.
 func chunkTextWithOverlap(text string, maxRunes int, overlapRunes int) []string {
 	runes := []rune(text)
+	if maxRunes <= 0 {
+		return []string{text}
+	}
+	if overlapRunes >= maxRunes {
+		overlapRunes = maxRunes / 2
+	}
 	if len(runes) <= maxRunes {
 		return []string{text}
 	}
 	var chunks []string
 	step := maxRunes - overlapRunes
+	if step <= 0 {
+		return []string{text}
+	}
 	for i := 0; i < len(runes); i += step {
 		end := i + maxRunes
 		if end > len(runes) {

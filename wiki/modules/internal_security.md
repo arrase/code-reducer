@@ -1,88 +1,137 @@
-# `internal/security` Module Architecture
+# `internal/security` — Package Documentation
 
-## Responsibility
+## Module Responsibility & Data Flow
 
-This package provides path-traversal prevention, cross-process coordination via file-based locking, and `.gitignore` hygiene for the lock artifact. It operates on a single repository root; no global or package-level mutable state exists. All external I/O is filesystem-bound.
+The `security` package encapsulates three orthogonal concerns for code-reducer processes: **sandbox enforcement** (preventing path traversal beyond the repository boundary), **process-level mutual exclusion** via file-based locks, and **operational hygiene** (keeping lock state out of version control). No networking, database access, or external process communication occurs within this package.
 
----
+All functions are pure-Go with no global mutable state. Every observable side effect is local to a single `*SimpleLock` receiver instance or the calling goroutine's stack. Errors follow a strict wrapping convention: security-critical violations and actionable sentinel messages return unwrapped plain strings; standard-library errors use `%w`; best-effort cleanup paths swallow non-fatal I/O failures silently.
 
-## Constants & Types
+**Data flow** proceeds in two independent tracks that share no state except through the repository root path string:
 
-### `LockFileName`
-```go
-const LockFileName = ".code-reducer.lock"
-```
-
-Exported string constant identifying the lockfile artifact. Referenced by both `AcquireLock` and `EnsureGitignoreHasLockfile`.
-
-### `SimpleLock`
-```go
-type SimpleLock struct {
-    lockPath string
-    file     *os.File
-}
-```
-
-Per-instance value used only as the return from `AcquireLock`. Fields are private. Allocation is local to each call; no sharing across goroutines or process invocations.
+1. **Path resolution track:** `SafeResolve` → called by `AcquireLock` to canonicalize the lock file location before attempting acquisition.
+2. **Lock lifecycle track:** `AcquireLock` → returns a `*SimpleLock` receiver → caller uses it for work → calls `Unlock()` for release → `EnsureGitignoreHasLockfile` runs during cleanup to append the lock filename to `.gitignore`.
 
 ---
 
-## Data Flow: Lock Lifecycle
+## Public API Surface
 
-`AcquireLock` → `SimpleLock.Unlock()` forms a linear lifecycle. `Unlock` closes the underlying handle and removes the file via `os.Remove`. The order is close-then-remove, which aligns with POSIX semantics (close invalidates the handle). No coordination exists for concurrent callers holding locks; if another process expects to observe a successful write before removal, there is no synchronization primitive governing that path.
+### Types
+
+#### `SimpleLock`
+
+File-based process lock with internal mutex protection. The struct is constructed by `AcquireLock`; once acquired, `lockPath` and `file` are set exactly once under mutex scope, then only modified during `Unlock()`.
+
+| Field | Type | Semantics |
+|-------|------|-----------|
+| `lockPath` | `string` | Absolute path to the `.code-reducer.lock` file. Set in constructor; zero-valued if acquisition failed or was never called. |
+| `file` | `*os.File` | Opened lock file handle. Acquired with `O_CREATE\|O_EXCL`; set to `nil` inside `Unlock()`. |
+| `mu` | `sync.Mutex` | Per-instance mutex protecting `closed` and the pointer-clear of `file` during unlock. |
+| `closed` | `bool` | Transition flag: `false` while locked, flips to `true` once `Unlock()` completes its write operations (under mutex). |
+
+#### Functions
+
+##### `SafeResolve(repoRoot, inputPath string) (string, error)`
+
+Computes the absolute path of an input relative to a repository root. The resolution is symlink-aware: ancestor components are evaluated through their physical targets via `filepath.EvalSymlinks` before being walked upward until one succeeds. The final result must lie strictly inside the resolved root—any escape beyond it returns an unwrapped string error indicating a security violation.
+
+##### `AcquireLock(repoRoot string) (*SimpleLock, error)`
+
+Resolves the lock file path through `SafeResolve`, then attempts atomic creation with `O_CREATE\|O_EXCL`. On success, writes the process PID to the newly created file and returns a populated `*SimpleLock`. If the file already exists (anewer process holds it), returns an unwrapped sentinel string describing that another process has acquired the lock.
+
+##### `EnsureGitignoreHasLockfile(repoRoot string) error`
+
+Reads `.gitignore`; if present, appends `# Code-Reducer Lockfile\n.code-reducer.lock\n` only when not already contained in the file. If `.gitignore` does not exist, creates it with append semantics (`O_APPEND\|O_CREATE\|O_WRONLY`). Errors from reading or writing are wrapped; non-existence of `.gitignore` is treated as expected and returned as `nil`.
+
+#### Methods
+
+##### `(l *SimpleLock).Unlock() error`
+
+Idempotent release: acquires the internal mutex, closes the file handle (discarding any close-error), removes the lock file from disk via best-effort `os.Remove`, sets `closed = true`, then releases the mutex. A second call is safe and returns `nil`. Swallowed errors for cleanup operations are discarded; removal failures that occur after a successful close surface as wrapped errors only in the specific narrow case where both close-succeeded-and-remove-failed—but this path effectively swallows non-`IsNotExist` remove errors in practice.
 
 ---
 
-## Path Resolution: `SafeResolve`
+## Business Rules & Domain Concepts
 
-Canonicalizes `repoRoot` and `inputPath` into absolute form via `filepath.Abs`, then computes the relative offset from root. If the relative prefix begins with `..`, returns `"security violation: path traversal detected: %q"`. Otherwise returns the cleaned absolute path. Wraps any `filepath.Abs` error with context `"failed to get absolute root path: %w"`.
+### Repository Boundary Enforcement
 
----
+All internal paths must resolve strictly within `repoRoot`. Any resolution that escapes beyond it returns a standalone string error: `"security violation: path traversal detected: %q"`, never wrapped. This is the one unwrapped class of non-sentinel errors in the package—security-critical, so callers detect it via exact match or `strings.Contains` rather than type assertion.
 
-## Lock Acquisition & Release: `AcquireLock` / `SimpleLock.Unlock()`
+### Symlink-Aware Path Resolution
 
-Opens `.code-reducer.lock` in repoRoot using O_EXCL semantics; on success, writes the current process PID via `fmt.Sprintf("%d\n", os.Getpid())`. Atomic creation via O_EXCL ensures that if an existing lock is detected at acquire time, surfaces a descriptive error suggesting manual cleanup of a stale lockfile rather than silently failing.
+Ancestors are evaluated through their physical targets before path reconstruction. This prevents traversal attacks that use symlinked directories to bypass the sandbox while preserving logical input structure for legitimate uses. Implementation: `filepath.EvalSymlinks(absRoot)` resolves the root once; subsequent ancestor walks use `os.Lstat` with a fallback to `EvalSymlinks` on each component until one exists, then rebuild upward from that point.
 
-**Unlock**: Closes the open handle (if non-nil) and deletes the file from disk. Returns last non-nil error between close and remove — priority given to whichever operation fails; if close already failed, remove errors are not re-surfaced unless close succeeded first.
+### Process-Level File Locking
 
----
+The lock file is `.code-reducer.lock`. Acquisition uses `O_EXCL` for atomic creation—no two processes can hold the lock simultaneously on the same filesystem. On success, the PID of the acquiring process is written as a single-line string (`fmt.Sprintf("%d\n", os.Getpid())`). The lockfile content therefore serves as both a record and a mechanism for stale detection: if another process exits without releasing its lock, a new acquisition attempt detects the existing file and reports an actionable error instructing manual cleanup.
 
-## Git Hygiene: `EnsureGitignoreHasLockfile`
+### Stale Lock Detection
 
-Reads `.gitignore` via `os.ReadFile`, tolerating absence. Scans every line for one matching the lock filename. If found, returns success without modification. Otherwise appends a dedicated comment line and the lock filename in append-create mode (`O_APPEND|O_CREATE|O_WRONLY`), preserving pre-existing contents.
+Intentional behavior—the system does not attempt to detect or kill the holding process. The caller receives an unwrapped string describing that the lock is held by another process and must clean up manually. This keeps the package non-invasive; it never interacts with external processes.
 
----
+### Automated Gitignore Integration
 
-## Concurrency Model
-
-No Go concurrency primitives (mutexes, channels) exist within this package. Cross-process coordination relies exclusively on OS file semantics via O_EXCL creation. No in-memory mutable state protected by any mutex or channel exists. Each `AcquireLock` call allocates a new `SimpleLock`; fields are not shared across goroutines or process invocations.
+The lockfile path is appended to `.gitignore` during unlock so it does not enter version control. Idempotent: if a line containing `code-reducer.lock` already exists, no duplicate entry is written. The lock filename itself is the only thing tracked; comment prefix provides human readability without affecting git behavior.
 
 ---
 
-## Side Effects Summary
+## Mutable State & Concurrency Analysis
 
-| Function | I/O Target | Action |
-|----------|-----------|--------|
-| **SafeResolve** | Local filesystem (repo root) | Reads `filepath.Abs` to resolve absolute path. No writes. |
-| **AcquireLock** | `.code-reducer.lock` in repoRoot | Creates file with O_EXCL, writes PID (`fmt.Sprintf("%d\n", os.Getpid())`). Atomic creation via O_EXCL. |
-| **SimpleLock.Unlock()** | `.code-reducer.lock` in repoRoot | Calls `os.Remove(l.lockPath)` — deletes the lockfile on disk. Does NOT close `f` (caller's responsibility). |
-| **EnsureGitignoreHasLockfile** | `.gitignore` in repoRoot | Reads via `os.ReadFile`. If file missing (`IsNotExist`), skips read path. Appends `# Code-Reducer Lockfile\n.code-reducer.lock\n` if lockfile not already listed. Uses O_APPEND\|O_CREATE\|O_WRONLY. Writes with `f.WriteString`. |
+### Per-Instance State
+
+| Field | Mutated By | Notes |
+|-------|-----------|--------|
+| `lockPath` | Constructor (`AcquireLock`) | Set exactly once. Zero value if acquisition failed or never called. Not mutated after construction. |
+| `file` (*os.File) | Constructor, then `Unlock()` | Pointer cleared inside the mutex during unlock so subsequent reads yield nil. |
+| `mu` (sync.Mutex) | All methods on receiver | Acquired/released by every method; not modified as a value. |
+| `closed` (bool) | `Unlock()` only | Flips from `false` → `true` under mutex. Once written, stays true for the lifetime of the receiver. |
+
+### Concurrency Protection
+
+The `sync.Mutex` protects all writes to `l.closed` and the pointer-clear of `l.file` inside `Unlock()`. No other concurrent access paths touch these fields in this file—`AcquireLock` constructs a new instance, so no shared writer exists for an already-acquired lock. The mutex serializes unlock calls on a single receiver only; it is not a global contention point across processes.
+
+---
+
+## Side Effects & I/O Communication
+
+### Filesystem Operations by Function
+
+| Function | Reads | Writes | Deletes/Atomic | Notes |
+|----------|-------|--------|----------------|--------|
+| `SafeResolve` | `os.Lstat`, `filepath.EvalSymlinks` (metadata only) | None | None | Walks ancestors upward until one exists; no data read/written. |
+| `AcquireLock` | None | `O_CREATE\|O_EXCL` + PID bytes via `fmt.Sprintf("%d\n", os.Getpid())` | None | Atomic creation on success; cleans up file handle and removes partial state if PID write fails before returning error. |
+| `SimpleLock.Unlock()` | None | `l.file.Close()` (flushes buffer) | `os.Remove(l.lockPath)` — best-effort, non-blocking | Idempotent. Swallowed close errors; remove failures are discarded unless they occur after a successful close and removal itself fails. |
+| `EnsureGitignoreHasLockfile` | `os.ReadFile(gitignorePath)` | Append-mode open + write string | None | Creates `.gitignore` if absent (append semantics). Appends only when lock filename is not already present. |
+
+### Network / External Process
+
+None. The package performs no HTTP, gRPC, socket, or IPC operations. No external process interaction beyond reading/writing files within the repository boundary.
 
 ---
 
 ## Error Handling Patterns
 
-| Function | Strategy |
-|----------|----------|
-| **SafeResolve** | Wraps `filepath.Abs` error with context `"failed to get absolute root path: %w"`. Separately detects traversal via `strings.HasPrefix(rel, "..")` and returns a sentinel-style message (`"security violation: path traversal detected: %q"`). |
-| **AcquireLock** | On O_EXCL failure, checks `os.IsExist(err)` first. If true → descriptive error telling user the lock is held by another process, suggesting manual deletion of stale locks. Otherwise wraps raw OS error with `%w`. |
-| **SimpleLock.Unlock()** | Returns last non-nil error (close or remove). Priority: if close fails AND remove succeeds, returns close error. If close succeeds AND remove fails, returns remove error. Uses `&& err == nil` guard to avoid masking remove errors when close already failed — though this logic is inverted in practice (it returns the first non-nil, then overrides only if previous was nil). |
-| **EnsureGitignoreHasLockfile** | On read: treats `IsNotExist` as success (silently skips). Wraps other read errors with context. On write: returns wrapped error if append fails. No panic paths — all OS errors are returned to caller. |
+### Sentinel Errors (Unwrapped)
 
----
+| Condition | Returned Value | Rationale |
+|-----------|---------------|-----------|
+| Lock held by another process | `"lock at %s is already held by another process..."` | Actionable message; caller needs exact match or substring search. |
+| Path traversal detected | `"security violation: path traversal detected: %q"` | Security-critical; never wrapped for unambiguous detection. |
 
-## Observations
+### Wrapped Errors (Standard Library)
 
-- All external I/O is filesystem-only. No network, no DB, no stdin/stdout writes beyond `fmt.Sprintf`.
-- Errors are never panicked; all surfaced as `(result, error)` tuples except `EnsureGitignoreHasLockfile` which returns only an error.
-- `SimpleLock.Unlock()` does NOT close the file before removing — this may be intentional (close truncates), but if another caller holds the lock and expects to see a successful write completion before removal, there is no coordination.
+| Condition | Wrapping Strategy | Notes |
+|-----------|------------------|--------|
+| `filepath.Abs` fails | `%w` | Root is not absolute—caller should handle gracefully. |
+| `filepath.EvalSymlinks` on root fails | `%w` | Symlink resolution failure for the repository boundary itself. |
+| `os.Lstat` returns non-nil, non-IsNotExist error | `%w` | Unexpected stat error on an ancestor component. |
+| `EvalSymlinks` on ancestor fails | `%w` | Ancestor symlink resolution failure during upward walk. |
+| `.gitignore` read (not IsNotExist) | `%w` | Read of existing gitignore encounters unexpected I/O error. |
+| Append/open for `.gitignore` fails | `%w` | File open or write failure for the ignore file. |
+
+### Swallowed Errors (Best-Effort Cleanup)
+
+If `l.file.Close()` inside `Unlock()` returns an error, it is replaced with `nil` and cleanup proceeds unconditionally. If `os.Remove(l.lockPath)` fails after a successful close, the remove-error is discarded unless both close-succeeded-and-remove-failed—but this narrow path effectively swallows non-`IsNotExist` errors in practice. The lockfile removal happens regardless; any failure that isn't `IsNotExist` is preserved in a local variable but only surfaces when close succeeded and remove failed—which is treated as swallowed behavior: best-effort cleanup.
+
+### Lock Acquisition Failure Cleanup
+
+In `AcquireLock`, if writing the PID to the newly created file fails, the function calls `f.Close()` then `os.Remove(lockPath)` before returning an error. The file handle and lockfile are cleaned up so no stale partial state remains on disk; the returned error is wrapped with `%w` for context.

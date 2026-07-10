@@ -1,134 +1,189 @@
-# Quickstart — Code-Reducer Architecture
+# quickstart.md
 
-> Dense, developer-facing reference for understanding system boundaries and module interaction. Not a tutorial. Skip if you already know how to invoke `code-reducer init|update`.
-
----
-
-## System Boundary: What Code-Reducer Owns
-
-Code-Reducer is a CLI-driven documentation generator that extracts architectural facts from source files and synthesizes them into Markdown via LLM calls. The system boundary is the repository root (`repoRoot`) — everything outside it (network, other repos, user home) is not part of this system's responsibility.
-
-The system operates in two modes: **`init`** (full rebuild) and **`update`** (incremental). State between invocations persists through a JSON-backed metadata cache at `{docsDir}/.metadata.json`.
+> Last updated: 2026-05-18  
+> Maintained by: Code-Reducer agent (auto-generated)
 
 ---
 
-## Module Interaction Map
+## What is Code-Reducer?
 
-```
-main.go ──► cmd/ (Cobra CLI surface, pre-flight validation, mode routing)
-          │
-          ▼
-    internal/config ──► ResolveConfig() returns *Config
-                          │
-                          ▼
-    internal/engine ──► Runner.Run(callback) ──► orchestrator.go
-                          ├──► tree.go (DirNode + change detection)
-                          ├──► synthesize.go (per-file extraction → chunking → synthesis)
-                          ├──► cache.go (persistent hash/facts/store)
-                          └──► client.go (LLM interaction layer)
-                          │
-                          ▼
-    internal/security ──► SimpleLock, SafeResolve (path-traversal prevention)
-                          │
-                          ▼
-    internal/tools ──► ReadFileSafely, WriteFileSafely, VerifyGitRepo, RunGit
+Code-Reducer is a terminal-based documentation-generation tool for Go projects. It produces and maintains technical wikis — `architecture.md`, `quickstart.md`, per-module API summaries under `modules/` — from your source code by invoking an Ollama-compatible LLM endpoint.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- **Go 1.21+** (standard library only)
+- An **Ollama-compatible** local LLM server running and reachable at the configured base URL
+- A working terminal (TTY required for interactive setup; non-TTY requires manual config persistence)
+
+### First Run — Interactive Setup
+
+```bash
+cd <your-go-project>
+code-reducer setup
 ```
 
-**Interaction rules:**
+This prompts you for:
 
-| Source Module | Target Module | Mechanism | Notes |
-|---|---|---|---|
-| `cmd/` | `internal/config` | calls `ConfigExists`, `LoadConfig`, `SaveConfig`, `ResolveConfig` | Config is resolved at runtime, not on init. CLI flags > env vars > YAML file > hardcoded defaults. |
-| `cmd/` | `internal/engine` | `engine.NewRunner().Run(callback)` after validation passes | Engine owns the pipeline; cmd only registers commands and validates pre-flight conditions. |
-| `internal/engine` | `internal/security` | `security.AcquireLock(repoRoot)`, `SafeResolve` | Lock acquired before any work begins; path resolution used for all file I/O to prevent traversal. |
-| `internal/engine` | `internal/tools` | `tools.ReadFileSafely`, `tools.WriteFileSafely`, `tools.VerifyGitRepo`, `tools.RunGit` | All safe filesystem operations go through tools. Git process execution uses `RunGit`. |
-| `internal/config` | `internal/security` | None direct | Config module is self-contained for its own I/O. |
-
----
-
-## Entry Points & Lifecycle
-
-### Init Flow (first-time documentation generation)
-
-1. **`cmd/init.go:Run`** → calls `executeCommand("init")`
-2. **Pre-flight validation in `root.go`:** cwd exists, git repo valid, config file present (or `code-reducer setup` invoked), mode routing checks pass
-3. **`security.AcquireLock(repoRoot)`** — exclusive lock acquired; failure is fatal and short-circuits everything downstream
-4. **`engine.NewRunner().Run(callback)`** with mode `"init"`:
-   - Builds full DirNode tree from flat file paths
-   - Synthesizes every directory bottom-up via `synthesizeNode`
-   - Generates global docs (`architecture.md`, `quickstart.md`) only if at least one module's root dir was affected or files are missing
-   - Writes `AGENTS.md` with idempotent append logic
-
-### Update Flow (incremental refresh)
-
-1. **`cmd/update.go:Run`** → calls `executeCommand("update")`
-2. Same pre-flight validation as init, plus check that project is already initialized
-3. **`engine.Runner.Run(callback)`** with mode `"update"`:
-   - Change detection via SHA-256 comparison against cached map (`cache.Files`)
-   - Affected directories marked top-down; propagation bottom-up so parents inherit affected status from children
-   - Only re-synthesizes paths whose subtree has at least one source of impact
-   - Cache pruning for deleted files
-
-### Setup Flow (non-interactive alternative)
-
-**`cmd/setup.go:RunSetupFlow(repoRoot)`** — sole exported identifier. Reads existing config, prompts user in sequence (model ID, Ollama URL, context size, ignore paths/extensions, docs dir), validates input, persists via `config.SaveConfig`. Swallows load errors; write failures exit with message.
-
----
-
-## Configuration Resolution Rules
-
-The effective configuration merges three sources at runtime: persisted `.code-reducer.yaml`, CLI flags (`--model-id`, `--num-ctx`), and built-in defaults. Priority order is hardcoded defaults < YAML file values < environment variables < CLI flags. Empty string/zero values do not override; only non-empty takes precedence, except model ID where explicit empty is treated as "not set" to allow fallback through the chain.
-
-Config files are stored with Unix permission mode `0600`. Lockfile entry appended to `.gitignore` via O_APPEND|O_CREATE semantics.
-
----
-
-## LLM Interaction Layer
-
-The engine talks to Ollama-style endpoints through `*LLMClient` in `internal/engine/client.go`. Constructed once per run, reused for every call in that run's lifetime. HTTP client carries a fixed 10-minute timeout; no way to swap after construction.
-
-**Synchronous path — `CallLLM`:** sends complete request, blocks until full response arrives. Non-OK status codes consume up to 1024 bytes and return as `"ollama api error: status %d, response: %s"`.
-
-**Streaming path — `StreamLLM`:** opens streaming connection; each decoded chunk forwarded to injected callback. Empty lines skipped; malformed JSON silently ignored per line. Iteration stops when `chunk.Done == true` or `io.EOF` arrives.
-
-Every call prepends a base system prompt that defines the agent persona and defensive output rules. Task-specific framing appended for `"module_synthesis"` and `"architecture"`.
-
----
-
-## Chunking & Reduction Pipeline (Unexported Engine Logic)
-
-All synthesis logic lives unexported inside `engine` as `synthesizeNode`: recursion anchor where every directory-level summary is produced by calling this function on each child first, then assembling their summaries plus per-file facts into a final parent summary.
-
-**Per-file processing:** read bytes safely (skip silently if unreadable), compute SHA-256 via `tools.ReadFileSafely`, check cache for hash match to reuse stored facts without re-prompting. If no cache hit, text is chunked with overlap and every extraction step runs across all chunks; results consolidated into one fact per step via `reduceFileFacts`.
-
-**Component assembly:** builds a slice containing one entry per file (prefixed with filename) plus one entry per child summary (prefixed with `"Subsystem"`). If no components exist, the module cache is cleared and an empty string returned. Otherwise merged into single final summary via recursive reduction until only one string remains.
-
-**Infinite-loop guard:** if every item ends up in its own batch and more than one item exists, function silently truncates each proportionally to `maxChars / len(items)` and forces them into a single batch — no error returned.
-
----
-
-## Concurrency & Safety Observations
-
-No file in any module uses `sync.Mutex`, channels, atomic operations, or equivalent concurrency primitives anywhere except within internal types not visible here. All state mutations occur on a single goroutine's call stack during recursion (`synthesizeNode`). The metadata cache is read/written without locking — race conditions exist but no protection mechanism is present.
-
-No panics: every function returns `(value, error)` or equivalent; no `panic`, `runtime.Goexit()`, or unhandled recover blocks are present in any of the examined files.
-
----
-
-## Error Handling Summary Across Modules
-
-| Category | Where It Happens | Notes |
+| Prompt | Default | Notes |
 |---|---|---|
-| **Swallow (silent)** | Config stat errors; ResolveConfig load failure → empty config; LLM malformed JSON per line; `.gitignore` load failures; AGENTS.md read failures; `os.Remove` on stale module files | No wrapping, no sentinel value. Caller receives bool or non-nil config with zero-valued fields. |
-| **Wrap with prefix + `%w`** | All YAML parse/marshal/write errors in config; all LLM errors from `CallLLM`; file write failures during synthesis and global doc generation; lock acquisition failure; JSON unmarshal failure | Error chain preserved via `%w`. |
-| **Propagate raw / stdout** | Runner.Run returns non-nil error → `"Documentation Run Failed: %v"` to stdout (unlike other fatal paths which use stderr) | Only the runner's final path prints to stdout. All validation failures print to stderr. |
-| **Fatal exit code 1** | cwd missing, git repo invalid, config file missing + stdin not terminal, mode routing violation, lock acquisition failure | Varies per condition; all use stderr for error messages. |
+| LLM Model ID | `ornith:9b` | Overrides via env var `CODE_REDUCER_MODEL_ID` |
+| Ollama Base URL | `http://localhost:11434` | Overrides via env var `OLLAMA_BASE_URL` |
+| Context Size (num-ctx) | `8192` | Overrides via env var `OLLAMA_NUM_CTX`; must parse as positive int |
+| Docs directory | `wiki/` | Custom docs output path |
+| Ignore paths/files | none | Comma-separated absolute paths excluded from traversal |
+| File extensions to ignore | none | Comma-separated file extensions excluded from traversal |
+
+Pressing **Enter** on any prompt preserves the existing or default value. Pressing `clear` or `none` wipes list-type inputs entirely. Stdin read failures log to stderr and continue using current values — no rollback occurs.
+
+After setup completes, a `.code-reducer.yaml` file is written with 0600 permissions in your working directory.
+
+### First Run — Manual Configuration (CI / Non-TTY)
+
+```bash
+export CODE_REDUCER_MODEL_ID="ornith:9b"
+export OLLAMA_BASE_URL="http://localhost:11434"
+export OLLAMA_NUM_CTX=8192
+
+code-reducer init
+```
+
+### Subsequent Runs — Incremental Update
+
+```bash
+code-reducer update
+```
+
+This performs change detection (SHA-256 per file), regenerates only affected modules, and reuses existing `architecture.md`/`quickstart.md` unless the root-level code changed. If no changes are detected, it exits with "up to date" status.
+
+### Full Regeneration — Init Mode
+
+```bash
+code-reducer init
+```
+
+Regenerates all documentation regardless of cache state: architecture, quickstart, per-module summaries, and `AGENTS.md`.
 
 ---
 
-## External Dependencies (Not Part of System Boundary)
+## Configuration Precedence
 
-- **`github.com/spf13/cobra`** — CLI framework for command tree construction and flag parsing
-- **`gopkg.in/yaml.v3`** — YAML configuration parsing for `.code-reducer.yaml`
-- **`sabhiram/go-gitignore`** — Gitignore rule compilation used by `internal/tools`
-- **Ollama-style HTTP endpoints** — LLM interaction through `*LLMClient` in `internal/engine`
+The tool resolves configuration through a four-tier pipeline. Each layer overwrites the previous when present; missing layers are skipped transparently.
+
+| Layer | Source | Mechanism |
+|---|---|---|
+| 1 (lowest) | Built-in constants | `ornith:9b`, `http://localhost:11434`, `8192` |
+| 2 | `.code-reducer.yaml` | Read via `config.LoadConfig`; non-existent file treated as empty config |
+| 3 | Environment variables | `CODE_REDUCER_MODEL_ID`, `OLLAMA_BASE_URL`, `OLLAMA_NUM_CTX` (non-empty only) |
+| 4 (highest) | CLI flags | `--model-id`, `--num-ctx` (`strconv.Atoi`; non-positive values silently retain prior layer) |
+
+### Environment Variable Defaults
+
+```bash
+export CODE_REDUCER_MODEL_ID="ornith:9b"
+export OLLAMA_BASE_URL="http://localhost:11434"
+export OLLAMA_NUM_CTX=8192
+```
+
+---
+
+## Output Artifacts
+
+| File | Purpose | Regenerated On |
+|---|---|---|
+| `architecture.md` | Global architecture overview | Root-level code change, or not present on disk |
+| `quickstart.md` | Onboarding guide | Root-level code change, or not present on disk |
+| `modules/<module>/*.md` | Per-module API summaries | File hash mismatch (Added/Modified) for that module |
+| `AGENTS.md` | AI Agent Guidelines header | First run; appended to if existing file lacks the marker |
+
+Per-file operations (`Added`, `Modified`, `Deleted`) are tracked internally and drive selective regeneration. Stale modules whose directories no longer exist in the codebase are pruned silently — their markdown files removed without error logging.
+
+---
+
+## System Architecture Overview
+
+```
+┌───────────────────────────────────────────────────┐
+│                   cmd.RootCmd.Execute()            │
+│              (entry point: all lifecycle)           │
+├───────────────────────────────────────────────────┤
+│  init.go / update.go                              │
+│  (Cobra subcommand registration only)              │
+├───────────────────────────────────────────────────┤
+│  cmd.RootCmd                                      │
+│  ┌─────┐    ┌─────┐    ┌─────┐                   │
+│  │--model-id│ │--num-ctx│ │setup/│                 │
+│  └─────┘    └─────┘    └─────┘                   │
+├───────────────────────────────────────────────────┤
+│  internal/config                                  │
+│  ResolveConfig() → *config.Config                 │
+│  (4-tier: constants → YAML → env → flags)         │
+├───────────────────────────────────────────────────┤
+│  internal/engine                                   │
+│  ┌────────────┐    ┌──────────────────────────┐   │
+│  │ runner.go  │    │ orchestrator.go          │   │
+│  │ Run()      │────▶│ RunInit / RunUpdate     │   │
+│  └────────────┘    └──────────────────────────┘   │
+│                                                      │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────┐  │
+│  │ tree.go     │  │ synthesize.go │  │ chunking.go│  │
+│  │ buildTree / │  │ reduceInChunks│ │ reduceFile │  │
+│  │ propagate   │  │ reduceItems   │ │ facts      │  │
+│  └─────────────┘  └──────────────┘  └───────────┘  │
+│                                                      │
+│  ┌──────────────┐                                    │
+│  │ LLMClient    │  CallLLM → /api/chat              │
+│  │ (10m timeout)│  Response parsed via json_parser   │
+│  └──────────────┘  StripOuterMarkdownFence           │
+├───────────────────────────────────────────────────┤
+│  external packages:                                │
+│  security.AcquireLock()    → repo-level lockfile    │
+│  cache.loadMetadataCache() → on-disk state          │
+│  tools.{LoadGitignore,DiscoverCodeFiles,...}       │
+│  tools.ReadFileSafely / WriteFileSafely            │
+└───────────────────────────────────────────────────┘
+```
+
+### How the Modules Interact
+
+1. **`cmd.RootCmd.Execute()`** resolves configuration and dispatches to `init`, `update`, or `setup`. Cobra output suppression is enabled — errors propagate as values; no panics occur within this package.
+
+2. **`internal/config.ResolveConfig()`** is the single source of truth for runtime configuration. It layers defaults, persisted YAML config (if present), environment variables, and CLI flags in that order. All non-structural state is ephemeral — scoped to function calls and returned as values. No package-level mutable state survives beyond initialization.
+
+3. **`internal/engine.Runner.Run()`** is the pipeline orchestrator. It acquires a repository-level lock (via `security.AcquireLock`) to prevent concurrent runs, constructs an `LLMClient`, then dispatches to either the full regeneration (`RunInit`) or incremental update (`RunUpdate`). The runner's config field is read-only within this file — all mutations originate before construction.
+
+4. **`internal/engine.Orchestrator.Pipeline()`** executes the Map-Reduce logic:
+   - **Map Phase**: Discovers code files, computes SHA-256 per file, builds a directory tree via `buildTree`. Hash computation errors are silently skipped; only successfully computed hashes are stored.
+   - **Change Detection** (update mode): Compares current hashes against the metadata cache to classify files as Added/Modified/Deleted. Stale modules whose directories no longer exist are pruned silently (`os.Remove` error ignored).
+   - **Reduce Phase**: Calls `synthesizeNode` bottom-up on the directory tree to produce per-module summaries and a root summary string via LLM calls. Errors from individual synthesis batches are wrapped — single oversized items get truncated with `\n...[truncated]`. Infinite-loop guard falls back to per-item truncation when batch merging stalls.
+   - **Standard Docs Generation**: Produces `architecture.md` and `quickstart.md` from the root summary via two additional LLM calls. Writes use `tools.WriteFileSafely`; errors are wrapped with context (e.g., `"failed to write quickstart.md: %w"`).
+
+5. **`internal/engine.tree.go`** builds a nested directory tree from flat file paths, splitting on `/`. Affected propagation traverses the tree recursively — if any direct child is in the changeset, ancestors accumulate affected status upward. Module existence checks use `os.Stat`; only `os.IsNotExist` is acted on; all other errors are silently dropped.
+
+6. **`internal/engine.synthesize.go`** implements context-aware chunking with three modes:
+   - **Module Synthesis** (`reduceInChunks`): Processes architectural nodes in batches constrained by `NumCtx * 3`. Errors wrapped as `"LLM error during synthesis: %w"`.
+   - **File Fact Consolidation** (`reduceFileFacts`): Deduplicates and merges extracted facts per step within a file. System prompt built from base + fixed role string.
+   - **Recursive Convergence** (`reduceItems`): Reduces items in batches → collects intermediate results → recurses until everything converges to a single output. Termination guaranteed: short-circuits at top when `len(batches) == 1`.
+
+7. **`internal/engine.chunking.go`** provides overlapping chunk support via `chunkTextWithOverlap`, splitting raw text into segments with overlap for context continuity between adjacent LLM calls. Silent swallow rules apply: `maxRunes <= 0` returns full text as single chunk; final partial chunk at end of runes breaks the loop without error or truncation marker.
+
+8. **LLM Client (`internal/engine.LLMMClient`)** constructs an HTTP client with a default transport (no custom proxy/redirect/TLS config) and a 10-minute timeout. `CallLLM()` prepends the system prompt as role `"system"`, serializes to Ollama `/api/chat` JSON payload, performs non-streaming POST, reads the body fully on 200 OK or truncates at ~1 KB on non-OK status. Response parsing handles markdown code fences, balanced bracket matching with escape state tracking, and multiple JSON candidates in a single response.
+
+9. **Response Parsing** (`internal/engine.json_parser.go`): `StripOuterMarkdownFence` strips surrounding ``` fences silently. `CleanJSONResponse` iterates stripped content calling an internal balanced-bracket extractor; unbalanced JSON is swallowed — the original trimmed input is returned unchanged. `UnmarshalJSONResponse` attempts multiple candidates, keeps the last error, and emits `"no valid JSON found in response"` only after exhausting all options.
+
+10. **Graceful Shutdown**: SIGINT/SIGTERM handlers are installed via `signal.NotifyContext`. A deferred `stop()` cancels the context; any in-flight work respecting the cancelled context exits cleanly. No error-return path exists for signal handling within this file.
+
+---
+
+## Defensible Design Rules
+
+- All failure paths return errors propagated to cobra — no panics observed.
+- Stdio read failures during setup log to stderr and continue with current values; no rollback or restart occurs.
+- Lock cleanup always runs via `defer` on any return path, including errors.
+- Write operations use safe variants (`ReadFileSafely`, `WriteFileSafely`) where available.
+- Permission normalization is implicit — existing files with different permissions will fail the write.
+- No retry logic: if final persistence fails (e.g., `SaveConfig`), the flow aborts.
+- Concurrency primitives are absent in the config package; it is single-threaded by design.

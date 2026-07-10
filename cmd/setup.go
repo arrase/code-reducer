@@ -16,14 +16,13 @@ var setupCmd = &cobra.Command{
 	Use:   "setup",
 	Short: "Configure the application",
 	Long:  `Run the interactive configuration setup to generate the .code-reducer.yaml file.`,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		repoRoot, err := os.Getwd()
 		if err != nil {
-			fmt.Printf("Error getting current working directory: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("failed to get current working directory: %w", err)
 		}
 
-		RunSetupFlow(repoRoot)
+		return RunSetupFlow(repoRoot)
 	},
 }
 
@@ -32,12 +31,12 @@ func init() {
 }
 
 // RunSetupFlow guides the user through setting up the configuration file.
-func RunSetupFlow(repoRoot string) {
+func RunSetupFlow(repoRoot string) error {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("Welcome to Code-Reducer CLI Setup")
 	fmt.Println("---------------------------------")
 
-	existingModel := "ornith:9b"
+	existingModel := config.OllamaDefaultModelID
 	existingBaseURL := config.OllamaDefaultBaseURL
 	existingNumCtx := config.OllamaDefaultNumCtx
 
@@ -103,10 +102,10 @@ func RunSetupFlow(repoRoot string) {
 
 	err = config.SaveConfig(repoRoot, newCfg)
 	if err != nil {
-		fmt.Printf("Error saving configuration: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("error saving configuration: %w", err)
 	}
 	fmt.Printf("Configuration successfully saved to local %s file.\n", config.ConfigFileName)
+	return nil
 }
 
 func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) []string {
@@ -124,13 +123,18 @@ func promptStringList(reader *bufio.Reader, promptMsg string, existingList []str
 
 	input, err := reader.ReadString('\n')
 	if err != nil {
-		fmt.Printf("\nWarning: error reading input (%v), keeping existing values.\n", err)
+		fmt.Fprintf(os.Stderr, "\nWarning: error reading input (%v), keeping existing values.\n", err)
 		return existingList
 	}
 
 	input = strings.TrimSpace(input)
 	if input == "" {
 		return existingList
+	}
+
+	lowerInput := strings.ToLower(input)
+	if lowerInput == "clear" || lowerInput == "none" {
+		return []string{}
 	}
 
 	parts := strings.Split(input, ",")
@@ -148,7 +152,7 @@ func promptString(reader *bufio.Reader, promptMsg, existingVal string) string {
 	fmt.Printf("%s [%s]: ", promptMsg, existingVal)
 	input, err := reader.ReadString('\n')
 	if err != nil {
-		fmt.Printf("\nWarning: error reading input (%v), using default: %s\n", err, existingVal)
+		fmt.Fprintf(os.Stderr, "\nWarning: error reading input (%v), using default: %s\n", err, existingVal)
 		return existingVal
 	}
 	input = strings.TrimSpace(input)

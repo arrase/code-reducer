@@ -13,15 +13,40 @@ import (
 )
 
 // ReadFileSafely resolves the virtual path inside the repository and reads the file content.
+// It implements TOCTOU mitigation similar to WriteFileSafely.
 func ReadFileSafely(repoRoot, virtualPath string) ([]byte, error) {
 	safePath, err := security.SafeResolve(repoRoot, virtualPath)
 	if err != nil {
 		return nil, err
 	}
 
-	content, err := os.ReadFile(safePath)
+	f, err := os.Open(safePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		return nil, fmt.Errorf("failed to open file for reading: %w", err)
+	}
+	defer f.Close()
+
+	fiLstat, err := os.Lstat(safePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lstat file: %w", err)
+	}
+
+	if fiLstat.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("security violation: symlink detected on read: %s", safePath)
+	}
+
+	fiFstat, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to fstat file: %w", err)
+	}
+
+	if !os.SameFile(fiLstat, fiFstat) {
+		return nil, fmt.Errorf("security violation: TOCTOU symlink race detected on read: %s", safePath)
+	}
+
+	content, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file content: %w", err)
 	}
 
 	return content, nil
@@ -104,13 +129,15 @@ func LoadGitignore(repoRoot string) ([]string, error) {
 
 // ShouldIgnoreFile checks if a file (specified by relative path) is ignored.
 func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ignoredExtensions []string) bool {
+	slashRelPath := filepath.ToSlash(relPath)
+
 	// 1. Check user-defined ignores (config + gitignore)
-	if gitIgnore != nil && gitIgnore.MatchesPath(relPath) {
+	if gitIgnore != nil && gitIgnore.MatchesPath(slashRelPath) {
 		return true
 	}
 
 	// 2. Check path components for dot-prefixed items or .egg-info
-	components := strings.Split(relPath, string(filepath.Separator))
+	components := strings.Split(slashRelPath, "/")
 	for _, comp := range components {
 		if strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".egg-info") {
 			return true
@@ -118,15 +145,19 @@ func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ign
 	}
 
 	// 3. Check filename extensions & suffixes
-	name := filepath.Base(relPath)
+	name := filepath.Base(slashRelPath)
 	ext := strings.ToLower(filepath.Ext(name))
 	for _, iext := range ignoredExtensions {
-		normIext := iext
-		if !strings.HasPrefix(normIext, ".") {
-			normIext = "." + normIext
-		}
-		if ext == strings.ToLower(normIext) || strings.HasSuffix(strings.ToLower(name), strings.ToLower(normIext)) {
-			return true
+		lowerIext := strings.ToLower(iext)
+		lowerName := strings.ToLower(name)
+		if !strings.Contains(lowerIext, ".") {
+			if ext == "."+lowerIext || strings.HasSuffix(lowerName, "."+lowerIext) {
+				return true
+			}
+		} else {
+			if strings.HasSuffix(lowerName, lowerIext) {
+				return true
+			}
 		}
 	}
 	// 3.5 Check if it's a known text file to avoid IsBinaryFile I/O bottleneck
@@ -143,7 +174,7 @@ func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ign
 	}
 
 	// 4. Check if it's a binary file
-	absPath, err := security.SafeResolve(repoRoot, relPath)
+	absPath, err := security.SafeResolve(repoRoot, slashRelPath)
 	if err != nil {
 		return true // Treat unsafe paths outside repo root as ignored
 	}
@@ -170,19 +201,21 @@ func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []st
 			return nil
 		}
 
+		slashRel := filepath.ToSlash(rel)
+
 		if d.IsDir() {
 			name := d.Name()
-			if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || (gitIgnore != nil && gitIgnore.MatchesPath(rel)) {
+			if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || (gitIgnore != nil && gitIgnore.MatchesPath(slashRel)) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		if ShouldIgnoreFile(repoRoot, rel, gitIgnore, ignoredExtensions) {
+		if ShouldIgnoreFile(repoRoot, slashRel, gitIgnore, ignoredExtensions) {
 			return nil
 		}
 
-		files = append(files, filepath.ToSlash(rel))
+		files = append(files, slashRel)
 		return nil
 	})
 

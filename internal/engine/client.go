@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -48,11 +47,6 @@ type ollamaOptions struct {
 
 type ollamaResponse struct {
 	Message Message `json:"message"`
-}
-
-type ollamaChunk struct {
-	Message Message `json:"message"`
-	Done    bool    `json:"done"`
 }
 
 // CallLLM invokes the LLM via HTTP failing fast without retries.
@@ -112,54 +106,6 @@ func (c *LLMClient) CallLLM(ctx context.Context, systemPrompt string, messages [
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	return "", fmt.Errorf("ollama api error: status %d, response: %s", resp.StatusCode, string(body))
-}
-
-// StreamLLM streams responses in real time from the LLM.
-func (c *LLMClient) StreamLLM(ctx context.Context, systemPrompt string, messages []Message, onChunk func(string)) error {
-	req, err := c.prepareOllamaRequest(ctx, systemPrompt, messages, true, false)
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("ollama api error (stream): status %d, response: %s", resp.StatusCode, string(body))
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("error reading stream: %w", err)
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		var chunk ollamaChunk
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			continue
-		}
-		if chunk.Message.Content != "" && onChunk != nil {
-			onChunk(chunk.Message.Content)
-		}
-		if chunk.Done {
-			break
-		}
-	}
-
-	return nil
 }
 
 func (c *LLMClient) GetBaseSystemPrompt() string {
