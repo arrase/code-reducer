@@ -28,7 +28,7 @@ func RunGit(repoRoot string, args ...string) (string, error) {
 func VerifyGitRepo(repoRoot string) error {
 	_, err := RunGit(repoRoot, "rev-parse", "--is-inside-work-tree")
 	if err != nil {
-		return fmt.Errorf("not a git repository (or any of the parent directories)")
+		return fmt.Errorf("not a git repository (or any of the parent directories): %w", err)
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"github.com/arrase/code-reducer/internal/engine"
 	"github.com/spf13/cobra"
 )
 
@@ -9,7 +10,10 @@ var initCmd = &cobra.Command{
 	Short: "Initialize project documentation",
 	Long:  `Scan the repository and build the initial set of wiki markdown pages.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return executeCommand("init")
+		if err := executeCommand(engine.ModeInit); err != nil {
+			return err
+		}
+		return nil
 	},
 }
 

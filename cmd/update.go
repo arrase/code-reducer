@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"github.com/arrase/code-reducer/internal/engine"
 	"github.com/spf13/cobra"
 )
 
@@ -9,7 +10,10 @@ var updateCmd = &cobra.Command{
 	Short: "Update project documentation incrementally",
 	Long:  `Scan changed files since the last documented commit and update the wiki pages.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return executeCommand("update")
+		if err := executeCommand(engine.ModeUpdate); err != nil {
+			return err
+		}
+		return nil
 	},
 }
 

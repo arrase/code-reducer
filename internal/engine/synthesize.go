@@ -24,6 +24,92 @@ type pipelineContext struct {
 	logEvent            LogEventFunc
 }
 
+func extractFileFacts(p *pipelineContext, f string, nodePath string, fileLimit int) (string, error) {
+	var fileHash string
+	var ok bool
+	if p.precalculatedHashes != nil {
+		fileHash, ok = p.precalculatedHashes[f]
+	}
+
+	var contentBytes []byte
+	var err error
+
+	// Check cache hit using precalculated hash without reading file
+	var facts string
+	cachedEntry, exists := p.cache.Files[f]
+	if ok && exists && cachedEntry.SHA256 == fileHash {
+		facts = cachedEntry.Facts
+	} else {
+		// Read file only on cache miss
+		contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
+		if err != nil {
+			p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
+			return "", nil
+		}
+
+		if !ok {
+			hashSum := sha256.Sum256(contentBytes)
+			fileHash = hex.EncodeToString(hashSum[:])
+			
+			// Re-check cache in case hash was not precalculated but exists in cache
+			if exists && cachedEntry.SHA256 == fileHash {
+				facts = cachedEntry.Facts
+			}
+		}
+	}
+
+	if facts == "" {
+		if contentBytes == nil {
+			contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
+			if err != nil {
+				p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
+				return "", nil
+			}
+		}
+		contentStr := string(contentBytes)
+		overlap := defaultChunkOverlap
+		if overlap > fileLimit/4 {
+			overlap = fileLimit / 4
+		}
+		chunks := chunkTextWithOverlap(contentStr, fileLimit, overlap)
+
+		var factsBuilder strings.Builder
+		for i, step := range p.cfg.ExtractionSteps {
+			var stepFacts []string
+			for chunkIdx, chunk := range chunks {
+				chunkMsg := ""
+				if len(chunks) > 1 {
+					chunkMsg = fmt.Sprintf(" (Chunk %d of %d)", chunkIdx+1, len(chunks))
+				}
+				p.logEvent(EventStatus, fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(p.cfg.ExtractionSteps), step.Name, chunkMsg, f))
+				
+				systemPrompt := p.cfg.SystemPrompt + "\n" + step.Prompt
+				userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, nodePath, chunk)
+				res, err := p.client.CallLLM(p.ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
+				if err != nil {
+					return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
+				}
+				stepFacts = append(stepFacts, stripOuterMarkdownFence(res))
+			}
+
+			consolidatedFact, err := reduceFileFacts(p.ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
+			if err != nil {
+				return "", err
+			}
+
+			factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, consolidatedFact))
+		}
+		facts = strings.TrimSpace(factsBuilder.String())
+
+		// Update cache
+		p.cache.Files[f] = FileCacheEntry{
+			SHA256: fileHash,
+			Facts:  facts,
+		}
+	}
+	return facts, nil
+}
+
 func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
 	if err := p.ctx.Err(); err != nil {
 		return "", err
@@ -69,90 +155,13 @@ func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
 			return "", err
 		}
 
-		var fileHash string
-		var ok bool
-		if p.precalculatedHashes != nil {
-			fileHash, ok = p.precalculatedHashes[f]
+		facts, err := extractFileFacts(p, f, node.Path, fileLimit)
+		if err != nil {
+			return "", err
 		}
-
-		var contentBytes []byte
-		var err error
-
-		// Check cache hit using precalculated hash without reading file
-		var facts string
-		cachedEntry, exists := p.cache.Files[f]
-		if ok && exists && cachedEntry.SHA256 == fileHash {
-			facts = cachedEntry.Facts
-		} else {
-			// Read file only on cache miss
-			contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
-			if err != nil {
-				p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
-				continue
-			}
-
-			if !ok {
-				hashSum := sha256.Sum256(contentBytes)
-				fileHash = hex.EncodeToString(hashSum[:])
-				
-				// Re-check cache in case hash was not precalculated but exists in cache
-				if exists && cachedEntry.SHA256 == fileHash {
-					facts = cachedEntry.Facts
-				}
-			}
+		if facts != "" {
+			components = append(components, fmt.Sprintf("### File: %s\n%s", filepath.Base(f), facts))
 		}
-
-		if facts == "" {
-			if contentBytes == nil {
-				contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
-				if err != nil {
-					p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
-					continue
-				}
-			}
-			contentStr := string(contentBytes)
-			overlap := defaultChunkOverlap
-			if overlap > fileLimit/4 {
-				overlap = fileLimit / 4
-			}
-			chunks := chunkTextWithOverlap(contentStr, fileLimit, overlap)
-
-			var factsBuilder strings.Builder
-			for i, step := range p.cfg.ExtractionSteps {
-				var stepFacts []string
-				for chunkIdx, chunk := range chunks {
-					chunkMsg := ""
-					if len(chunks) > 1 {
-						chunkMsg = fmt.Sprintf(" (Chunk %d of %d)", chunkIdx+1, len(chunks))
-					}
-					p.logEvent(EventStatus, fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(p.cfg.ExtractionSteps), step.Name, chunkMsg, f))
-					
-					systemPrompt := p.cfg.SystemPrompt + "\n" + step.Prompt
-					userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, node.Path, chunk)
-					res, err := p.client.CallLLM(p.ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
-					if err != nil {
-						return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
-					}
-					stepFacts = append(stepFacts, stripOuterMarkdownFence(res))
-				}
-
-				consolidatedFact, err := reduceFileFacts(p.ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
-				if err != nil {
-					return "", err
-				}
-
-				factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, consolidatedFact))
-			}
-			facts = strings.TrimSpace(factsBuilder.String())
-
-			// Update cache
-			p.cache.Files[f] = FileCacheEntry{
-				SHA256: fileHash,
-				Facts:  facts,
-			}
-		}
-
-		components = append(components, fmt.Sprintf("### File: %s\n%s", filepath.Base(f), facts))
 	}
 
 	for _, childName := range childNames {

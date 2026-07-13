@@ -9,9 +9,17 @@ import (
 	"github.com/arrase/code-reducer/internal/security"
 )
 
+type ChangeStatus string
+
+const (
+	StatusAdded    ChangeStatus = "Added"
+	StatusModified ChangeStatus = "Modified"
+	StatusDeleted  ChangeStatus = "Deleted"
+)
+
 type FileChange struct {
 	Path   string
-	Status string // "Added", "Modified", "Deleted"
+	Status ChangeStatus
 }
 
 func propagateAffected(node *DirNode, affectedDirs map[string]bool) bool {
@@ -31,7 +39,7 @@ func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataC
 	changedFiles := make(map[string]bool)
 	for _, c := range filteredChanges {
 		changedFiles[c.Path] = true
-		if c.Status == "Deleted" {
+		if c.Status == StatusDeleted {
 			affectedDirs[path.Dir(c.Path)] = true
 		}
 	}
