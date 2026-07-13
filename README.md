@@ -56,10 +56,10 @@ Incrementally update the wiki whenever code files change:
 ## 🛠️ CLI Command Reference
 
 ### 1. `code-reducer setup`
-Runs an interactive setup flow in the current directory to generate the `.code-reducer.yaml` configuration file. You will be prompted for:
-* LLM Model ID (defaults to `ornith:9b` or reads from existing config)
+Runs an interactive setup flow in the current directory to generate the `.code-reducer.yaml` configuration file. If a `.code-reducer.yaml` file already exists, all configuration prompts will default to its existing values. You will be prompted for:
+* LLM Model ID (defaults to `ornith:9b`)
 * Ollama Base URL (defaults to `http://localhost:11434`)
-* Ollama Context Size (defaults to `8192` or reads from existing config)
+* Ollama Context Size (defaults to `8192`)
 * Custom files and directories to ignore (comma-separated)
 * Documentation output folder name (defaults to `wiki`)
 
@@ -67,6 +67,7 @@ Runs an interactive setup flow in the current directory to generate the `.code-r
 Scans the repository, builds the hierarchical tree, and generates the initial set of wiki markdown pages:
 * Generates a metadata cache in `<docs_dir>/.metadata.json` containing the baseline metadata file summaries.
 * Automatically generates (or appends to) an `AGENTS.md` file in the repository root to guide other AI development agents on how to find and use the generated wiki documentation.
+* *Note: This command will implicitly launch the interactive setup wizard if the `.code-reducer.yaml` file is missing.*
 * *Note: This command will fail if the project has already been initialized.*
 
 ### 3. `code-reducer update`
@@ -76,6 +77,8 @@ Detects files modified, added, or deleted since the last documentation run and p
 * Skips LLM calls for unchanged directories by reusing the cached summaries in `wiki/.metadata.json`.
 * Bottom-up propagation: If a file inside a subdirectory changes, the subdirectory is marked "affected" and this state propagates up to the parent directory, rebuilding parents and the root summaries.
 * Automatically syncs global files (`architecture.md` and `quickstart.md`) only if the root directory `.` is affected (i.e. top-level structural changes occurred) or if the files are physically missing.
+* Cache Invalidation: Automatically detects changes in your `extraction_steps` configuration and invalidates the entire cache, forcing a full regeneration to ensure documentation accuracy.
+* *Note: Like `init`, this command will implicitly launch the setup wizard if the configuration file is missing.*
 
 ---
 
@@ -210,13 +213,13 @@ To prevent massive folders from blowing out Ollama's context window, Code-Reduce
 * **Directory-Level Reduce**: File briefings and child directory summaries are grouped into batches.
   * If a directory's components fit into a single batch, they are joined and sent to the LLM with the `module_synthesis_prompt` to yield a unified directory summary.
   * If they exceed the limit, they are split into sub-batches, reduced independently, and recursively merged.
-  * **Truncation Safeguard**: In `reduceItems`, if a single item exceeds the character limit, it is automatically truncated (appending `...[truncated]`) to avoid infinite loops and context buffer overflows.
+  * **Dynamic Multi-Layer Map-Reduce**: In `reduceItems`, if a single item exceeds the character limit, it is automatically chunked into smaller pieces to create a deeper reduction layer. This preserves all information without truncation. To avoid infinite map-reduce loops (e.g. if the LLM refuses to condense text), the engine compares input and output payload sizes and gracefully halts recursion without losing context or exceeding buffer limits.
 
 #### Global Synthesis Phase
 After reducing the root directory (`.`), the final summary is sent to the LLM to generate:
 1. **System Blueprint**: `wiki/architecture.md` (High-level architecture, module boundaries, external integrations).
 2. **Developer Quickstart**: `wiki/quickstart.md` (Onboarding guide, configuration guidelines).
-3. **AI Agent Guidelines**: Writes guidelines to `AGENTS.md` (or appends to it) to help other incoming agentic developers find and utilize the generated documentation.
+3. **AI Agent Guidelines**: During the initial initialization (`init`), the pipeline writes guidelines to `AGENTS.md` (or appends to it) to help other incoming agentic developers find and utilize the generated documentation.
 
 ---
 
@@ -236,19 +239,16 @@ To serialize execution across multiple terminal windows or background jobs, the 
 3. **Git Isolation**: The runner automatically checks if `.code-reducer.lock` is ignored. If not, it safely appends it to the project's `.gitignore` file.
 
 #### TOCTOU Symlink Hijacking & Safe File I/O
-1. **Safe Reading (`ReadFileSafely`)**: When reading files, the engine performs `os.Lstat` on the path to verify it is not a symbolic link. It then opens the file descriptor, calls `f.Stat()`, and compares it with the `Lstat` results via `os.SameFile()`. If the inodes do not match, a TOCTOU symlink replacement race is detected and the read operation is aborted.
+1. **Safe Reading (`ReadFileSafely`)**: When reading files, the engine resolves the target path using `security.SafeResolve`. `SafeResolve` prevents directory traversal by evaluating symlinks bottom-up on all existing ancestor directories before completing absolute path resolution, and aborts if the path escapes the repository boundary.
 2. **Atomic Writing (`WriteFileSafely` & `SaveConfig`)**: To prevent data corruption, all file writes are performed atomically. The engine creates a temporary file in the target directory (`os.CreateTemp`), writes the contents, calls `Sync()` to flush to disk, closes the descriptor, sets the permissions, and atomically replaces the target file via `os.Rename`.
 
 ---
 
-### 3. File Discovery, Binary, and Ignore Filters
+### 3. File Discovery and Ignore Filters
 
 Repository scanning is executed using `filepath.WalkDir` coupled with multiple layers of evaluation:
 1. **Pruning Subtrees**: Directories that are dot-prefixed (such as `.git` or `.venv`), end in `.egg-info`, or match any ignore rules (from `.gitignore` or configuration) are skipped entirely using `filepath.SkipDir` during traversal, saving CPU cycles.
 2. **Ignore Matching Rules**: Ignores loaded from the project's `.gitignore` and specified in the YAML configuration are merged and compiled using a dedicated Gitignore library (`go-gitignore`), ensuring 100% compliance with standard Git semantic rules.
-3. **Binary Classification (Null-Byte Scanner & Fast-Path)**: 
-   * **Text Fast-Path**: Common source code extensions (like `.go`, `.js`, `.py`, `.md`) are instantly classified as text, entirely bypassing I/O bottlenecks.
-   * **Fallback Null-Byte Scan**: Unlabelled files are caught by checking the first `1024` bytes for a null byte (`0x00`). If a null byte is found, the file is classified as a binary and skipped.
 
 ---
 
