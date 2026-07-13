@@ -54,22 +54,22 @@ type Config struct {
 	Ignore                      []string         `yaml:"ignore"`
 }
 
-// DefaultExtractionSteps is the standard list of extraction steps.
+// DefaultExtractionSteps is the standard list of extraction steps, optimized for language-agnostic extraction and ~10B LLMs.
 var DefaultExtractionSteps = []ExtractionStep{
 	{
 		Name:   "API_SIGNATURES",
-		Prompt: "Task: Extract the public surface area of the file.\nOutput: A strict Markdown list of all exported structs, interfaces, and methods. For each, note the actual input and output types. Ignore internal logic.",
+		Prompt: "Task: Extract the public API surface.\nOutput: A strict Markdown list of all exported or public elements (classes, functions, methods, types). Include parameters and return types. Do not explain internal execution logic.",
 	},
 	{
 		Name:   "BUSINESS_LOGIC",
-		Prompt: "Task: Analyze the business logic and domain concepts.\nOutput: Explain what business rules or domain concepts this file solves. Describe the high-level algorithmic flow. Ignore implementation details.",
+		Prompt: "Task: Extract the core purpose and domain rules.\nOutput: Explain the primary domain problem this code solves. List the high-level algorithm steps. Ignore syntax, standard library usage, and basic implementation details.",
 	},
 	{
 		Name:   "STATE_AND_CONCURRENCY",
-		Prompt: "Task: Analyze state mutation and concurrency.\nOutput: List all mutable state (global variables, changing struct fields) and what concurrency mechanisms (e.g., sync.Mutex, channels) protect them. If none, state 'No mutable state'.",
+		Prompt: "Task: Identify mutable state and thread safety.\nOutput: List global variables, shared states, or class-level properties that are modified. Identify synchronization mechanisms (locks, mutexes, async/await, atomic types). If entirely stateless, output exactly: 'No mutable state'.",
 	},
 	{
 		Name:   "ERRORS_AND_SIDE_EFFECTS",
-		Prompt: "Task: Analyze side effects and error handling.\nOutput: Detail how this code communicates with the outside world (I/O like network, disk, DB) and how it handles/returns errors (wrap, sentinel, panic).",
+		Prompt: "Task: Analyze external I/O and error propagation.\nOutput: Detail interactions with external systems (network, disk, databases, APIs). Explain how errors are propagated (exceptions, error return codes, crash/panic). If no I/O exists, state 'No external side effects'.",
 	},
 }
