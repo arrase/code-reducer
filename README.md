@@ -86,59 +86,67 @@ Code-Reducer stores configuration parameters in a `.code-reducer.yaml` file in t
 ### Example Configuration:
 ```yaml
 # The model ID loaded into your local Ollama instance
-model_id: "ornith:9b"
+model_id: ornith:9b
 
 # URL of the local or remote Ollama server
-ollama_base_url: "http://localhost:11434"
+ollama_base_url: http://localhost:11434
 
 # Custom context window size
 ollama_num_ctx: 20000
 
-# Directory paths, files, or glob patterns to ignore during scanning
-ignore:
-  - "README.md"
-  - ".code-reducer.yaml"
-  - "go.sum"
-  - "go.mod"
-  - "screenshots"
-  - "examples"
-
 # Target directory to write generated markdown documentation
-docs_dir: "wiki"
+docs_dir: wiki
 
 # System instructions injected to every LLM request
 system_prompt: |
-  You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
-  DEFENSIVE RULES: 1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 3. Do NOT name standard library packages unless explicitly stated in the source text. 4. Only report facts you are 100% sure about.
+    You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
+    DEFENSIVE RULES: 1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 3. Do NOT name standard library packages unless explicitly stated in the source text. 4. Only report facts you are 100% sure about.
 
 # Synthesis prompt for directory modules
 module_synthesis_prompt: |-
-  Task: Write a technical documentation page for a code module based on the provided list of its internal components.
-  Rule 1: Group related functions and classes under appropriate Markdown headings.
-  Rule 2: Explain the responsibility of the module and the data flow.
-  Rule 3: Keep it highly technical and dense.
+    Task: Write a technical documentation page for a code module based on the provided list of its internal components.
+    Rule 1: Group related functions and classes under appropriate Markdown headings.
+    Rule 2: Explain the responsibility of the module and the data flow.
+    Rule 3: Keep it highly technical and dense.
 
 # Synthesis prompt for the global architecture overview
 architecture_prompt: |-
-  Task: Write a global architecture or quickstart document based on the module summaries.
-  Rule 1: Explain the system boundaries and how the modules interact.
-  Rule 2: Provide a dense, developer-friendly overview.
+    Task: Write a global architecture or quickstart document based on the module summaries.
+    Rule 1: Explain the system boundaries and how the modules interact.
+    Rule 2: Provide a dense, developer-friendly overview.
 
 # Prompt used to consolidate chunks of the same file
 file_fact_consolidation_prompt: |-
-  You are a specialized code documentation assistant.
-  Consolidate, deduplicate and merge the following facts extracted from different chunks of the same file into a single, cohesive summary.
+    You are a specialized code documentation assistant.
+    Consolidate, deduplicate and merge the following facts extracted from different chunks of the same file into a single, cohesive summary.
 
 # Customize the LLM extraction pipeline steps
 extraction_steps:
-  - name: "API_SIGNATURES"
-    prompt: "Task: Extract the public API surface.\nOutput: A strict Markdown list of all exported or public elements (classes, functions, methods, types). Include parameters and return types. Do not explain internal execution logic."
-  - name: "BUSINESS_LOGIC"
-    prompt: "Task: Extract the core purpose and domain rules.\nOutput: Explain the primary domain problem this code solves. List the high-level algorithm steps. Ignore syntax, standard library usage, and basic implementation details."
-  - name: "STATE_AND_CONCURRENCY"
-    prompt: "Task: Identify mutable state and thread safety.\nOutput: List global variables, shared states, or class-level properties that are modified. Identify synchronization mechanisms (locks, mutexes, async/await, atomic types). If entirely stateless, output exactly: 'No mutable state'."
-  - name: "ERRORS_AND_SIDE_EFFECTS"
-    prompt: "Task: Analyze external I/O and error propagation.\nOutput: Detail interactions with external systems (network, disk, databases, APIs). Explain how errors are propagated (exceptions, error return codes, crash/panic). If no I/O exists, state 'No external side effects'."
+    - name: API_SIGNATURES
+      prompt: |-
+        Task: Extract the public API surface.
+        Output: A strict Markdown list of all exported or public elements (classes, functions, methods, types). Include parameters and return types. Do not explain internal execution logic.
+    - name: BUSINESS_LOGIC
+      prompt: |-
+        Task: Extract the core purpose and domain rules.
+        Output: Explain the primary domain problem this code solves. List the high-level algorithm steps. Ignore syntax, standard library usage, and basic implementation details.
+    - name: STATE_AND_CONCURRENCY
+      prompt: |-
+        Task: Identify mutable state and thread safety.
+        Output: List global variables, shared states, or class-level properties that are modified. Identify synchronization mechanisms (locks, mutexes, async/await, atomic types). If entirely stateless, output exactly: 'No mutable state'.
+    - name: ERRORS_AND_SIDE_EFFECTS
+      prompt: |-
+        Task: Analyze external I/O and error propagation.
+        Output: Detail interactions with external systems (network, disk, databases, APIs). Explain how errors are propagated (exceptions, error return codes, crash/panic). If no I/O exists, state 'No external side effects'.
+
+# Directory paths, files, or glob patterns to ignore during scanning
+ignore:
+  - README.md
+  - .code-reducer.yaml
+  - go.sum
+  - go.mod
+  - screenshots
+  - examples
 ```
 
 ### Precedence Order
