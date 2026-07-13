@@ -1,288 +1,243 @@
-# internal/engine — Documentation Synthesis Engine
+# internal/engine — Incremental Documentation Synthesis Engine
 
-## Module Responsibility & Data Flow
+## Module Responsibility
 
-The `internal/engine` package implements a recursive, context-window-aware LLM-based documentation synthesis engine. It operates in two modes—**init** (full generation from scratch) and **update** (incremental refresh)—orchestrating file discovery, change detection, chunked fact extraction, hierarchical synthesis, and persistent cache management for all intermediate state.
+This package orchestrates automatic generation of architecture overviews (`architecture.md`), quickstart guides (`quickstart.md`), and per-module API summaries for software repositories. It operates in two modes: **init** (full generation from scratch) and **update** (incremental regeneration triggered by file changes). The engine consumes source code through a hierarchical synthesis pipeline driven by LLM calls, persists intermediate state to disk for resumption between runs, and uses an exclusive lock file to serialize concurrent invocations.
 
-Data flow: `Runner.Run` → acquires lock → instantiates LLM client + orchestrator → dispatches to `RunInit` or `RunUpdate` → discovers code files via `tools.DiscoverCodeFiles` → classifies changes (Added/Modified/Deleted) against persisted `MetadataCache` → builds directory tree → propagates affected flags upward → recursively synthesizes each node via `synthesizeNode` (per-chunk LLM extraction → fact consolidation → reduction) → writes module docs to disk → persists cache.
-
-All external communication is delegated: network calls go through the injected `llmCaller.CallLLM`; filesystem I/O goes through internal tool wrappers (`tools.ReadFileSafely`, `tools.WriteFileSafely`); path resolution uses `security.SafeResolve`. No mutexes, channels, or atomic operations are used anywhere in this package.
-
----
-
-## Constants & Types (constants.go)
-
-### Constants
-
-| Constant | Value | Purpose |
-|---|---|---|
-| `defaultHTTPTimeout` | 10 min | Default HTTP client request timeout |
-| `maxErrorBodyBytes` | 1024 bytes | Maximum size allowed in error response bodies |
-| `defaultChunkOverlap` | 800 chars | Overlap between consecutive chunks during streaming/processing |
-| `minNumCtxFloor` | 512 tokens | Minimum context window floor for processing |
-| `contextWindowAllocRatio` | 0.75 | Ratio used when allocating context windows (reserves 75% of available space) |
-| `maxCharsMultiplier` | 3 | Multiplier applied to character counts (scales token estimates or max output limits) |
-| `metadataFileName` | `.metadata.json` | Persistent metadata file name for the engine's state |
-| `agentsFileName` | `AGENTS.md` | Agent definitions/configuration file |
-| `defaultDirPerm` | 0755 | Default directory permission mode |
-
-### Type: `LogEventFunc`
-
-Function type alias with signature `func(EventType, string)`. Callback interface for logging events; no business rules defined here.
-
----
-
-## LLM Client Communication (client.go)
-
-### `Message`, `llmClient`, `CallLLM`
-
-Unexported except `Message` struct (`Role string`, `Content string`). The package-private `llmClient` carries: model ID, base URL, context count, HTTP client pointer. All set once during construction; never modified afterward within this file. No mutexes or channels used.
-
-### Algorithmic Flow
-
-1. **Prepare payload**: Assemble request body by prepending `systemPrompt` as a system-role message before any user-supplied messages, serialize as JSON to Ollama `/api/chat`.
-2. **Send HTTP request**: Single synchronous POST with fixed timeout; no retries (fail-fast policy).
-3. **Handle response**: On 200 OK → deserialize body → extract `message.content` field. Non-2xx status code → error string containing both HTTP status and raw response payload.
-4. **Return result**: Extracted text content or wrapped error describing what went wrong.
-
-### Error Handling Patterns
-
-| Path | Wraps? | Notes |
-|---|---|---|
-| Marshal failure | ✅ `%w` | Good; caller can inspect via `errors.Is` |
-| HTTP request construction | ❌ raw | Unwrapped; context lost for callers |
-| Network/transport error | ❌ raw | Unwrapped; timeout vs DNS vs connect indistinguishable to caller |
-| Success-path body read | ❌ raw | Unwrapped (rare) |
-| JSON unmarshal failure | ✅ `%w` | Good |
-| Non-OK status response | ❌ custom message | Discards read error (`_`); uses undefined `maxErrorBodyBytes` constant |
-
-No retry logic. `defaultHTTPTimeout` and `maxErrorBodyBytes` referenced but not defined in this file; if they come from another package, callers have no visibility into their values or how they are set. No context propagation check between `Do()` and `Body.Close()`.
-
----
-
-## Runner & Entry Point (runner.go)
-
-### `Runner` / `Run`
-
-`Runner` wraps a config pointer and exposes a single `Run(ctx, repoRoot, mode, onEvent)` method that is the only public entry point into the pipeline. It performs four sequential operations:
-
-1. **Gitignore lockfile maintenance** — attempts to append the lockfile path to `.gitignore`. Failure is logged via `onEvent(EventStatus, ...)` and execution continues; no error returned.
-2. **Repository lock acquisition** — calls `security.AcquireLock(repoRoot)`. On failure, returns wrapped error: `"failed to acquire repository lock: %w"`. No partial work proceeds without the lock.
-3. **Mode dispatch** — constructs an LLM client from config fields (`cfg.ModelID`, `cfg.OllamaBaseURL`, `cfg.OllamaNumCtx`) and instantiates an `orchestrator`. Dispatches to either `RunInit` or `RunUpdate`; any other mode returns `"unsupported mode: %s"`.
-4. **Deferred lock release** — `defer lock.Unlock()` runs after the pipeline completes, regardless of success or failure.
-
-The `Runner.cfg` field is set once in `NewRunner(cfg)` and never mutated within this file. The pointer type allows external reassignment but no such mutation occurs here.
-
----
-
-## Orchestrator & Pipeline Modes (orchestrator.go)
-
-### `EventType`, `Event`, `orchestrator`
-
-Unexported struct with two exported constants on the `EventType` type alias: `EventStatus = "status"` and `EventError = "error"`. The unexported `orchestrator` struct carries a method receiver; its public surface is empty.
-
-### RunInit — Cold Start Flow
+## Data Flow
 
 ```
-1. setupPipeline() → discover files, compute hashes, load .gitignore (swallowed), load cache (swallowed)
-2. Mark every directory as affected (full regeneration)
-3. Synthesize root summary from full tree via LLM calls
-4. Generate architecture.md + quickstart.md using root summary
-5. Write agent guidelines file (append if marker missing, overwrite otherwise)
-6. Persist cache to disk → complete
+Runner.Run(ctx, repoRoot, mode) 
+    ↓ acquires lock via security.AcquireLock(repoRoot)
+orchestrator.RunInit(ctx, ...) | orchestrator.RunUpdate(ctx, ...)
+    ↓ setupPipeline() loads gitignore + discovers code files + computes SHA256 hashes per file
+tree.buildTree(files) → DirNode hierarchy
+    ↓ synthesizeNode(root) recurses post-order: child dirs first (reusing cached summaries), then each file
+client.CallLLM(...) — LLM API call for extraction step on chunked content
+reduceInChunks / reduceFileFacts — recursive text synthesis with batch partitioning and overlap handling
+cache.saveMetadataCache(repoRoot, docsDir, cache) — persists Files + Modules maps to disk as JSON
 ```
 
-### RunUpdate — Incremental Refresh Flow
+## File-Level Documentation
 
-```
-1. setupPipeline() → discover current files, compute hashes
-2. If extraction steps changed → invalidate entire cache (.StepsHash mismatch resets Files and Modules maps)
-3. Classify all discovered files into Added/Modified/Deleted buckets by comparing current vs cached SHA-256 hashes
-4. Build directory tree from allowed (existing + new) files only
-5. Purge stale module summaries: for any `cache.Modules` path not represented in the live tree, delete both the cache entry and the physical `.md` file (`_ = os.Remove(...)` — error swallowed).
-6. Compute affected directories; propagate upward through parent dirs.
-7. If `len(affectedDirs) == 0` → return early (no-op, docs are up to date).
-8. Synthesize root summary from the affected region via LLM calls.
-9. Re-generate architecture.md + quickstart.md only if `.` is in `affectedDirs`, or either file does not exist on disk, or resolution fails (treated as "not exists").
-10. Persist cache → complete.
-```
+### `cache.go` — Persistent Metadata Cache
 
-### Pipeline Context (`pipelineContext`)
+#### Types
 
-Unexported struct carrying: LLM client pointer, repo root string, config pointer, `*MetadataCache` pointer, affected directory set map, precomputed file hashes map, and event logger callback. Constructed fresh per invocation; no shared instances exist across goroutines in this file.
+- **`FileCacheEntry`** — Key-value pair mapping a file's SHA256 hash to its synthesized facts string. Used as the per-file cache entry in `MetadataCache.Files`.
+- **`MetadataCache`** — Package-level cache state containing:
+  - `Version int` — Cache format version; mismatched versions return an empty initialized structure rather than corrupt data.
+  - `StepsHash string` — SHA256 of serialized extraction steps, used to invalidate the entire cache when configuration changes.
+  - `Files map[string]FileCacheEntry` — Per-file hash→facts mapping for incremental updates.
+  - `Modules map[string]string` — Per-directory synthesized summary storage.
 
----
+#### Public API Surface
 
-## Cache Persistence Layer (cache.go)
+- **`IsInitialized(repoRoot, docsDir string) bool`** — Probes `{docsDir}/{metadataFileName}` existence; returns `false` on read failure (error swallowed).
+- **`saveMetadataCache(repoRoot, docsDir string, cache *MetadataCache) error`** — Serializes the metadata cache to indented JSON at `{docsDir}/{metadataFileName}`. Sets `cache.Version = currentCacheVersion` before marshaling. JSON marshal errors propagate; write failures propagate as-is.
+- **`computeSHA256(repoRoot, virtualPath string) (string, error)`** — Reads a source file via `tools.ReadFileSafely`, computes SHA256 hash in memory. Read errors propagated directly.
 
-### `MetadataCache`, `FileCacheEntry`
+#### Internal Functions
 
-Two structs with no methods:
-- **`FileCacheEntry`** — pairs a SHA256 digest string (`sha256`) with extracted facts string (`facts`). Stored in `MetadataCache.Files map[string]FileCacheEntry`.
-- **`MetadataCache`** — carries version int, steps hash string, files map, and modules map (module dir → synthesized summary).
+- **`loadMetadataCache(repoRoot, docsDir string) (*MetadataCache, error)`** — Constructs an empty `MetadataCache` with fresh maps (`make(map[string]FileCacheEntry)`, `make(map[string]string)`). If the cache file exists and parses successfully with matching version, returns parsed state + nil. On `os.ErrNotExist`: returns default structure + **nil error** (silent recovery). Other read errors wrapped via `%w`. Version mismatch: returns clean cache + nil without signaling an error.
 
-### IsInitialized(repoRoot, docsDir) bool
+#### Thread Safety
 
-Returns true only if the cache file exists AND is readable in one call. Reuses the existence check from `loadMetadataCache`. No error return.
-
-### saveMetadataCache(repoRoot, docsDir, cache) error
-
-Serializes to `{docsDir}/{metadataFileName}` with indented JSON (`json.MarshalIndent(cache, "", "  ")`). Marshaling errors propagate directly; write errors pass through `tools.WriteFileSafely`. The version field is pinned to the current value on every save.
-
-### Version Compatibility Guard
-
-On load: if `cache.Version != currentCacheVersion` (currently 1), returns a fresh zero-valued `MetadataCache{}` with nil error. No warning, no panic—caller sees success with an empty cache. This prevents stale metadata from corrupting future runs without explicit migration handling.
-
-### Fault-Tolerant Initialization
-
-If the file does not exist (`os.ErrNotExist` sentinel matched via `errors.Is`), returns a populated zero-valued cache with nil error. If it exists but cannot be read or unmarshaled, returns wrapped error `"failed to read metadata cache: %w"`. Callers can distinguish "not yet initialized" from "corrupt data."
+No synchronization primitives present. The maps in `MetadataCache` are created fresh and returned as struct values, but callers receive map references pointing to shared backing storage. Concurrent access to `Files`/`Modules` from multiple goroutines constitutes a data race unless external locking exists outside this module boundary. On-disk writes via `saveMetadataCache` provide coarse-grained serialization through OS write ordering alone; no explicit mutex is used.
 
 ---
 
-## Chunking & Reduction Engine (chunking.go)
+### `chunking.go` — Recursive Hierarchical Text Synthesis
 
-### reduceWithLLM, reduceInChunks, reduceFileFacts
+#### Internal Functions (All Unexported)
 
-All unexported; package-private. Implements a **context-aware recursive reduction** for LLM-based synthesis:
+- **`reduceWithLLM(ctx, c llmCaller, items []string, sysPrompt string, buildPrompt func(batch []string) string, logMsg func(batch []string) string, errMsg string, logEvent LogEventFunc) (string, error)`** — Feeds a batch of items to an LLM via `c.CallLLM(ctx, sysPrompt, messages, false)`. System prompt describes the synthesis task. Response markdown fences are stripped before returning. Errors from `CallLLM` wrapped as `fmt.Errorf("%s: %w", errMsg, err)` where `errMsg` is caller-supplied (e.g., `"LLM error during synthesis"`). Original error type information lost for classification purposes.
 
-1. **Split**: Input list divided into batches whose combined character count fits within `contextSize × maxCharsMultiplier`.
-2. **Reduce each batch**: Each batch sent to LLM via domain-specific prompt → one summary string per batch. If only one batch exists, returned directly; otherwise summaries concatenated and fed back into step 1 recursively until a single result remains.
-3. **Graceful truncation**: Items exceeding `maxChars` are truncated with `"...\n...[truncated]"`. If every item exceeds the per-item budget (`allowedPerItem`), all items uniformly truncated to avoid infinite loops.
-4. **Context cancellation**: Checked at entry points and before each recursive reduction round; cancellation errors propagate as-is.
+- **`reduceInChunks(ctx, c llmCaller, nodePath string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error)`** — Delegates to `reduceWithLLM`. No external I/O beyond the LLM call.
 
-### chunkTextWithOverlap (unused in this file)
+- **`reduceFileFacts(ctx, c llmCaller, filePath string, stepName string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error)`** — Delegates to `reduceWithLLM`. Used per extraction step during file synthesis in `synthesize.go`.
 
-Text-splitting utility with overlap between adjacent chunks. Appears available for reuse elsewhere but not referenced by any function here.
+- **`reduceItems(ctx, items []string, maxChars int, reduceFn func(batch []string) (string, error)) (string, error)`** — Core recursive reduction engine:
+  1. Partitions input items into batches where total character count stays within `maxChars`. Oversized single items are truncated in-place via `items[0] = string(runes[:maxChars]) + "\n...[truncated]"` (mutation without signal).
+  2. If exactly one batch exists, calls the reduction function on it directly.
+  3. Otherwise, recursively reduces each sub-batch independently, concatenates results, and recurses until a single result remains — forming a binary tree of reductions.
 
----
+- **`chunkTextWithOverlap(text string, maxRunes int, overlapRunes int) []string`** — Splits a single text into overlapping rune-counted chunks at fixed step size. Used for preparing input sequences requiring positional overlap between adjacent pieces during file synthesis.
 
-## Synthesis Core (synthesize.go)
+#### State and Side Effects
 
-All types and functions unexported (`pipelineContext`, `synthesizeNode`). Package-private.
-
-### Recursive Directory Synthesis
-
-A directory's summary is derived by recursively synthesizing children (subdirectories) and files together. Final result stored in cache under `cache.Modules[node.Path]` and written to disk at `docs/modules/<safe-filename>`.
-
-### Caching Strategy with Hash-Based Invalidation
-
-- **Module-level**: Stores synthesized summary per directory path. Reused when affected status indicates no changes (short-circuit return).
-- **File-level**: Stores SHA256 hash + extracted facts in `cache.Files[f]`. Cache hit determined by comparing precomputed or read file hash against cached entry; only re-reads on miss.
-
-### Multi-Step Extraction Pipeline Per File Chunk
-
-1. System prompt augmented with current extraction step's prompt.
-2. Single LLM call extracts facts from chunk → one fact per step.
-3. All steps produce respective facts for the same file → consolidated via `reduceFileFacts`.
-
-### Synthesis Order & Assembly
-
-1. File facts (sorted child name order).
-2. Child subdirectory summaries (after all files processed).
-3. Combined list reduced to final summary via `reduceInChunks` at directory level.
-
-### Affected-Dir Pruning
-
-If a directory path has no affected status AND a cached module summary exists → short-circuit return cached value without reprocessing children or files.
+- `reduceItems` mutates `items[0]` in-place when a single oversized item is encountered. This silent truncation provides no error signal to callers; data loss goes undetected unless output string is inspected.
+- All other functions are pure (string manipulation, recursion) with the sole exception of the LLM API call inside `reduceWithLLM`.
 
 ---
 
-## Tree & Change Detection (tree.go)
+### `client.go` — Ollama HTTP Client
 
-### Exported Types: `FileChange`, `DirNode`
+#### Types
 
-- **`FileChange`** — `Path string`, `Status string` ("Added", "Modified", "Deleted").
-- **`DirNode`** — `Path string`, `Files []string`, `Children map[string]*DirNode`.
+- **`Message`** — Struct with `Role string \`json:"role"\`` and `Content string \`json:"content"\``. Used as the conversational turn schema for LLM requests.
+- **`ollamaRequest`, `ollamaOptions`, `ollamaResponse`** — Unexported structs holding request/response payloads.
 
-### Three-Phase Algorithm
+#### Methods on `*llmClient`
 
-1. **Build tree**: Given raw file paths, split each on `/`, create intermediate `DirNode` entries for subdirectories, attach files to leaf nodes via `buildTree`.
-2. **Determine affected directories from changes**: For each input change, mark directly changed file as affected (if exists in current set). When a file is Deleted, mark parent directory as affected. Walk recursively and check additional conditions: if node path matches `docs/modules/<safe-name>` but no such doc exists on disk → affected; if node has empty cached metadata entry → affected.
-3. **Propagate status upward**: Recursive walk of `DirNode` tree propagates any `affected` flag from children to parents so a parent is considered affected if any child is.
+- **`newLLMClient(modelID, baseURL string, numCtx int) *llmClient`** — Constructor storing model identifier, base URL, and context size. Field assignments occur once; no subsequent mutation within the file.
+- **`(c *llmClient).NumCtx() int`** — Returns stored `numCtx` value. Read-only accessor.
+- **`(c *llmClient).prepareOllamaRequest(ctx, systemPrompt string, messages []Message, jsonFormat bool) (*http.Request, error)`** — Prepends the system prompt as a new entry to the messages array, then serializes model ID + conversation context + processing options into JSON. Constructs HTTP POST request targeting `{baseURL}/api/chat`. JSON marshal failures wrapped with `%w`; request construction errors propagated as-is.
+- **`(c *llmClient).CallLLM(ctx, systemPrompt string, messages []Message, jsonFormat bool) (string, error)`** — Executes the HTTP POST via `c.httpClient.Do` with timeout applied to the client itself (`&http.Client{Timeout: defaultHTTPTimeout}`). On 200 status: deserializes response body fully and returns generated text. On non-OK status: reads up to `maxErrorBodyBytes` (value undefined in this file; if zero, `io.LimitReader(resp.Body, 0)` blocks indefinitely until EOF rather than applying a size limit), then returns formatted error `"ollama api error: status %d, response: %s"` where the body read failure is silently swallowed — only the HTTP status and successfully-read bytes are visible in the returned error.
 
----
+#### Unresolved References
 
-## JSON Parser Utility (json_parser.go)
-
-### stripOuterMarkdownFence(input) string
-
-Single-pass parser that strips markdown or JSON code fences from strings:
-1. Trims whitespace from input.
-2. Attempts regex match against pattern capturing triple backticks with 3+ chars, optionally followed by `markdown` or `json`, then all content between opening and closing fences (group 1).
-3. If matched → returns trimmed captured inner content.
-4. If no match → returns original trimmed input unchanged.
-
-No error return parameter. `regexp.MustCompile` panics on invalid pattern at package init—unhandled within this file, propagates to any caller importing the package.
+- `defaultHTTPTimeout` and `maxErrorBodyBytes` referenced but not defined in this file; resolved at link time or via another package constant. If these resolve to zero values, behavior deviates from intended timeout/limit semantics.
 
 ---
 
-## Utility Functions for Filename Generation and Event Logging (utils.go)
+### `constants.go` — Runtime Configuration Contract
 
-### Responsibility
+#### Function Types
 
-This file provides two unexported utility functions supporting the engine's documentation generation pipeline and optional event logging instrumentation. Neither function communicates with external systems, modifies shared state, or returns errors. All operations are pure in-memory transformations.
+- **`LogEventFunc func(EventType, string)`** — Signature for external observer hooks into system events (type + message), enabling traceability without hardcoding logging implementation.
 
----
+#### Constants and Values
 
-### toSafeMarkdownFilename — Module Path to Markdown Filename Conversion
-
-**Signature:** `func toSafeMarkdownFilename(path string) string` (inferred from usage; exact signature not exported)
-
-#### Purpose
-
-Transforms a module path into a safe markdown documentation filename, enforcing the engine's implicit one-to-one mapping contract between modules and their `.md` documentation files. The root module is special-cased to default to `root.md`.
-
-#### Data Flow
-
-1. Input: a raw string representing a module path (e.g., `"internal/engine"`).
-2. Character substitution: every `/` character in the input is replaced with `_`.
-3. Extension appended: `.md` is concatenated to produce the final filename.
-4. Output: a single `string` containing the resulting markdown filename.
-
-#### Behavior Notes
-
-- No filesystem, network, database, or other external I/O occurs during execution.
-- The function returns only a result string; no error type is returned. Invalid input characters (anything other than `/`) are passed through unmodified — callers receive no escape hatch for detecting malformed paths.
-- Pure: no mutable state, no package-level globals modified, no struct fields touched.
+This file defines the numerical boundaries governing engine behavior:
+- HTTP operation timeout: 10 minutes before aborting network calls.
+- Error response truncation limit: responses beyond 1 KB are truncated for non-critical error paths.
+- Chunked text processing: input split into overlapping segments of ~800 characters, enabling streaming across large documents without full loading.
+- Context window budgeting: only 75% of total memory reserved; minimum floor enforced at ~512 tokens regardless of available space.
+- Output scaling rule: maximum generated output capped at roughly 3× input length to prevent runaway generation loops.
+- Persistent state layer: engine writes `.metadata.json` snapshot and reads agent behavior from `AGENTS.md`, establishing a file-based identity layer for long-running processes.
+- Directory permissions: any directories the engine creates are assigned 0755 by default, controlling filesystem boundary access.
 
 ---
 
-### makeLogEvent — Optional Event Callback Adapter
+### `json_parser.go` — Markdown Fence Stripping Utility
 
-**Signature:** `func makeLogEvent(onEvent LogEventFunc) func(EventType, message string)` (inferred from usage; `EventType`, `LogEventFunc` referenced but not defined in this file)
+#### Internal Functions
 
-#### Purpose
+- **`stripOuterMarkdownFence(content string) string`** — Best-effort extraction of raw content from strings wrapped in backtick-delimited markdown or JSON fences (3+ backticks, optional language identifier like `markdown` or `json`). Algorithm: trim whitespace → test against regex pattern for fence syntax → if match found, extract interior between opening and closing fences; otherwise return trimmed input unchanged. Regex mismatch returns original with whitespace stripped — no error signaled.
 
-Wires an optional callback into a logging pipeline. When invoked with an event type and message pair, it either forwards the call to the registered handler or silently discards it. This makes the logging subsystem purely additive — no required consumer exists for the engine's log events; instrumentation is opt-in only.
+#### Side Effects
 
-#### Data Flow
-
-1. Input: a user-provided `onEvent` callback of type `LogEventFunc`.
-2. Closure construction: returns a new function accepting `(EventType, message)` pairs.
-3. Invocation behavior: if `onEvent == nil`, the returned closure does nothing when called — no panic, no error, no log output. If `onEvent` is non-nil, the call is forwarded to it with the provided type and message arguments.
-
-#### Behavior Notes
-
-- No I/O anywhere in this flow.
-- Pure: no mutable state, no package-level globals modified.
-- Silent failure path: when `onEvent == nil`, events are swallowed without notice or error wrapping.
-- The returned function is always valid (non-nil), so callers can invoke it safely regardless of whether a handler was registered.
+No external I/O. Only standard library `regexp` and `strings` used for in-memory processing. If a malformed regex were supplied at compile time it would panic during package initialization, but this is not handled within the function scope.
 
 ---
 
-### Referenced Types (Defined Elsewhere)
+### `orchestrator.go` — Incremental Documentation Generation Orchestrator
 
-The following types are referenced in this file but not defined within it:
+#### Types
 
-| Type | Role |
+- **`EventType`** (`type string`) — Event classification type.
+- **`EventStatus`, `EventError`** (`constant EventType`) — Predefined event status/error constants.
+- **`Event struct`** — `Type EventType`, `Message string`. Carries typed event data with message payload.
+
+#### Methods on `*orchestrator`
+
+- **`GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum string, cfg *config.Config, logEvent LogEventFunc) error`** — Generates `architecture.md` and `quickstart.md` from the synthesized root summary. Writes both files via `tools.WriteFileSafely`. Errors wrapped and propagated.
+- **`RunInit(ctx, repoRoot string, cfg *config.Config, onEvent func(Event)) error`** — Full generation path:
+  1. Loads `.gitignore`, user-configured ignore paths, metadata cache from disk.
+  2. Discovers code files respecting ignores; errors propagated directly as returned errors.
+  3. Computes SHA256 hashes per file (per-file failures logged + skipped from processing).
+  4. Builds hierarchical directory tree from all discovered files.
+  5. Marks every directory as "affected" for fresh generation.
+  6. Traverses tree bottom-up: each node's summary becomes part of its parent's input; leaf summaries flow up through directories, then into module-level summaries, converging at repository root.
+  7. Uses root-level synthesis result to generate global `architecture.md` and `quickstart.md`.
+  8. Ensures `.agent-guidelines.md` exists: if missing, creates fresh; if contains "AI Agent Guidelines", appends; otherwise replaces. Read failures for this file are swallowed — code proceeds as if empty/missing. Write errors wrapped and returned.
+
+- **`RunUpdate(ctx, repoRoot string, cfg *config.Config, onEvent func(Event)) error`** — Incremental path:
+  1. Detects file changes by comparing current hashes against cached ones — classifying each as Added, Modified, or Deleted.
+  2. Builds tree only from currently existing files; prunes cache entries for deleted files and removes module documentation for directories no longer present.
+  3. Determines affected directories based on change set; propagates "affected" status through hierarchy.
+  4. If nothing changed (zero affected directories), returns immediately with no regeneration.
+  5. Otherwise re-runs hierarchical synthesis within affected modules only.
+
+- **Private Functions** — `setupPipeline(repoRoot, cfg, logEvent) (string, []string, *MetadataCache)` loads gitignore + discovers files + computes hashes; errors from `LoadGitignore` swallowed after logging warning event. `teardownPipeline(repoRoot, docsDir, cache, logEvent, successMsg)` saves metadata cache — write failures logged as warnings but **not returned** (silently swallowed).
+
+#### Error Propagation Summary
+
+| Operation | Failure Handling |
 |---|---|
-| `EventType` | Categorizes log events into discrete types; carried as the first argument to event handlers and consumed by the returned closure from `makeLogEvent`. |
-| `LogEventFunc` | Function signature for user-provided event handlers. Expected to accept `(EventType, message string)` or equivalent parameters. |
-| `Event` (struct) | Domain model with at least two fields: `Type` (`EventType`) and `Message` (`string`). Events are tracked as discrete, typed records carrying descriptive payloads. |
+| LLM call (`CallLLM`) | Wrapped + propagated as returned error |
+| Write file (`WriteFileSafely`) | Wrapped + propagated in main path; swallowed in teardown |
+| Read file (`ReadFileSafely` for `.agent-guidelines.md`) | Swallowed — falls through to write path |
+| Load gitignore | Logged warning, swallowed |
+| Discover files | Propagated as returned error |
+| SHA256 hash per file | Per-file: logged + skipped from processing |
+| MkdirAll | Wrapped + propagated |
+| SafeResolve (path existence) | Errors treated as "not found", swallowed |
+| os.Remove (cleanup) | Swallowed silently — stale files remain on disk if deletion fails |
 
 ---
 
-### Concurrency & State Summary
+### `runner.go` — Pipeline Execution Wrapper with Locking
 
-- **Mutable state:** None. Both functions operate entirely on their inputs and return values without touching package-level variables or struct fields.
-- **Concurrency mechanisms:** None. No mutexes, channels, atomic operations, or synchronization primitives are used in this file.
+#### Types and Constants
+
+- **`Mode type string`** — Operation mode of the documentation pipeline.
+- **`ModeInit`, `ModeUpdate`** (`const Mode`) — Init mode constant and update mode constant.
+- **`Runner struct`** — Orchestrates execution of the documentation pipeline. Holds immutable reference to configuration set once via `NewRunner`.
+
+#### Methods on `*Runner`
+
+- **`NewRunner(cfg *config.Config) *Runner`** — Constructor storing configuration values (model ID, base URL, context size). No field reassignment within this file after construction.
+- **`(r *Runner) Run(ctx, repoRoot string, mode Mode, onEvent func(Event)) error`** — Main entry point:
+  1. Attempts to add lockfile entry to `.gitignore` via `security.EnsureGitignoreHasLockfile(repoRoot)`; failure swallowed — only logged via callback.
+  2. Acquires exclusive repository lock via `security.AcquireLock(repoRoot)`. Failure propagated with wrapping: `"failed to acquire repository lock: %w"`.
+  3. Defer unlock for after pipeline completes (success or error). No explicit error handling for unlock failures visible in this file.
+  4. Instantiates LLM client and orchestrator based on stored configuration values.
+  5. Dispatches either `RunInit` or `RunUpdate` depending on mode string match; unknown modes return `"unsupported mode: %s"` without wrapping.
+
+---
+
+### `synthesize.go` — Recursive Context-Aware Synthesis Engine
+
+#### Internal Structures and Functions
+
+- **`pipelineContext struct`** — Holds shared state for a synthesis run: LLM client, repository root, docs directory, configuration, extraction steps, affected directories set, precalculated hashes map. Locally allocated per method call in `RunInit`/`RunUpdate`.
+- **`synthesizeNode(p *pipelineContext, node *DirNode) (string, error)`** — Recursive synthesis walking the directory tree:
+  1. Post-order traversal: process children before files. For each child directory, recursively call `synthesizeNode`; if child is not affected and has a cached summary, reuse directly.
+  2. Per-file processing loop: compute or retrieve SHA256 hash (from precalculated hashes map or read-and-hash). On cache hit (hash matches stored entry), return cached facts without reading the file. On cache miss, read file content; if multiple chunks needed based on dynamic context window size × 4 chars/token × allocation ratio, split with overlap. For each chunk, run LLM extraction across all configured `ExtractionSteps`, building consolidated fact per step via `reduceFileFacts`.
+  3. Component assembly: build list of components — file facts (prefixed by filename) followed by child directory summaries (prefixed by subsystem name). If no components exist, cache empty string and return early.
+  4. Final reduction: combine all assembled components into single consolidated summary for current directory using `reduceInChunks`. Cache result under `p.cache.Modules[node.Path]` and write to disk at `<docsDir>/modules/<safe-filename-of-path>`.
+
+#### External Interactions
+
+- **Disk Read**: `tools.ReadFileSafely(p.repoRoot, f)` reads individual source files when cache misses occur. Errors logged as warnings via callback but do not propagate — facts for that file remain empty string; processing continues to next file.
+- **Disk Write**: `tools.WriteFileSafely(p.repoRoot, modulePath, []byte(finalSum))` writes synthesized documentation at `<repoRoot>/<cfg.DocsDir>/modules/<safe-filename>`. Failures wrapped with context: `"failed to write module documentation for %s: %w"`. Propagates up through synthesis stack.
+- **Network/API**: `p.client.CallLLM(p.ctx, systemPrompt, []Message{...}, false)` makes LLM API calls per extraction step and chunk combination during file synthesis. Multiple sequential calls made per file (one per `cfg.ExtractionSteps`), multiple files processed before moving to child summary reduction.
+
+#### Thread Safety Assessment
+
+No explicit locks/mutexes visible in this file. Context (`p.ctx`) checked at boundaries for cancellation detection but does not prevent concurrent map writes to the cache. If multiple goroutines invoke `synthesizeNode` with different `pipelineContext` instances sharing the same underlying `*MetadataCache`, both `cache.Files` and `cache.Modules` maps will be concurrently written without locking — a data race unless external synchronization exists outside this module boundary.
+
+---
+
+### `tree.go` — Directory Tree Building and Affected Detection
+
+#### Types
+
+- **`FileChange struct`** — `Path string` (file path), `Status string` (change status: `"Added"`, `"Modified"`, `"Deleted"`).
+- **`DirNode struct`** — `Path string` (directory path), `Files []string` (list of file paths in this directory), `Children map[string]*DirNode` (child directory nodes keyed by name).
+
+#### Internal Functions
+
+- **`buildTree(repoRoot, files []string) *DirNode`** — Walks each path's directory components to create nested `DirNode` objects with files listed under parent directories. Mutated during tree construction only; single-threaded build path.
+- **`determineAffected(p *pipelineContext, node *DirNode) bool`** — For each node: checks if any file in its `Files` list matches a changed file (marks as affected); resolves expected module path via safe filename conversion and secure resolution; if resolved path does not exist on disk, marks as affected (indicating missing module); checks external metadata cache (`cache.Modules`); if no cached value recorded for this directory's path, marks as affected.
+- **`propagateAffected(p *pipelineContext) map[string]bool`** — Walks tree again; any node whose subtree contains an affected descendant gets itself marked as affected. Parent directories inherit children's impact.
+
+#### External I/O and Error Propagation
+
+- `determineAffected`: calls `os.Stat(absModulePath)` after resolving a module path via `security.SafeResolve`. Only the "not exist" case is handled; if `SafeResolve` returns an error or `Stat` returns a non-not-exist error (e.g., permission denied, I/O fault), it is not checked and never propagated to callers.
+- All other functions (`propagateAffected`, `buildTree`) are pure in-memory operations using only string manipulation via standard library imports — no actual read/write calls.
+
+---
+
+### `utils.go` — Internal Utility Helpers
+
+#### Internal Functions (Both Unexported)
+
+- **`toSafeMarkdownFilename(path string) string`** — Converts a module path into a filesystem-safe markdown filename by replacing `/` with `_`, defaulting to `root.md` when the result is empty or just `.`. Single-step transformation using only in-memory string manipulation (`strings.ReplaceAll`). Silently returns computed string regardless of input — no error signaling.
+- **`makeLogEvent(onEvent func(Event)) LogEventFunc`** — Produces a `LogEventFunc` that forwards an `EventType` and message string to an optional callback, with nil-safety for the callback. Returns a ready-to-use closure without error handling.
+
+#### Side Effects
+
+No external side effects. Both functions perform only in-memory operations: path separator replacement, default value fallback, and closure wrapping. No disk, network, database, or API interactions occur.
