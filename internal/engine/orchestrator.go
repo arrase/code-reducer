@@ -221,9 +221,9 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 		currentHash := currentFilesMap[f]
 		cachedEntry, exists := cache.Files[f]
 		if !exists {
-			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: "Added"})
+			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: StatusAdded})
 		} else if cachedEntry.SHA256 != currentHash {
-			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: "Modified"})
+			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: StatusModified})
 		}
 	}
 
@@ -234,7 +234,7 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 	sort.Strings(cachedFiles)
 	for _, f := range cachedFiles {
 		if _, exists := currentFilesMap[f]; !exists {
-			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: "Deleted"})
+			filteredChanges = append(filteredChanges, FileChange{Path: f, Status: StatusDeleted})
 		}
 	}
 

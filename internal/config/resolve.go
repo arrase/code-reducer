@@ -6,17 +6,24 @@ import (
 	"strconv"
 )
 
-// mergeAndDeduplicate merges two slices and removes duplicates.
-func mergeAndDeduplicate[T comparable](a, b []T) []T {
-	seen := make(map[T]bool)
-	var result []T
-	for _, item := range append(a, b...) {
+// deduplicate removes duplicates from a slice.
+func deduplicate(a []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+	for _, item := range a {
 		if !seen[item] {
 			seen[item] = true
 			result = append(result, item)
 		}
 	}
 	return result
+}
+
+func resolveString(yamlVal, defaultVal string) string {
+	if yamlVal != "" {
+		return yamlVal
+	}
+	return defaultVal
 }
 
 // ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
@@ -31,7 +38,7 @@ func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string) (*Config, error) {
 	}
 
 	// Deduplicate ignores
-	resolvedIgnore := mergeAndDeduplicate(cfg.Ignore, nil)
+	resolvedIgnore := deduplicate(cfg.Ignore)
 
 	// Extraction steps
 	resolvedSteps := cfg.ExtractionSteps
@@ -88,22 +95,10 @@ func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string) (*Config, error) {
 	}
 
 	// 5. Resolve prompts: Config > Default
-	resolved.SystemPrompt = DefaultSystemPrompt
-	if cfg.SystemPrompt != "" {
-		resolved.SystemPrompt = cfg.SystemPrompt
-	}
-	resolved.ModuleSynthesisPrompt = DefaultModuleSynthesisPrompt
-	if cfg.ModuleSynthesisPrompt != "" {
-		resolved.ModuleSynthesisPrompt = cfg.ModuleSynthesisPrompt
-	}
-	resolved.ArchitecturePrompt = DefaultArchitecturePrompt
-	if cfg.ArchitecturePrompt != "" {
-		resolved.ArchitecturePrompt = cfg.ArchitecturePrompt
-	}
-	resolved.FileFactConsolidationPrompt = DefaultFileFactConsolidationPrompt
-	if cfg.FileFactConsolidationPrompt != "" {
-		resolved.FileFactConsolidationPrompt = cfg.FileFactConsolidationPrompt
-	}
+	resolved.SystemPrompt = resolveString(cfg.SystemPrompt, DefaultSystemPrompt)
+	resolved.ModuleSynthesisPrompt = resolveString(cfg.ModuleSynthesisPrompt, DefaultModuleSynthesisPrompt)
+	resolved.ArchitecturePrompt = resolveString(cfg.ArchitecturePrompt, DefaultArchitecturePrompt)
+	resolved.FileFactConsolidationPrompt = resolveString(cfg.FileFactConsolidationPrompt, DefaultFileFactConsolidationPrompt)
 
 	return resolved, nil
 }

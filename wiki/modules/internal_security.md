@@ -1,62 +1,105 @@
-# Module: internal/security
+# internal/security — Repository-Safe Path Resolution & Locking
 
-## Responsibility
+## Module Responsibility
 
-Enforces security boundaries and inter-process exclusivity during Code-Reducer operations. The module prevents directory-traversal attacks by constraining resolved paths within the repository root, ensures shared resources are not accessed concurrently via file locking, and integrates with version control to keep lock state out of tracked content. No mutable package-level state exists; all concurrency control is instance-scoped.
+This package provides two safety primitives for a repository-aware tool: preventing directory escape during path resolution, and coordinating concurrent access through an exclusive lockfile. All operations are scoped to local filesystem state within the repository tree; no network calls or external APIs are invoked.
 
 ## Data Flow
 
-The two sentinel errors defined in `errors.go` (`ErrPathTraversal`, `ErrLockHeld`) serve as the terminal failure signals for path-validation and lock-contention scenarios. Callers receive these values through standard Go error-return patterns and propagate them via `if err != nil` checks; no panic, crash, or custom wrapping occurs within this package. The actual I/O operations that trigger these errors reside in other files not shown here.
-
-## Public API: `SimpleLock`
-
-### Type Definition
-
-```go
-type SimpleLock struct {
-    lockPath string
-    file     *os.File
-    mu       sync.Mutex
-    closed   bool
-}
+```
+┌─────────────┐    ┌──────────┐    ┌──────────────┐    ┌──────────────┐
+│  Caller     │───▶│ SafeResolve│───▶│ AcquireLock   │───▶│ SimpleLock  │
+│             │    │           │    │               │    │ (instance)  │
+└─────────────┘    └──────────┘    └──────────────┘    └──────────────┘
+                                                              │
+                                                              ▼
+                                                       Unlock() → nil error
 ```
 
-**State characteristics:**
+`SafeResolve` is invoked first by `AcquireLock` to guarantee the lockfile path lies within the symlink-resolved repo root. Both sentinel errors (`ErrPathTraversal`, `ErrLockHeld`) are defined in a separate file and returned only from downstream handlers; this package does not propagate them internally.
 
-- **`lockPath string`** — read-only after construction; never reassigned within this package. Assigned exclusively by the constructor.
-- **`file *os.File`** — modified inside `Unlock()` (`l.file = nil`) and assigned once in `AcquireLock()`.
-- **`mu sync.Mutex`** — value-type mutex embedded on each instance. Acquired and released only within `Unlock()` via defer.
-- **`closed bool`** — modified inside `Unlock()` (`l.closed = true`).
+---
 
-### Methods
+## Sentinel Errors — `errors.go`
 
-#### `Unlock() error`
+### ErrPathTraversal
 
-Closes the underlying file descriptor, removes the lockfile atomically (ignoring errors if the file no longer exists), and sets internal state to closed. Safe to call multiple times or from different goroutines without deadlocking. Returns a non-nil error only when both close and remove fail; otherwise returns nil. No panic path observed.
+Returned by external path validation logic when a resolved target lies outside the repository root boundary. Defined as an `errors.New()` sentinel with payload prefixed `"security violation:"`. No I/O or state mutation occurs in this file; the error exists solely for consumer handlers to return from their respective call sites.
 
-#### `SafeResolve(repoRoot string, inputPath string) (string, error)`
+### ErrLockHeld
 
-Resolves an arbitrary input path against the repository root boundary. Walks upward via `os.Lstat` until hitting the first physically-existing directory or reaching the root (`parent == current`). Symlinks are evaluated on existing ancestor components to defeat symlink-based traversal attacks. Non-existent suffix components are appended after the walk completes. If the relative path starts with `..`, it is rejected as a security violation and returns `ErrPathTraversal`. Any stat returning something other than ENOENT during the upward walk is returned immediately without masking — this could surface unexpected errors (e.g., EACCES) as fatal rather than being handled.
+Returned by external lock acquisition logic when another process already holds the shared resource. Also defined as an `errors.New()` sentinel with payload prefixed `"security violation:"`. The package-level description distinguishes inter-process contention ("another process") from intra-process re-entry, which this error does not signal.
 
-#### `AcquireLock() (*SimpleLock, error)`
+---
 
-Resolves a lockfile path within the repository root using `SafeResolve`; atomically creates the file via O_WRONLY|O_CREATE|O_EXCL to prevent concurrent acquisition from another process; writes the current PID into the newly-created file. If lock path cannot be resolved → returns nil plus the original error from SafeResolve. If O_EXCL open fails with EEXIST → wraps `ErrLockHeld` and includes lockPath in message. If write to lockfile fails → closes file, removes lockfile, then returns wrapped error (prevents stale locks). No panic or crash path observed.
+## Path Sanitization — `SafeResolve`
 
-#### `EnsureGitignoreHasLockfile(lockPath string) error`
+**Signature:** `func SafeResolve(repoRoot string, inputPath string) (string, error)`
 
-Reads `.gitignore`; checks whether it already contains an entry for the lockfile; if not, appends a commented entry under a temp file written atomically via rename. Uses `Sync()` before rename for durability. Failure modes: unreadable `.gitignore` → propagates upstream error; read failure (non-ENOENT) → wrapped; temp-file creation/write/sync/chmod/rename failures → each wrapped with descriptive messages. Partial writes are not persisted if sync fails (atomic-ish via same-directory pattern).
+### Algorithm Steps
 
-## Error Propagation Summary
+1. Convert `repoRoot` to an absolute path via `filepath.Abs`.
+2. Resolve symlinks on the existing ancestor parts of the joined (`root + input`) path by walking upward until a physically existing directory is found.
+3. Rebuild the full path from the resolved ancestor and any non-existent suffix components.
+4. Verify the resulting path lies strictly within the symlink-resolved repo root using `filepath.Rel`; reject if the relative path starts with `".."`.
 
-| Function | Failure Mode | Caller Impact |
-|---|---|---|
-| `SafeResolve` | Absolute path error, symlink resolution failure, stat-on-nonexistent-component error (only if not ENOENT), or path-traversal detection via `ErrPathTraversal`. | Any caller of `AcquireLock` or `EnsureGitignoreHasLockfile` receives the wrapped error directly. |
-| `AcquireLock` | Lock path cannot be resolved → returns nil + original error from SafeResolve. O_EXCL open fails with EEXIST → wraps `ErrLockHeld`. Write failure → closes file, removes lockfile, then returns wrapped error. | Caller receives non-nil error; no lock is held. No panic or crash path observed. |
-| `SimpleLock.Unlock()` | Close of underlying file fails → captured as err. Removal failure (other than ENOENT) only considered if close succeeded and removal also failed — otherwise swallowed (`if err == nil { err = removeErr }`). | Returns non-nil error only on double-failure; otherwise returns nil. No panic path. |
-| `EnsureGitignoreHasLockfile` | `.gitignore` cannot be resolved → propagates upstream. Read fails (non-ENOENT) → wraps error message. Temp file creation fails → wrapped. Write to temp file fails → wrapped. Sync fails → wrapped and returns early; subsequent close/rename skipped. Chmod fails → wrapped. Rename fails → wrapped. | Caller receives a descriptive error for each failure point. Sync-before-rename pattern means partial writes are not persisted if sync fails (atomic-ish). |
+### Error Handling
 
-## Notable Patterns / Risks
+- A specific `os.IsExist(err)` branch is checked after opening the lockfile with `O_EXCL` to distinguish "lock held by another process" from generic I/O errors. The existence case returns a user-facing message; other OS errors are wrapped and propagated upward.
+- Write failures during PID capture trigger cleanup: the file is closed and removed before returning an error, preventing stale partial lockfiles.
 
-- **`SafeResolve` loop**: The `for` loop calling `os.Lstat` walks upward until it finds an existing ancestor or reaches the root (`parent == current`). If a non-existent-component stat returns something other than ENOENT, it is returned immediately — this could mask unexpected errors (e.g., EACCES on a directory) as fatal rather than being handled.
-- **`.gitignore` rename**: The temp-file + rename pattern ensures atomicity but requires write access to the parent directory of `.gitignore`. Failure modes are well-covered, though no retry logic exists for transient I/O errors (e.g., NFS timeout during `Sync`).
-- **Lockfile cleanup on write failure**: In `AcquireLock`, if PID write fails, the lockfile is explicitly removed before returning error — this prevents stale locks from being left behind.
+---
+
+## Exclusive Locking — `AcquireLock` & `SimpleLock.Unlock()`
+
+### AcquireLock
+
+**Signature:** `func AcquireLock(repoRoot string) (*SimpleLock, error)`
+
+1. Resolve the lockfile path via `SafeResolve` so it is guaranteed inside the repo root.
+2. Open the file with `O_EXCL` (exclusive creation) to atomically detect whether another process holds the lock.
+3. If acquisition fails due to existence, return an error suggesting manual cleanup of a stale lockfile.
+4. Write the current PID into the newly created lockfile.
+
+### SimpleLock
+
+**Fields:** All fields are lowercase/private (`closed`, `mu`, etc.). The struct embeds `sync.Mutex` for serialization of unlock calls on the same instance only; concurrent acquisition across different instances (different processes) is by design—each process gets its own lock.
+
+**Instance-Level Mutable State:**
+| Field | Type | Modified By | Synchronization |
+|-------|------|-------------|-----------------|
+| `closed` | `bool` | `Unlock()` sets to `true` | Internal `sync.Mutex` (`mu`) |
+
+### Unlock
+
+**Signature:** `func (l *SimpleLock) Unlock() error`
+
+1. Close the underlying file and remove the lockfile from disk; treat missing-file errors as benign so repeated calls do not fail.
+2. If both close and remove fail: close error is returned only if no other error occurred; otherwise the remove error (non-`IsNotExist`) takes precedence.
+3. Idempotent: checks `l.closed` first; if already released, returns nil without further I/O.
+
+---
+
+## Gitignore Maintenance — `EnsureGitignoreHasLockfile`
+
+**Signature:** `func EnsureGitignoreHasLockfile(repoRoot string) error`
+
+1. Read `.gitignore` (or tolerate its absence).
+2. Append a commented entry for the lockfile if it is not already present.
+3. Write the updated content to a temporary file, then atomically rename it over the original `.gitignore`.
+
+### Atomicity Guarantees
+
+- `os.CreateTemp(dir, ".gitignore.tmp.*")` creates a temp file in the same directory as `.gitignore`, ensuring rename is atomic on the filesystem.
+- `tmpFile.Sync()` forces OS-to-disk flush before close.
+- `os.Rename(tmpName, gitignorePath)` atomically replaces `.gitignore` with the new content via rename; temp file cleanup runs via a deferred function always executed regardless of success or failure path.
+
+---
+
+## Concurrency Model
+
+### Package-Level State
+No mutable state at package level. All constants (`LockFileName`) are compile-time immutable values.
+
+### Instance-Level State
+Only `SimpleLock` carries instance-local state protected by an internal mutex for the unlock path. No global counters, shared caches, or concurrently-accessed variables exist across instances.

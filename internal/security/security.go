@@ -53,11 +53,8 @@ func SafeResolve(repoRoot, inputPath string) (string, error) {
 	}
 
 	// Rebuild the resolved full path
-	resolvedPath := resolvedAncestor
-	if len(nonExistentSuffix) > 0 {
-		resolvedPath = filepath.Join(append([]string{resolvedAncestor}, nonExistentSuffix...)...)
-	}
-	resolvedPath = filepath.Clean(resolvedPath)
+	parts := append([]string{resolvedAncestor}, nonExistentSuffix...)
+	resolvedPath := filepath.Join(parts...)
 
 	// Verify that resolvedPath is inside resolvedRoot
 	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
@@ -86,10 +83,7 @@ func (l *SimpleLock) Unlock() error {
 	l.closed = true
 
 	var err error
-	if l.file != nil {
-		err = l.file.Close()
-		l.file = nil
-	}
+	err = l.file.Close()
 	if removeErr := os.Remove(l.lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
 		if err == nil {
 			err = removeErr
@@ -109,7 +103,7 @@ func AcquireLock(repoRoot string) (*SimpleLock, error) {
 	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, defaultFilePerm)
 	if err != nil {
 		if os.IsExist(err) {
-			return nil, fmt.Errorf("%w: lock at %s is already held by another process. If you are sure no other code-reducer process is running, delete this stale lockfile manually", ErrLockHeld, lockPath)
+			return nil, fmt.Errorf("%w: %s. If you are sure no other code-reducer process is running, delete this stale lockfile manually", ErrLockHeld, lockPath)
 		}
 		return nil, fmt.Errorf("failed to acquire lock at %s: %w", lockPath, err)
 	}

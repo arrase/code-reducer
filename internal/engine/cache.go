@@ -33,38 +33,30 @@ func computeStepsHash(steps []config.ExtractionStep) string {
 	return hex.EncodeToString(h[:])
 }
 
+func newEmptyCache() *MetadataCache {
+	return &MetadataCache{
+		Version: currentCacheVersion,
+		Files:   make(map[string]FileCacheEntry),
+		Modules: make(map[string]string),
+	}
+}
+
 func loadMetadataCache(repoRoot string, docsDir string) (*MetadataCache, error) {
 	metadataPath := filepath.Join(docsDir, metadataFileName)
 	data, err := tools.ReadFileSafely(repoRoot, metadataPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return &MetadataCache{
-				Version: currentCacheVersion,
-				Files:   make(map[string]FileCacheEntry),
-				Modules: make(map[string]string),
-			}, nil
+			return newEmptyCache(), nil
 		}
-		return &MetadataCache{
-			Version: currentCacheVersion,
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}, fmt.Errorf("failed to read metadata cache: %w", err)
+		return newEmptyCache(), fmt.Errorf("failed to read metadata cache: %w", err)
 	}
 	var cache MetadataCache
 	if err := json.Unmarshal(data, &cache); err != nil {
-		return &MetadataCache{
-			Version: currentCacheVersion,
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}, fmt.Errorf("failed to unmarshal metadata cache: %w", err)
+		return newEmptyCache(), fmt.Errorf("failed to unmarshal metadata cache: %w", err)
 	}
 	if cache.Version != currentCacheVersion {
 		// Incompatible version: return a clean cache
-		return &MetadataCache{
-			Version: currentCacheVersion,
-			Files:   make(map[string]FileCacheEntry),
-			Modules: make(map[string]string),
-		}, nil
+		return newEmptyCache(), nil
 	}
 	if cache.Files == nil {
 		cache.Files = make(map[string]FileCacheEntry)

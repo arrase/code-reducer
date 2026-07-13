@@ -34,7 +34,7 @@ func init() {
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
 }
 
-func executeCommand(mode string) error {
+func executeCommand(mode engine.Mode) error {
 	repoRoot, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("failed to get current working directory: %w", err)

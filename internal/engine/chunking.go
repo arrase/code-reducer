@@ -64,11 +64,18 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 		return "", err
 	}
 
-	// If there is exactly one item and it exceeds the max allowed character limit, truncate it.
-	if len(items) == 1 && utf8.RuneCountInString(items[0]) > maxChars {
-		runes := []rune(items[0])
-		items[0] = string(runes[:maxChars]) + "\n...[truncated]"
+	// 1. Expand items that are too large (More layers)
+	var expanded []string
+	for _, item := range items {
+		if utf8.RuneCountInString(item) > maxChars {
+			// Chunk large items to ensure they can be batched comfortably
+			chunks := chunkTextWithOverlap(item, maxChars/2, maxChars/10)
+			expanded = append(expanded, chunks...)
+		} else {
+			expanded = append(expanded, item)
+		}
 	}
+	items = expanded
 
 	var batches [][]string
 	var currentBatch []string
@@ -89,26 +96,16 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 		batches = append(batches, currentBatch)
 	}
 
-	// Prevent infinite loop if items cannot be batched together
-	if len(batches) == len(items) && len(items) > 1 {
-		allowedPerItem := maxChars / len(items)
-		var truncatedItems []string
-		for _, item := range items {
-			if utf8.RuneCountInString(item) > allowedPerItem {
-				runes := []rune(item)
-				truncatedItems = append(truncatedItems, string(runes[:allowedPerItem])+"\n...[truncated]")
-			} else {
-				truncatedItems = append(truncatedItems, item)
-			}
-		}
-		batches = [][]string{truncatedItems}
-	}
-
 	if len(batches) == 1 {
 		return reduceFn(batches[0])
 	}
 
 	var intermediate []string
+	totalInputRunes := 0
+	for _, item := range items {
+		totalInputRunes += utf8.RuneCountInString(item)
+	}
+
 	for _, batch := range batches {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -119,6 +116,20 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 		}
 		intermediate = append(intermediate, chunkRes)
 	}
+
+	totalOutputRunes := 0
+	for _, item := range intermediate {
+		totalOutputRunes += utf8.RuneCountInString(item)
+	}
+
+	// Loop Prevention: If the LLM is failing to condense the information (output >= 95% of input),
+	// we stop adding layers and concatenate. This prevents infinite map-reduce loops.
+	// Since the downstream processes (like next level in the tree) will automatically chunk
+	// oversized inputs, we safely preserve all information without exceeding the context window.
+	if totalOutputRunes >= (totalInputRunes * 95 / 100) {
+		return strings.Join(intermediate, "\n\n"), nil
+	}
+
 	return reduceItems(ctx, intermediate, maxChars, reduceFn)
 }
 
