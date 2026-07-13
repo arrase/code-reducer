@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code-Reducer - Local LLM Documentation Generator</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+
+    <header>
+        <div class="container">
+            <nav>
+                <a href="#" class="logo">Code-Reducer</a>
+                <ul class="nav-links">
+                    <li><a href="#features">Features</a></li>
+                    <li><a href="#architecture">Architecture</a></li>
+                    <li><a href="#quickstart">Quick Start</a></li>
+                    <li><a href="https://github.com/arrase/code-reducer" target="_blank">GitHub</a></li>
+                </ul>
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        <div class="hero">
+            <div class="container">
+                <h1>Code-Reducer</h1>
+                <p>A lightweight, high-performance command-line tool written in Go that automatically generates and maintains developer-friendly, comprehensive wikis for extensive repositories using local LLMs.</p>
+                <a href="https://github.com/arrase/code-reducer" class="btn" target="_blank"><i class="fab fa-github"></i> View on GitHub</a>
+            </div>
+        </div>
+
+        <section id="about">
+            <div class="container">
+                <h2>What is Code-Reducer?</h2>
+                <p>
+                    <strong>Code-Reducer</strong> is designed specifically for <strong>local development and private LLMs</strong>. It uses a custom <strong>Hierarchical Map-Reduce Strategy</strong> to analyze large codebases using small, local LLM models (e.g., 7B, 9B, or 26B parameters) via <strong>Ollama</strong> without exceeding context windows or degrading output quality.
+                </p>
+            </div>
+        </section>
+
+        <section id="features">
+            <div class="container">
+                <h2>Features</h2>
+                <div class="features-grid">
+                    <div class="feature-card">
+                        <div class="feature-title">🌳 Hierarchical Map-Reduce Pipeline</div>
+                        <p>Breaks codebase synthesis into a structured Map-Reduce pipeline to document large directories recursively, staying strictly within local LLM context limits.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-title">🔒 Optimized for Local LLMs</div>
+                        <p>Built specifically to leverage Ollama (e.g., ornith:9b or gemma4:26b), eliminating expensive cloud API costs and keeping proprietary code local.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-title">⚙️ Fully Customizable</div>
+                        <p>Allows overriding default system prompts, synthesis rules, architecture blueprints, and file fact consolidation directly from YAML configuration.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-title">🛡️ Security Sandbox</div>
+                        <p>Features path traversal guards, atomic process locking, and TOCTOU symlink hijacking defenses for safe workspace operations.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-title">⚡ Fast Incremental Updates</div>
+                        <p>Uses a filesystem SHA256 hash cache to only re-document modified files, propagating changes upward to minimize LLM calls.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-title">🔄 Smart Cache Invalidation</div>
+                        <p>Automatically detects changes in your extraction steps pipeline and invalidates the cache to ensure documentation accuracy.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="architecture">
+            <div class="container">
+                <h2>Architecture & Security</h2>
+                <p>Code-Reducer uses a Multi-Layer Map-Reduce engine to prevent massive folders from blowing out Ollama's context window. It applies a recursive bottom-up consolidation strategy.</p>
+                <div class="alert-box alert-tip">
+                    <strong>🚀 Security First</strong>
+                    <p>Every filesystem operation passes through a security sandbox with path traversal guards and atomic locks to serialize execution.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="quickstart">
+            <div class="container">
+                <h2>Quick Start</h2>
+                <p>Ensure you have Go (1.26+) and Ollama running locally.</p>
+                
+                <h3>Build and Run</h3>
+                <pre><code>go build -o code-reducer main.go
+./code-reducer init</code></pre>
+                
+                <p>Keep your docs updated incrementally by running <code>./code-reducer update</code>.</p>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 Code-Reducer. Built with ❤️ and AI.</p>
+        </div>
+    </footer>
+
+</body>
+</html>
