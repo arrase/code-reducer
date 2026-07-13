@@ -8,26 +8,35 @@ import (
 	"github.com/arrase/code-reducer/internal/security"
 )
 
+// Mode represents the operation mode of the documentation pipeline.
+type Mode string
+
+const (
+	// ModeInit initializes the project documentation.
+	ModeInit   Mode = "init"
+	// ModeUpdate updates the existing project documentation incrementally.
+	ModeUpdate Mode = "update"
+)
+
+// Runner orchestrates the execution of the documentation pipeline.
 type Runner struct {
 	cfg *config.Config
 }
 
+// NewRunner creates a new Runner instance with the given configuration.
 func NewRunner(cfg *config.Config) *Runner {
 	return &Runner{
 		cfg: cfg,
 	}
 }
 
-func (r *Runner) Run(ctx context.Context, repoRoot string, mode string, onEvent func(Event)) error {
-	logEvent := func(t, m string) {
-		if onEvent != nil {
-			onEvent(Event{Type: t, Message: m})
-		}
-	}
+// Run executes the documentation pipeline for the specified mode.
+func (r *Runner) Run(ctx context.Context, repoRoot string, mode Mode, onEvent func(Event)) error {
+	logEvent := makeLogEvent(onEvent)
 
 	// 1. Ensure lockfile is in gitignore
 	if err := security.EnsureGitignoreHasLockfile(repoRoot); err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to ensure gitignore has lockfile: %v", err))
+		logEvent(EventStatus, fmt.Sprintf("Warning: failed to ensure gitignore has lockfile: %v", err))
 	}
 
 	// 2. Acquire repository lock
@@ -37,16 +46,17 @@ func (r *Runner) Run(ctx context.Context, repoRoot string, mode string, onEvent 
 	}
 	defer lock.Unlock()
 
-	// 3. Instantiate LLM Client
-	client := NewLLMClient(r.cfg.ModelID, r.cfg.OllamaBaseURL, r.cfg.OllamaNumCtx)
+	// 3. Instantiate LLM Client & Orchestrator
+	client := newLLMClient(r.cfg.ModelID, r.cfg.OllamaBaseURL, r.cfg.OllamaNumCtx)
+	orch := &orchestrator{client: client}
 
 	// 4. Run the documentation pipeline
-	if mode == "init" {
-		if err := client.RunInit(ctx, repoRoot, r.cfg, onEvent); err != nil {
+	if mode == ModeInit {
+		if err := orch.RunInit(ctx, repoRoot, r.cfg, onEvent); err != nil {
 			return err
 		}
-	} else if mode == "update" {
-		if err := client.RunUpdate(ctx, repoRoot, r.cfg, onEvent); err != nil {
+	} else if mode == ModeUpdate {
+		if err := orch.RunUpdate(ctx, repoRoot, r.cfg, onEvent); err != nil {
 			return err
 		}
 	} else {

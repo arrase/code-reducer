@@ -31,6 +31,9 @@ func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataC
 	changedFiles := make(map[string]bool)
 	for _, c := range filteredChanges {
 		changedFiles[c.Path] = true
+		if c.Status == "Deleted" {
+			affectedDirs[path.Dir(c.Path)] = true
+		}
 	}
 
 	var checkNode func(n *DirNode)
@@ -42,7 +45,7 @@ func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataC
 			}
 		}
 
-		safeName := ToSafeMarkdownFilename(n.Path)
+		safeName := toSafeMarkdownFilename(n.Path)
 		modulePath := filepath.Join(docsDir, "modules", safeName)
 		absModulePath, err := security.SafeResolve(repoRoot, modulePath)
 		if err == nil {

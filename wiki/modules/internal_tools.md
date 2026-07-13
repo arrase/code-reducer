@@ -1,110 +1,107 @@
-# `internal/tools` — File System & Git Operations Module
+# Package: internal/tools — Architecture Document
 
 ## Module Responsibility
 
-This module provides two complementary interfaces for repository-aware operations: safe file I/O with TOCTOU race mitigation, and Git process abstraction for executing commands within the working tree. Both modules operate on a single root path (`repoRoot`) without shared mutable state, and neither uses concurrency primitives — all functions are goroutine-safe by construction.
+The `internal/tools` package provides repository-scanning primitives for a codebase-analysis tool. It exposes two functional domains: **safe local file I/O** (`file_tools.go`) and **git subprocess orchestration** (`git_tools.go`). Together they enable the caller to discover source-code files, classify their content type, read/write artifacts safely, and validate that the target directory is a git work-tree before proceeding.
+
+Data flow follows a two-phase pattern:
+1. `VerifyGitRepo` (or an equivalent pre-flight check) confirms the working directory corresponds to a valid git repository by invoking `git rev-parse --is-inside-work-tree`.
+2. Once validated, `DiscoverCodeFiles` walks the entire tree under that root, applying layered ignore rules and returning only text-source files.
+
+Both domains share these architectural constraints: **no panics**, **error wrapping** (stderr is preserved for diagnostics), and **no network/DB calls**. All I/O operates within a single local process or on the local filesystem.
 
 ---
 
-## `file_tools.go` — Safe File I/O & Discovery
+## File Operations (`file_tools.go`)
 
-### Core Functions
+### Safe Read / Write Primitive
 
-| Function | Input | Output |
-|---|---|---|
-| [`ReadFileSafely`](file:///path/to/file_tools.go#L15-L64) | `repoRoot`, `virtualPath` `string` | `[]byte`, `error` |
-| [`WriteFileSafely`](file:///path/to/file_tools.go#L70-L132) | `repoRoot`, `virtualPath` `string`; `content` `[]byte` | `error` |
-| [`LoadGitignore`](file:///path/to/file_tools.go#L138-L164) | `repoRoot` `string` | `[]string`, `error` |
-| [`ShouldIgnoreFile`](file:///path/to/file_tools.go#L170-L236) | `repoRoot`, `relPath` `string`; `gitIgnore` `*ignore.GitIgnore`; `ignoredExtensions` `[]string` | `bool` |
-| [`DiscoverCodeFiles`](file:///path/to/file_tools.go#L242-L291) | `repoRoot` `string`; `ignores`, `ignoredExtensions` `[]string` | `[]string`, `error` |
-| [`IsBinaryFile`](file:///path/to/file_tools.go#L297-L315) | `path` `string` | `bool` |
+`ReadFileSafely` and `WriteFileSafely` implement TOCTOU-safe file operations using the temp-file + rename pattern.
 
-### TOCTOU Race Mitigation Pattern
+**Shared sequence:**
+1. Resolve a virtual path to an absolute filesystem path via `SafeResolve`.
+2. On write: create parent directories with `defaultDirPerm`; on read: no directory creation.
+3. Open or create a temporary file in the target directory using `os.CreateTemp`.
+4. Write content (for writes) or read from the resolved path (for reads).
+5. Close and sync (writes only); close (reads only).
+6. Rename temp into final destination for writes; return contents for reads.
 
-Both `ReadFileSafely` and `WriteFileSafely` implement a Time-Of-Check-Time-Of-Use safety pattern:
+**Symlink detection:** Both paths verify the target is not a symlink via `os.Lstat`/`f.Stat`. Pre-open checks prevent TOCTOU swap attacks where an attacker replaces a real file with a symlink between resolution and open. Post-open checks catch any state changes after the initial open.
 
-1. Resolve the virtual path to an absolute safe path via `SafeResolve`
-2. Open the file descriptor first
-3. Perform `lstat` on the resolved path (no symlink following)
-4. Perform `fstat` on the open file descriptor (follows symlinks)
-5. Verify that `lstat` and `fstat` reference the same inode — mismatch indicates a symlink race between opening and checking
+**Error semantics:**
+- `ReadFileSafely`: returns `nil, err` on failure; wraps each step with context strings (`failed to open file`, `failed to lstat`, etc.). Symlink detection yields an explicit "security violation" error rather than a generic I/O error.
+- `WriteFileSafely`: all failure paths return wrapped errors (directory creation, temp write, sync, close, chmod, rename). No panic usage; no sentinel values.
 
-Both operations reject any symlink detection as a security violation. On success, `ReadFileSafely` reads all content via buffered I/O; on success, `WriteFileSafely` truncates to zero first (safe only because symlinks were ruled out), then writes the provided content.
+**Deferred cleanup:** Both functions defer `f.Close()` for reads and use deferred `os.Remove` in `WriteFileSafely` to clean up temp files if the rename fails.
 
-### Error Handling Contract
+### Gitignore Handling
 
-| Function | Wrapped Errors (`%w`) | Swallowed | Sentinel Unwrapped |
-|---|---|---|---|
-| `ReadFileSafely` | Yes, for every I/O error | No | Symlink race check |
-| `WriteFileSafely` | Yes, for every I/O error | No | Symlink race check |
-| `LoadGitignore` | No | Missing file → `(nil, nil)` | None |
-| `ShouldIgnoreFile` | No | `SafeResolve` err → returns `true` | None |
-| `DiscoverCodeFiles` | No | Extensive — walk callback errors swallowed at each node | None |
-| `IsBinaryFile` | No | All open/read errors → `false` | None |
+- **`LoadGitignore(repoRoot)`**: Opens `.gitignore` under `repoRoot`. If absent (`os.IsNotExist`), returns `nil, nil` — no error raised. Any other open/read failure is returned unwrapped.
+- **`ShouldIgnoreFile(repoRoot, relPath, gitIgnore)`**: Applies layered rules:
+  1. Check against compiled `GitIgnore` patterns (user-supplied + `.gitignore`).
+  2. Reject any path component starting with `.` or ending with `.egg-info`, regardless of other rules.
+  3. If extension matches a known text-source language list, accept as code.
+  4. For unknown extensions: resolve absolute path and scan first 1024 bytes for null bytes; binaries return `true`.
 
-### File Discovery Algorithm (Multi-Layer Ignore Rules)
+**Side effect note:** `ShouldIgnoreFile` opens the file on every invocation to classify unknown extensions — this is a real I/O side effect per call, not cached.
 
-A file is considered "ignored" if it matches **any** of these conditions:
+### Code Discovery Pipeline (`DiscoverCodeFiles`)
 
-- Matches a compiled gitignore pattern list
-- Has a path component starting with `.` or ending in `.egg-info`
-- Has an extension matching the user-provided ignored extensions list (case-insensitive, supports both `.` prefix and suffix forms)
-- Is detected as binary by reading up to 1024 bytes and scanning for null byte (`\x00`)
+**Input:** repository root + list of ignore patterns (strings).
+**Output:** slice of relative source-code paths.
 
-If any single check returns true, the file is excluded. This is a **union** of ignore conditions.
+**Algorithmic flow:**
+1. Compile user-supplied ignore patterns and `.gitignore` entries into a single `GitIgnore` object via `LoadGitignore`.
+2. Walk the entire tree recursively using `filepath.WalkDir`. For each entry:
+   - Directory: if name starts with `.` or matches any compiled pattern, skip subtree entirely.
+   - File: delegate to `ShouldIgnoreFile`.
+3. Collect passing files into result slice.
 
-The primary business rule is to recursively walk the repository root and discover high-signal source code files while filtering out noise: build artifacts, dependency directories, output files, dot-prefixed hidden paths, `.egg-info` markers, binary files, and any user-defined ignore patterns (via gitignore compilation).
+**Walk error handling:** If a walk callback returns an error for a single entry, the error is printed to `stderr` and that item is skipped (`return nil`). The overall `err` from `WalkDir` propagates at the end — terminal fatal errors are returned; non-fatal entries are swallowed silently.
 
-### Binary Detection Rule
+### Binary Classification (`IsBinaryFile`)
 
-A file is considered binary if its first 1024 bytes contain a null byte (`\x00`). Files that cannot be opened are treated as non-binary (returns false), avoiding the loading of entire files into memory for classification.
+Scans first 1024 bytes for null bytes to distinguish text source files from binary content. Returns `true` (ignored) on any I/O error other than EOF — this "fail-closed" assumption treats unreadable files as likely binary rather than propagating the actual error.
 
----
-
-## `git_tools.go` — Git Process Abstraction
-
-### Core Functions
-
-| Function | Input | Output |
-|---|---|---|
-| [`RunGit`](file:///path/to/git_tools.go#L15-L64) | `repoRoot string`, variadic `args ...string` | `(string, error)` |
-| [`VerifyGitRepo`](file:///path/to/git_tools.go#L70-L89) | `repoRoot string` | `error` |
-
-### Execution Model
-
-Both functions spawn the `git` binary via `exec.Command("git", ...)` with `--no-pager`, restricting execution to the provided root directory. Both capture stdout and stderr into buffers synchronously. No standard library packages beyond `bytes`, `fmt`, `os/exec`, `strings` are imported.
-
-### Error Handling Contract
-
-| Function | Failure Path | Behavior |
-|---|---|---|
-| `RunGit` | Exit code ≠ 0 | Wraps error: `git command failed: %v, stderr: %s`. Returns `(string, error)` with stdout and wrapped error. No panic. |
-| `RunGit` | Exit code 0 | Returns `(trimmedOut, nil)`. Stdout is whitespace-trimmed; stderr is discarded on success. |
-| `VerifyGitRepo` | `RunGit(...)` returns error | Wraps it: `not a git repository (or any of the parent directories)`. The original stderr content is lost in this wrapper. Returns only the wrapped sentinel-like error. No panic. |
-
-### Repository Integrity Check
-
-A directory is considered a valid Git working tree only if `git rev-parse --is-inside-work-tree` succeeds; any failure indicates the path is outside a Git working tree or not a git repository at all. The verification phase delegates to the execution phase with specific arguments, interpreting success as confirmation of repository validity and failure as an assertion that the directory is not a Git repository.
+**Constants:** `binaryDetectionBufSize` is lowercase and package-private; not exported.
 
 ---
 
-## Data Flow Summary
+## Git Tools (`git_tools.go`)
 
+### External Command Execution (`RunGit`)
+
+Spawns `git --no-pager` via `exec.Command` with any additional arguments from the caller. The subprocess runs within `repoRoot` as its working directory. Stdout/stderr are captured into in-memory `bytes.Buffer`; no file, network, or DB I/O occurs.
+
+**Failure handling:** On error, wraps the original with stderr content:
 ```
-DiscoverCodeFiles(repoRoot, ignores, ignoredExtensions)
-├── Compile gitignore from ignore lines → gitIgnore object (in-memory, no I/O)
-└── filepath.WalkDir(repoRoot):
-    ├── Skip repo root itself (first entry)
-    ├── If directory:
-    │   ├── Check name against dot-prefix / .egg-info / gitIgnore
-    │   └── If any match → Skip entire subtree
-    └── If file:
-        └── ShouldIgnoreFile check:
-            ├── gitignore matches? → ignore
-            ├── path component starts with "." or ends ".egg-info"? → ignore
-            ├── extension in ignoredExtensions list? → ignore
-            ├── binary? → ignore
-            └── otherwise → add to result list
-
-Result: flat list of relative paths representing source code files that pass all safety and filtering rules.
+fmt.Errorf("git command failed: %v, stderr: %s", err, trimmedErr)
 ```
+Returns `(string, error)` — partial stdout is still delivered alongside the error. No panics.
+
+### Repository Validation (`VerifyGitRepo`)
+
+Delegates to `RunGit` with subcommand `rev-parse --is-inside-work-tree`. If this invocation results in an error, returns a fixed message: `"not a git repository (or any of the parent directories)"`. The original stderr is discarded at this wrapper layer — normalized to a single sentinel-style message for downstream callers.
+
+---
+
+## Concurrency & State Analysis
+
+**Mutable state:** None detected across both files. All constants are `const` (compile-time); all variables (`safePath`, `dir`, `tmpFile`, `tmpName`, `patterns`, `files`, `buf`, `cmd`, `stdout`, `stderr`, etc.) are function-local and never escape their defining scope. No package-level global state is modified.
+
+**Concurrency mechanisms:** None detected. No `sync.Mutex`, channels, `atomic` types, or other synchronization primitives. Shared mutable state does not exist to protect.
+
+---
+
+## Error Handling Summary
+
+| Pattern | Where |
+|---|---|
+| Wrap-and-return (preserve stderr) | `RunGit` |
+| Normalize to sentinel message | `VerifyGitRepo` |
+| Sentinel + wrap with context | `ReadFileSafely`, `WriteFileSafely`, `LoadGitignore` |
+| Boolean return, resolve failures as "ignored" | `ShouldIgnoreFile` |
+| Swallow per-entry walk errors, propagate terminal | `DiscoverCodeFiles` |
+| Fail-closed (I/O error → binary assumption) | `IsBinaryFile` |
+
+**No panics** observed across either file. All errors are returned to callers as Go values.

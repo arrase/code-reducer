@@ -13,72 +13,85 @@ import (
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
+// EventType defines the type of pipeline events.
+type EventType string
+
+const (
+	// EventStatus represents progress/status updates.
+	EventStatus EventType = "status"
+	// EventError represents execution errors.
+	EventError  EventType = "error"
+)
+
+// Event represents a progress or error notification from the pipeline.
 type Event struct {
-	Type    string
+	Type    EventType
 	Message string
 }
 
-func (c *LLMClient) GenerateStandardDocs(ctx context.Context, repoRoot, docsDir, rootSum string, logEvent func(string, string)) error {
-	logEvent("status", "Step 3: Global Architecture Synthesis...")
+type orchestrator struct {
+	client llmCaller
+}
+
+func (o *orchestrator) GenerateStandardDocs(ctx context.Context, repoRoot, docsDir, rootSum string, cfg *config.Config, logEvent LogEventFunc) error {
+	logEvent(EventStatus, "Step 3: Global Architecture Synthesis...")
 	archPath := filepath.Join(docsDir, "architecture.md")
 	archMsg := fmt.Sprintf("Write the global architecture overview (%s/architecture.md) based on the root summary.\n\n%s", docsDir, rootSum)
-	archDoc, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("architecture"), []Message{{Role: "user", Content: archMsg}}, false)
+	sysPrompt := cfg.SystemPrompt + "\n" + cfg.ArchitecturePrompt
+	archDoc, err := o.client.CallLLM(ctx, sysPrompt, []Message{{Role: "user", Content: archMsg}}, false)
 	if err != nil {
 		return fmt.Errorf("failed to generate global architecture: %w", err)
 	}
-	if err := tools.WriteFileSafely(repoRoot, archPath, []byte(StripOuterMarkdownFence(archDoc))); err != nil {
+	if err := tools.WriteFileSafely(repoRoot, archPath, []byte(stripOuterMarkdownFence(archDoc))); err != nil {
 		return fmt.Errorf("failed to write architecture.md: %w", err)
 	}
 
-	logEvent("status", "Step 4: Generating Quickstart...")
+	logEvent(EventStatus, "Step 4: Generating Quickstart...")
 	qsPath := filepath.Join(docsDir, "quickstart.md")
 	qsMsg := fmt.Sprintf("Write the %s/quickstart.md page based on this architecture.\n\n%s", docsDir, rootSum)
-	qsDoc, err := c.CallLLM(ctx, c.GetDefaultSystemPrompt("architecture"), []Message{{Role: "user", Content: qsMsg}}, false)
+	qsDoc, err := o.client.CallLLM(ctx, sysPrompt, []Message{{Role: "user", Content: qsMsg}}, false)
 	if err != nil {
 		return fmt.Errorf("failed to generate quickstart documentation: %w", err)
 	}
-	if err := tools.WriteFileSafely(repoRoot, qsPath, []byte(StripOuterMarkdownFence(qsDoc))); err != nil {
+	if err := tools.WriteFileSafely(repoRoot, qsPath, []byte(stripOuterMarkdownFence(qsDoc))); err != nil {
 		return fmt.Errorf("failed to write quickstart.md: %w", err)
 	}
 
 	return nil
 }
 
-func setupPipeline(repoRoot string, cfg *config.Config, logEvent func(string, string)) (string, []string, *MetadataCache) {
+func setupPipeline(repoRoot string, cfg *config.Config, logEvent LogEventFunc) (string, []string, *MetadataCache) {
 	docsDir := cfg.DocsDir
 	gitignorePatterns, err := tools.LoadGitignore(repoRoot)
 	if err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
+		logEvent(EventStatus, fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
 	}
 	ignores := append(cfg.Ignore, docsDir)
 	ignores = append(ignores, gitignorePatterns...)
 
 	cache, err := loadMetadataCache(repoRoot, docsDir)
 	if err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to load metadata cache: %v", err))
+		logEvent(EventStatus, fmt.Sprintf("Warning: failed to load metadata cache: %v", err))
 	}
 	return docsDir, ignores, cache
 }
 
-func teardownPipeline(repoRoot, docsDir string, cache *MetadataCache, logEvent func(string, string), successMsg string) {
+func teardownPipeline(repoRoot, docsDir string, cache *MetadataCache, logEvent LogEventFunc, successMsg string) {
 	if err := saveMetadataCache(repoRoot, docsDir, cache); err != nil {
-		logEvent("status", fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
+		logEvent(EventStatus, fmt.Sprintf("Warning: failed to save metadata cache: %v", err))
 	}
-	logEvent("status", successMsg)
+	logEvent(EventStatus, successMsg)
 }
 
-func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
-	logEvent := func(t, m string) {
-		if onEvent != nil {
-			onEvent(Event{Type: t, Message: m})
-		}
-	}
-	logEvent("status", "Starting Map-Reduce pipeline: init")
-	logEvent("status", "Step 1: Code Discovery & Building Tree...")
+func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
+	logEvent := makeLogEvent(onEvent)
+	logEvent(EventStatus, "Starting Map-Reduce pipeline: init")
+	logEvent(EventStatus, "Step 1: Code Discovery & Building Tree...")
 	
 	docsDir, ignores, cache := setupPipeline(repoRoot, cfg, logEvent)
+	cache.StepsHash = computeStepsHash(cfg.ExtractionSteps)
 
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores, cfg.IgnoreExtensions)
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
 	if err != nil {
 		return err
 	}
@@ -88,16 +101,18 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 		hash, err := computeSHA256(repoRoot, f)
 		if err == nil {
 			precalculatedHashes[f] = hash
+		} else {
+			logEvent(EventStatus, fmt.Sprintf("Warning: failed to compute hash for %s: %v", f, err))
 		}
 	}
 
 	tree := buildTree(codeFiles)
 	modulesDir := filepath.Join(repoRoot, docsDir, "modules")
-	if err := os.MkdirAll(modulesDir, 0755); err != nil {
+	if err := os.MkdirAll(modulesDir, defaultDirPerm); err != nil {
 		return fmt.Errorf("failed to create modules directory: %w", err)
 	}
 
-	logEvent("status", "Step 2: Hierarchical Tree-Merging (Map-Reduce)...")
+	logEvent(EventStatus, "Step 2: Hierarchical Tree-Merging (Map-Reduce)...")
 
 	affectedDirs := make(map[string]bool)
 	var markAllAffected func(n *DirNode)
@@ -109,17 +124,28 @@ func (c *LLMClient) RunInit(ctx context.Context, repoRoot string, cfg *config.Co
 	}
 	markAllAffected(tree)
 
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, precalculatedHashes, logEvent)
+	pCtx := &pipelineContext{
+		ctx:                 ctx,
+		client:              o.client,
+		repoRoot:            repoRoot,
+		cfg:                 cfg,
+		cache:               cache,
+		affectedDirs:        affectedDirs,
+		precalculatedHashes: precalculatedHashes,
+		logEvent:            logEvent,
+	}
+
+	rootSum, err := synthesizeNode(pCtx, tree)
 	if err != nil {
 		return err
 	}
 
-	if err := c.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, logEvent); err != nil {
+	if err := o.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, cfg, logEvent); err != nil {
 		return err
 	}
 
-	logEvent("status", "Step 5: Updating AGENTS.md...")
-	agentFilePath := "AGENTS.md"
+	logEvent(EventStatus, fmt.Sprintf("Step 5: Updating %s...", agentsFileName))
+	agentFilePath := agentsFileName
 	agentGuidelines := fmt.Sprintf(`# AI Agent Guidelines
 
 This repository contains automatically generated documentation under the %s directory to help AI coding agents understand the system architecture, design patterns, and module structure:
@@ -134,7 +160,7 @@ Before making changes, analyze these files to align with existing design choices
 	agentFileBytes, err := tools.ReadFileSafely(repoRoot, agentFilePath)
 	if err != nil {
 		if err := tools.WriteFileSafely(repoRoot, agentFilePath, []byte(agentGuidelines)); err != nil {
-			return fmt.Errorf("failed to write AGENTS.md: %w", err)
+			return fmt.Errorf("failed to write %s: %w", agentsFileName, err)
 		}
 	} else {
 		content := string(agentFileBytes)
@@ -147,7 +173,7 @@ Before making changes, analyze these files to align with existing design choices
 			}
 			newContent := content + separator + agentGuidelines
 			if err := tools.WriteFileSafely(repoRoot, agentFilePath, []byte(newContent)); err != nil {
-				return fmt.Errorf("failed to append to AGENTS.md: %w", err)
+				return fmt.Errorf("failed to append to %s: %w", agentsFileName, err)
 			}
 		}
 	}
@@ -156,19 +182,23 @@ Before making changes, analyze these files to align with existing design choices
 	return nil
 }
 
-func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
-	logEvent := func(t, m string) {
-		if onEvent != nil {
-			onEvent(Event{Type: t, Message: m})
-		}
-	}
-	logEvent("status", "Starting Map-Reduce pipeline: update")
+func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
+	logEvent := makeLogEvent(onEvent)
+	logEvent(EventStatus, "Starting Map-Reduce pipeline: update")
 
 	docsDir, ignores, cache := setupPipeline(repoRoot, cfg, logEvent)
 
-	logEvent("status", "Step 1: Detecting changed files...")
+	currentStepsHash := computeStepsHash(cfg.ExtractionSteps)
+	if cache.StepsHash != currentStepsHash {
+		logEvent(EventStatus, "Warning: Extraction steps changed. Invalidating metadata cache to force full documentation regeneration.")
+		cache.Files = make(map[string]FileCacheEntry)
+		cache.Modules = make(map[string]string)
+		cache.StepsHash = currentStepsHash
+	}
 
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores, cfg.IgnoreExtensions)
+	logEvent(EventStatus, "Step 1: Detecting changed files...")
+
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
 	if err != nil {
 		return err
 	}
@@ -178,11 +208,13 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	var allowedCodeFiles []string
 
 	for _, f := range codeFiles {
-		allowedCodeFiles = append(allowedCodeFiles, f)
 		hash, err := computeSHA256(repoRoot, f)
-		if err == nil {
-			currentFilesMap[f] = hash
+		if err != nil {
+			logEvent(EventStatus, fmt.Sprintf("Warning: failed to compute hash for %s: %v", f, err))
+			continue
 		}
+		currentFilesMap[f] = hash
+		allowedCodeFiles = append(allowedCodeFiles, f)
 	}
 
 	for _, f := range allowedCodeFiles {
@@ -233,7 +265,7 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	for mPath := range cache.Modules {
 		if !activeDirs[mPath] {
 			delete(cache.Modules, mPath)
-			moduleFile := filepath.Join(docsDir, "modules", ToSafeMarkdownFilename(mPath))
+			moduleFile := filepath.Join(docsDir, "modules", toSafeMarkdownFilename(mPath))
 			if absModuleFile, err := security.SafeResolve(repoRoot, moduleFile); err == nil {
 				_ = os.Remove(absModuleFile)
 			}
@@ -244,12 +276,23 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	propagateAffected(tree, affectedDirs)
 
 	if len(affectedDirs) == 0 {
-		logEvent("status", "No modifications detected. Documentation is up to date.")
+		logEvent(EventStatus, "No modifications detected. Documentation is up to date.")
 		return nil
 	}
 
-	logEvent("status", fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
-	rootSum, err := synthesizeNode(ctx, c, tree, repoRoot, cfg, cache, affectedDirs, currentFilesMap, logEvent)
+	logEvent(EventStatus, fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
+	pCtx := &pipelineContext{
+		ctx:                 ctx,
+		client:              o.client,
+		repoRoot:            repoRoot,
+		cfg:                 cfg,
+		cache:               cache,
+		affectedDirs:        affectedDirs,
+		precalculatedHashes: currentFilesMap,
+		logEvent:            logEvent,
+	}
+
+	rootSum, err := synthesizeNode(pCtx, tree)
 	if err != nil {
 		return err
 	}
@@ -270,11 +313,11 @@ func (c *LLMClient) RunUpdate(ctx context.Context, repoRoot string, cfg *config.
 	}
 
 	if affectedDirs["."] || !archExists || !qsExists {
-		if err := c.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, logEvent); err != nil {
+		if err := o.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, cfg, logEvent); err != nil {
 			return err
 		}
 	} else {
-		logEvent("status", "Global architecture and quickstart pages are up to date. Skipping regeneration.")
+		logEvent(EventStatus, "Global architecture and quickstart pages are up to date. Skipping regeneration.")
 	}
 
 	teardownPipeline(repoRoot, docsDir, cache, logEvent, "Pipeline update completed successfully!")

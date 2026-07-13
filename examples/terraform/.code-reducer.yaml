@@ -1,0 +1,55 @@
+# Example .code-reducer.yaml for analyzing Terraform infrastructure projects
+model_id: "ornith:9b"
+ollama_base_url: "http://localhost:11434"
+ollama_num_ctx: 8192
+docs_dir: "wiki"
+
+# Tell the LLM to behave as a Cloud Architect and IaC analyzer
+system_prompt: |
+  You are Code-Reducer, an expert Cloud Architect and Terraform infrastructure analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
+  DEFENSIVE RULES: 
+  1. Do NOT assume resources exist unless explicitly declared in the configuration.
+  2. Do NOT guess downstream resource side effects unless directly linked (e.g., via security group attachments or subnet associations).
+  3. Only report resource definitions and configurations you are 100% sure about.
+
+# Synthesis prompt for directory modules (which represent infrastructure sub-components)
+module_synthesis_prompt: |
+  Task: Write a technical documentation page for a Terraform module based on the provided list of its internal resources, variables, and sub-modules.
+  Rule 1: Group related resources (e.g., networking, compute, database, IAM) under appropriate Markdown headings.
+  Rule 2: Explain the primary responsibility of this module, the resource dependency flow, and security configurations.
+  Rule 3: Keep it highly technical, listing key resources, inputs, and outputs.
+
+# Synthesis prompt for the global infrastructure overview
+architecture_prompt: |
+  Task: Write a global cloud architecture overview and deployment guide based on the module summaries.
+  Rule 1: Explain the high-level cloud topology, provider requirements, and how modules connect (e.g., VPC connecting to EKS and RDS).
+  Rule 2: Provide a dense, developer-friendly infrastructure overview and standard Terraform deployment commands (init, plan, apply).
+
+file_fact_consolidation_prompt: |
+  You are a specialized infrastructure documentation assistant. Consolidate, deduplicate and merge the following facts extracted from different chunks of the same Terraform file into a single, cohesive summary.
+
+# Custom extraction steps during map phase
+extraction_steps:
+  - name: "PROVISIONED_RESOURCES"
+    prompt: |
+      Task: Extract resources and data sources defined in this file.
+      Output: A strict Markdown list of all resources (`resource "type" "name"`) and data sources (`data "type" "name"`). Note key parameters (e.g. instance type, VPC CIDR, backend configurations).
+  - name: "VARIABLES_AND_OUTPUTS"
+    prompt: |
+      Task: Analyze input variables, outputs, and local variables.
+      Output: List all input variables (with types and default values) and outputs exported by this file. Mention any complex local variables (`locals`) that define key configurations.
+  - name: "MODULE_DEPENDENCIES"
+    prompt: |
+      Task: Analyze sub-module usage.
+      Output: Identify any external or internal modules called in this file (`module "name"`), their source paths, and the key inputs passed to them.
+  - name: "IAM_AND_SECURITY"
+    prompt: |
+      Task: Analyze permissions, IAM roles, and security groups.
+      Output: Detail security groups, firewall rules, IAM roles, policies, and KMS keys defined in this file. Outline what access permissions or network paths they allow.
+
+# Ignore Terraform state, local plugins, and lock files
+ignore:
+  - ".terraform"
+  - "*.tfstate"
+  - "*.tfstate.backup"
+  - ".terraform.lock.hcl"

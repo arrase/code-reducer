@@ -1,121 +1,136 @@
-# `internal/config` — Package Documentation
+# Module: internal/config — Configuration Layer for Code Reducer Synthesis Pipeline
 
-## Responsibility and Data Flow
+## Responsibility
 
-The package implements a **multi-layer configuration resolution** pipeline for the code analysis tool. Configuration values flow through four precedence tiers: hard-coded defaults → YAML file (`~/.config/code-reducer.yaml`) → environment variables → CLI flags. Each layer overwrites prior values when present; missing layers are transparently skipped.
+This module manages the lifecycle of project-level configuration for a multi-phase LLM analysis pipeline that generates technical documentation from source code. It defines three distinct concerns: (1) compile-time type and constant declarations, (2) file-system operations on `.code-reducer.yaml` with atomic write guarantees, and (3) multi-source value resolution across defaults, YAML, environment variables, and CLI flags.
 
-Three properties are resolved independently: `ModelID`, `OllamaBaseURL`, and `OllamaNumCtx`. The package also structures the analysis pipeline into named **extraction steps** (`ExtractionStep`), each carrying a distinct prompt template. These steps can be customized per project via YAML or wholesale replaced by CLI flag.
+## Data Flow
 
-All non-structural state (resolved config, local variables) is ephemeral—scoped to function calls and returned as values. No package-level mutable state survives beyond initialization. Concurrency primitives are absent; the package is single-threaded in its design.
+The module's data flow is sequential: `config.go` declares the schema (`Config`, `ExtractionStep`) and compile-time constants; `io.go` provides read/write primitives against a fixed path derived from `cwd`; `resolve.go` composes these into a resolved `*Config` by merging across four priority tiers. No state persists between calls within this module—each resolution produces a fresh `*Config` allocation whose fields are populated through the merge chain and returned to callers for consumption elsewhere in the application.
 
-## Types
+---
 
-### `ExtractionStep`
+## Configuration Types and Defaults (`config.go`)
 
-```go
-type ExtractionStep struct {
-    Name   string // step identifier (e.g., "api-signatures", "business-logic")
-    Prompt string // prompt template applied to this phase during analysis
-}
-```
+### Exported Structs
 
-Instances are held in a package-level slice (`DefaultExtractionSteps`). The slice is immutable after declaration; callers receive copies or slices of it.
+**`ExtractionStep`** — Carries per-phase identifiers:
+- `Name string` — Phase identifier (e.g., `"API_SIGNATURES"`, `"BUSINESS_LOGIC"`).
+- `Prompt string` — The prompt text handed to the LLM for that phase.
 
-### `Config`
+**`Config`** — Aggregate configuration container referenced by all exported functions:
+- `ModelID string`
+- `OllamaBaseURL string`
+- `OllamaNumCtx int`
+- `DocsDir string`
+- `SystemPrompt string`, `ModuleSynthesisPrompt string`, `ArchitecturePrompt string`, `FileFactConsolidationPrompt string` — First-class prompt templates, all configurable via YAML.
+- `ExtractionSteps []ExtractionStep`
+- `Ignore []string`
 
-```go
-type Config struct {
-    ModelID              string            // resolved model identifier (last-wins: default → YAML → env → flag)
-    OllamaBaseURL        string            // resolved base URL (default → YAML → env; CLI flag omitted)
-    OllamaNumCtx         int               // resolved context size, validated positive (default → YAML → env → flag)
-    DocsDir              string            // path to the documents directory under analysis
-    ExtractionSteps      []ExtractionStep  // ordered list of extraction phases
-    Ignore               []string          // absolute paths excluded from traversal
-    IgnoreExtensions     []string          // file extensions excluded from traversal
-}
-```
+### Exported Constants
 
-## Constants and Defaults
+Environment variable keys (`CodeReducerModelIDEnvKey`, `OllamaBaseURLEnvKey`, `OllamaNumCtxEnvKey`), default values for Ollama instance parameters (`OllamaDefaultBaseURL = "http://localhost:11434"`, `OllamaDefaultModelID = "ornith:9b"`, `OllamaDefaultNumCtx = 8192`), file-system defaults (`DefaultDocsDir = "wiki"`, `ConfigFileName = ".code-reducer.yaml"`), and multiline prompt templates are all package-level constants.
 
-### Environment Variable Keys
+### Exported Variable
 
-| Constant | Value | Purpose |
-|---|---|---|
-| `CodeReducerModelIdEnvKey` | `"CODE_REDUCER_MODEL_ID"` | Overrides `Config.ModelID` when set. |
-| `OllamaBaseUrlEnvKey` | `"OLLAMA_BASE_URL"` | Overrides `Config.OllamaBaseURL` when set. |
-| `OllamaNumCtxEnvKey` | `"OLLAMA_NUM_CTX"` | Overrides `Config.OllamaNumCtx` when set; value must parse as a positive integer. |
+**`DefaultExtractionSteps`** — Pre-populated slice containing four named phases: `API_SIGNATURES`, `BUSINESS_LOGIC`, `STATE_AND_CONCURRENCY`, `ERRORS_AND_SIDE_EFFECTS`. Initialized at declaration only; no post-initialization mutations occur in this file.
 
-### Default Values
+### Non-Exported
 
-| Constant | Value | Purpose |
-|---|---|---|
-| `OllamaDefaultBaseURL` | `"http://localhost:11434"` | Fallback base URL when no prior layer supplies one. |
-| `OllamaDefaultModelID` | `"ornith:9b"` | Default model identifier. |
-| `OllamaDefaultNumCtx` | `8192` | Default context size. |
+Internal helper variable `configFilePerm` (value `0600`) is referenced by `io.go` but not declared here. No exported interfaces or methods exist on these types.
 
-### Configuration File
+---
 
-| Constant | Value | Purpose |
-|---|---|---|
-| `ConfigFileName` | `".code-reducer.yaml"` | Filename resolved relative to the current working directory by `getConfigPath`. |
+## Configuration File Lifecycle (`io.go`)
 
-## Package-Level Immutable Defaults
+### Exported Functions
 
-Three slices are declared at package init and never mutated:
+| Function | Input | Output |
+|----------|-------|--------|
+| `ConfigExists(cwd string)` | cwd directory path | `bool` |
+| `LoadConfig(cwd string)` | cwd directory path | `*Config`, `error` |
+| `SaveConfig(cwd string, cfg *Config)` | cwd, config pointer | `error` |
 
-```go
-var DefaultIgnores           []string // system-supplied ignore paths
-var DefaultIgnoredExtensions []string // system-supplied ignored extensions
-var DefaultExtractionSteps   []ExtractionStep // ordered extraction phases
-```
+No exported structs or interfaces are defined in this file. All external type references (`Config`) come from the same package.
 
-Callers may append to these slices externally, but the package itself never reassigns them. `SaveConfig` writes the current slice state back to disk; callers must mutate before save if they need custom defaults.
+### Atomic Write Pattern for SaveConfig
 
-## Public API Surface
+The save operation does not write directly to the target path. The sequence is: marshal `cfg` into YAML bytes → apply formatting normalization (collapsing single blank lines to double blank lines before known section headers: `system_prompt`, `module_synthesis_prompt`, `architecture_prompt`, `file_fact_consolidation_prompt`, `extraction_steps`, `ignore`) → create a temp file matching `.tmp.*` in the same directory → write normalized YAML into it → sync and close → set permissions via `os.Chmod` → atomically rename temp over original. Readers never observe a partially-written config during save because the old file remains intact until the new one is fully ready to replace it.
 
-### Path Resolution and Existence Check
+### Load-Save Roundtrip Integrity
 
-#### `getConfigPath(cwd string) (string, error)`
+Loading preserves whatever formatting was originally written; normalization is applied only on write, not read. This decouples the in-memory representation from on-disk formatting expectations. `LoadConfig` returns a fresh `*Config` via unmarshaling with no shared state. Errors from `os.ReadFile` propagate directly; YAML parse failures are wrapped with a `"failed to parse yaml config"` prefix chained via `%w`; marshal failures similarly wrap a descriptive message.
 
-Constructs the full path to `.code-reducer.yaml` by joining `cwd` with `ConfigFileName`. Returns a non-nil error only on I/O failure during construction; normal cases return `nil`.
+### Error Propagation Strategy
 
-#### `ConfigExists(cwd string) bool`
+- **Raw return**: When `os.ReadFile` fails in `LoadConfig`, the OS error is returned unwrapped.
+- **Wrap with context (`fmt.Errorf(... %w)`)**: Parse and write failures across all save-path operations (temp create, write, sync, close, chmod, rename). All wrapped calls preserve chain via `%w`.
+- **Error-as-boolean sentinel**: `ConfigExists` uses an `err == nil` check instead of returning the error. No wrapping; raw error is reused as a boolean condition.
+- **Silent cleanup in defer**: A deferred function calls `tmpFile.Close()` and `os.Remove(tmpName)`. Errors from these cleanup calls are swallowed (not returned). On success, `Close` runs twice on the temp file—Go allows this safely—and the defer's `Remove` returns an error that is silently swallowed because the original config now holds the renamed data.
 
-Returns whether the configuration file exists at the resolved path. Internally calls `os.Stat`; all errors (permission denied, I/O failures, etc.) are swallowed and treated as "does not exist". The function returns no error.
+### Disk Operations Summary
 
-### Configuration Loading
+| Function | Disk Operations |
+|---|---|
+| `getConfigPath` (internal) | None; pure computation via `filepath.Join`. |
+| `ConfigExists` | One read-only check via `os.Stat`. Error sentinel reused as boolean condition. |
+| `LoadConfig` | Two disk reads: `os.ReadFile` then `yaml.Unmarshal`. Missing-file errors propagate raw; parse failures are wrapped. |
+| `SaveConfig` | Multiple writes: `os.CreateTemp`, `tmpFile.Write`, `tmpFile.Sync`, `tmpFile.Close`, `os.Chmod`, `os.Rename`. Each step returns its own error; all but the final rename are wrapped. |
 
-#### `LoadConfig(cwd string) (*Config, error)`
+No network I/O anywhere in this module. No database operations referenced.
 
-Reads and parses the YAML configuration file at the resolved path. Error handling:
-- File-read failure (`os.ReadFile`) → returned to caller unchanged (pass-through).
-- YAML parse failure → wrapped as `"failed to parse yaml config: %w"`.
+---
 
-Returns a non-nil `*Config` on success; the struct is initialized with zero values before parsing, so callers receive a populated object even when the file contains only valid empty mappings.
+## Multi-Source Configuration Resolution (`resolve.go`)
 
-#### `ResolveConfig(repoRoot, modelIdFlag, numCtxFlag string) (*Config, error)`
+### Exported Functions
 
-Top-level entry point for full configuration resolution. Algorithm:
-1. Calls `LoadConfig` to read the YAML file. If the error is a non-existent-file sentinel (`os.IsNotExist(err)`), it swallows and initializes an empty `Config{}`; all other errors propagate wrapped as `"failed to load configuration file:"`.
-2. Layers defaults (hard-coded constants) over the loaded config.
-3. Layers environment variable overrides using `os.Getenv` for `CODE_REDUCER_MODEL_ID`, `OLLAMA_BASE_URL`, and `OLLAMA_NUM_CTX`. Non-empty values are used; empty strings fall through. Env read errors are swallowed.
-4. Applies CLI flags (`modelIdFlag`, `numCtxFlag`). The flag value is parsed via `strconv.Atoi`; only `err == nil && n > 0` is accepted—invalid or non-positive values cause the prior layer's value to be retained silently.
+| Function | Input Types | Output Types |
+|----------|-------------|--------------|
+| `ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string)` | `(string, string, string)` | `(*config.Config, error)` |
 
-Returns a fully resolved `*Config`. Errors are either pass-through (from `LoadConfig`) or wrapped with `"failed to load configuration file:"`. Notable: if YAML is malformed, the parse error wraps and propagates; otherwise resolution always succeeds for missing files.
+Internal helper `mergeAndDeduplicate` is lowercase and not part of the public surface. Only usage (not definition) of package-level types (`Config`, `OllamaDefaultModelID`, `CodeReducerModelIDEnvKey`, `DefaultExtractionSteps`) is visible here.
 
-### Configuration Persistence
+### Resolution Priority System
 
-#### `SaveConfig(cwd string, cfg *Config) error`
+Each configurable field follows its own independent priority chain, lowest to highest: **defaults → YAML config file → environment variables → CLI flags**. The merge-and-deduplicate logic operates on local function scopes with no cross-goroutine visibility and no shared mutable state.
 
-Serializes the config struct back to disk using `os.WriteFile` with `0600` permissions. Error handling:
-- Write success → returns `nil`.
-- Parse failure (marshal YAML) → wrapped as `"failed to marshal yaml: %w"`.
-- File-write failure → wrapped as `"failed to write config file: %w"`.
+### Field-Specific Priority Chains
 
-Writes directly (no temp-file + rename); a partial write can leave a truncated file on disk. Permission normalization is implicit—existing files with different permissions will fail the write.
+| Field | Priority Chain |
+|-------|---------------|
+| `ModelID` | Default > YAML > Env Var > CLI Flag |
+| `OllamaBaseURL` | Default > YAML > Env Var |
+| `OllamaNumCtx` (context size) | Default > YAML > Env Var > CLI Flag |
+| `DocsDir` | Default > YAML |
+| System prompts (`SystemPrompt`, `ModuleSynthesisPrompt`, `ArchitecturePrompt`, `FileFactConsolidationPrompt`) | All start with default, then override with YAML if non-empty |
 
-## Utility Functions
+### Validation Rules
 
-### `MergeAndDeduplicate[T comparable](a, b []T) []T`
+- **Numeric fields**: CLI flag and env var values are parsed as integers; a value must be greater than zero to take effect. Invalid or non-positive values fall through silently.
+- **String fields**: Empty string is treated as "not set" — the lower-priority default remains active.
+- **Config file absence** (`config.yml`): Not an error. If missing, an empty `Config{}` struct is created and defaults are applied. Other parse errors are surfaced.
 
-Generic slice merge that deduplicates entries. Merges `b` after `a`; duplicates are removed via a map lookup and never reported as errors. Returns a new slice; the original inputs remain unmodified. The function is safe for concurrent use (no shared mutable state).
+### Algorithmic Flow for ResolveConfig
+
+1. Load YAML config — if it exists and parses successfully; otherwise start with an empty struct (missing-file case).
+2. Resolve extraction steps — use YAML value if present, else fall back to `DefaultExtractionSteps`.
+3. Deduplicate ignore list from the loaded config using a map-based seen-set while preserving first-seen order.
+4. For each field, apply its specific priority chain: start with built-in default constant → override with YAML (if non-empty) → override with environment variable (if set and valid for numeric types) → override with CLI flag (highest priority; numeric types require successful integer parse and positive value).
+5. Return the fully resolved `Config` struct, or an error if the YAML file fails to parse (excluding missing-file case).
+
+### Error Handling in ResolveConfig
+
+- **Swallowed path**: When `os.IsNotExist(err)` is true during config loading, defaults apply with no error returned.
+- **Propagated path**: Any other error (parse failure, permission denied) is wrapped with a prefix and returned as `(*Config, nil, error)` — the config pointer is `nil`.
+- **Silent branches**: String comparisons (`!= ""`, `> 0`) short-circuit without errors. `strconv.Atoi` failures are caught inline; env/flag values simply not used. Map lookups for deduplication have no error path.
+
+### Always-On Return
+
+The function always returns a non-nil tuple `(*Config, error)` — either a populated config with `nil` error, or a `nil` config with an error string. No panics anywhere in this file.
+
+---
+
+## Concurrency and Mutability Summary
+
+Across all three files: no `sync.Mutex`, channels, atomics, or other synchronization primitives appear. No package-level variables are modified after initialization. All functions operate on caller-provided arguments and return results. The module is designed for single-call composition with no shared mutable state requiring protection.

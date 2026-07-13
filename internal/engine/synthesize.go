@@ -13,15 +13,26 @@ import (
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
-func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot string, cfg *config.Config, cache *MetadataCache, affectedDirs map[string]bool, precalculatedHashes map[string]string, logEvent func(string, string)) (string, error) {
-	if err := ctx.Err(); err != nil {
+type pipelineContext struct {
+	ctx                 context.Context
+	client              llmCaller
+	repoRoot            string
+	cfg                 *config.Config
+	cache               *MetadataCache
+	affectedDirs        map[string]bool
+	precalculatedHashes map[string]string
+	logEvent            LogEventFunc
+}
+
+func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
+	if err := p.ctx.Err(); err != nil {
 		return "", err
 	}
 
 	// If this node (and all descendants) is NOT affected, reuse cached summary!
-	if !affectedDirs[node.Path] && cache.Modules[node.Path] != "" {
-		logEvent("status", fmt.Sprintf("➜ Reusing cached summary for directory: %s", node.Path))
-		return cache.Modules[node.Path], nil
+	if !p.affectedDirs[node.Path] && p.cache.Modules[node.Path] != "" {
+		p.logEvent(EventStatus, fmt.Sprintf("➜ Reusing cached summary for directory: %s", node.Path))
+		return p.cache.Modules[node.Path], nil
 	}
 
 	var childNames []string
@@ -33,7 +44,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	childSummaries := make(map[string]string)
 	for _, name := range childNames {
 		child := node.Children[name]
-		sum, err := synthesizeNode(ctx, c, child, repoRoot, cfg, cache, affectedDirs, precalculatedHashes, logEvent)
+		sum, err := synthesizeNode(p, child)
 		if err != nil {
 			return "", err
 		}
@@ -47,21 +58,21 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	// Calculate a 100% dynamic file truncation limit based purely on the context size.
 	// Assuming ~4 characters per token, we allocate 75% of the total context window 
 	// for the file content, proportionally reserving the remaining 25% for prompts and output.
-	numCtx := c.NumCtx
-	if numCtx < 512 {
-		numCtx = 512
+	numCtx := p.client.NumCtx()
+	if numCtx < minNumCtxFloor {
+		numCtx = minNumCtxFloor
 	}
-	fileLimit := int(float64(numCtx * 4) * 0.75)
+	fileLimit := int(float64(numCtx * 4) * contextWindowAllocRatio)
 
 	for _, f := range node.Files {
-		if err := ctx.Err(); err != nil {
+		if err := p.ctx.Err(); err != nil {
 			return "", err
 		}
 
 		var fileHash string
 		var ok bool
-		if precalculatedHashes != nil {
-			fileHash, ok = precalculatedHashes[f]
+		if p.precalculatedHashes != nil {
+			fileHash, ok = p.precalculatedHashes[f]
 		}
 
 		var contentBytes []byte
@@ -69,14 +80,14 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 
 		// Check cache hit using precalculated hash without reading file
 		var facts string
-		cachedEntry, exists := cache.Files[f]
+		cachedEntry, exists := p.cache.Files[f]
 		if ok && exists && cachedEntry.SHA256 == fileHash {
 			facts = cachedEntry.Facts
 		} else {
 			// Read file only on cache miss
-			contentBytes, err = tools.ReadFileSafely(repoRoot, f)
+			contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
 			if err != nil {
-				logEvent("status", fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
+				p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
 				continue
 			}
 
@@ -92,33 +103,40 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 		}
 
 		if facts == "" {
+			if contentBytes == nil {
+				contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
+				if err != nil {
+					p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
+					continue
+				}
+			}
 			contentStr := string(contentBytes)
-			overlap := 800
+			overlap := defaultChunkOverlap
 			if overlap > fileLimit/4 {
 				overlap = fileLimit / 4
 			}
 			chunks := chunkTextWithOverlap(contentStr, fileLimit, overlap)
 
 			var factsBuilder strings.Builder
-			for i, step := range cfg.ExtractionSteps {
+			for i, step := range p.cfg.ExtractionSteps {
 				var stepFacts []string
 				for chunkIdx, chunk := range chunks {
 					chunkMsg := ""
 					if len(chunks) > 1 {
 						chunkMsg = fmt.Sprintf(" (Chunk %d of %d)", chunkIdx+1, len(chunks))
 					}
-					logEvent("status", fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(cfg.ExtractionSteps), step.Name, chunkMsg, f))
+					p.logEvent(EventStatus, fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(p.cfg.ExtractionSteps), step.Name, chunkMsg, f))
 					
-					systemPrompt := c.GetBaseSystemPrompt() + step.Prompt
+					systemPrompt := p.cfg.SystemPrompt + "\n" + step.Prompt
 					userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, node.Path, chunk)
-					res, err := c.CallLLM(ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
+					res, err := p.client.CallLLM(p.ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
 					if err != nil {
 						return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
 					}
-					stepFacts = append(stepFacts, StripOuterMarkdownFence(res))
+					stepFacts = append(stepFacts, stripOuterMarkdownFence(res))
 				}
 
-				consolidatedFact, err := reduceFileFacts(ctx, c, f, step.Name, stepFacts, logEvent)
+				consolidatedFact, err := reduceFileFacts(p.ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
 				if err != nil {
 					return "", err
 				}
@@ -128,7 +146,7 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 			facts = strings.TrimSpace(factsBuilder.String())
 
 			// Update cache
-			cache.Files[f] = FileCacheEntry{
+			p.cache.Files[f] = FileCacheEntry{
 				SHA256: fileHash,
 				Facts:  facts,
 			}
@@ -144,21 +162,21 @@ func synthesizeNode(ctx context.Context, c *LLMClient, node *DirNode, repoRoot s
 	}
 
 	if len(components) == 0 {
-		cache.Modules[node.Path] = ""
+		p.cache.Modules[node.Path] = ""
 		return "", nil
 	}
 
-	logEvent("status", fmt.Sprintf("➜ Synthesizing directory: %s (%d total components)", node.Path, len(components)))
-	finalSum, err := reduceInChunks(ctx, c, node.Path, components, logEvent)
+	p.logEvent(EventStatus, fmt.Sprintf("➜ Synthesizing directory: %s (%d total components)", node.Path, len(components)))
+	finalSum, err := reduceInChunks(p.ctx, p.client, node.Path, components, p.cfg, p.logEvent)
 	if err != nil {
 		return "", err
 	}
 
 	// Update module cache
-	cache.Modules[node.Path] = finalSum
+	p.cache.Modules[node.Path] = finalSum
 
-	modulePath := filepath.Join(cfg.DocsDir, "modules", ToSafeMarkdownFilename(node.Path))
-	if err := tools.WriteFileSafely(repoRoot, modulePath, []byte(finalSum)); err != nil {
+	modulePath := filepath.Join(p.cfg.DocsDir, "modules", toSafeMarkdownFilename(node.Path))
+	if err := tools.WriteFileSafely(p.repoRoot, modulePath, []byte(finalSum)); err != nil {
 		return "", fmt.Errorf("failed to write module documentation for %s: %w", node.Path, err)
 	}
 
