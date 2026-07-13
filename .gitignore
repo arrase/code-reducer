@@ -1,2 +1,16 @@
 .code-reducer.lock
 code-reducer
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Build output
+dist/
+tmp/
+*.tmp.*

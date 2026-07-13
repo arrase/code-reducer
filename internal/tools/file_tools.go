@@ -12,6 +12,12 @@ import (
 	ignore "github.com/sabhiram/go-gitignore"
 )
 
+const (
+	binaryDetectionBufSize = 1024
+	defaultDirPerm         = 0755
+	defaultFilePerm        = 0644
+)
+
 // ReadFileSafely resolves the virtual path inside the repository and reads the file content.
 // It implements TOCTOU mitigation similar to WriteFileSafely.
 func ReadFileSafely(repoRoot, virtualPath string) ([]byte, error) {
@@ -61,45 +67,36 @@ func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
 	}
 
 	dir := filepath.Dir(safePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, defaultDirPerm); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Open the file without truncating first to prevent truncating a followed symlink target
-	f, err := os.OpenFile(safePath, os.O_WRONLY|os.O_CREATE, 0644)
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(safePath)+".tmp.*")
 	if err != nil {
-		return fmt.Errorf("failed to open file for writing: %w", err)
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer f.Close()
+	tmpName := tmpFile.Name()
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpName)
+	}()
 
-	// TOCTOU mitigation: verify the file path is not a symlink
-	fiLstat, err := os.Lstat(safePath)
-	if err != nil {
-		return fmt.Errorf("failed to lstat file: %w", err)
+	if _, err := tmpFile.Write(content); err != nil {
+		return fmt.Errorf("failed to write to temp file: %w", err)
 	}
-	if fiLstat.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("security violation: symlink detected on write: %s", safePath)
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temp file: %w", err)
 	}
-
-	fiFstat, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to fstat file: %w", err)
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
 	}
-
-	// Verify the file descriptor points to the exact same file path check
-	if !os.SameFile(fiLstat, fiFstat) {
-		return fmt.Errorf("security violation: TOCTOU symlink race detected on write: %s", safePath)
+	if err := os.Chmod(tmpName, defaultFilePerm); err != nil {
+		return fmt.Errorf("failed to chmod temp file: %w", err)
 	}
 
-	// Truncate safely only after verifying it is not a symlink
-	if err := f.Truncate(0); err != nil {
-		return fmt.Errorf("failed to truncate file: %w", err)
+	if err := os.Rename(tmpName, safePath); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
-
-	if _, err := f.Write(content); err != nil {
-		return fmt.Errorf("failed to write file content: %w", err)
-	}
-
 	return nil
 }
 
@@ -128,7 +125,7 @@ func LoadGitignore(repoRoot string) ([]string, error) {
 }
 
 // ShouldIgnoreFile checks if a file (specified by relative path) is ignored.
-func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ignoredExtensions []string) bool {
+func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore) bool {
 	slashRelPath := filepath.ToSlash(relPath)
 
 	// 1. Check user-defined ignores (config + gitignore)
@@ -144,23 +141,9 @@ func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ign
 		}
 	}
 
-	// 3. Check filename extensions & suffixes
+	// 3. Check if it's a known text file to avoid IsBinaryFile I/O bottleneck
 	name := filepath.Base(slashRelPath)
 	ext := strings.ToLower(filepath.Ext(name))
-	for _, iext := range ignoredExtensions {
-		lowerIext := strings.ToLower(iext)
-		lowerName := strings.ToLower(name)
-		if !strings.Contains(lowerIext, ".") {
-			if ext == "."+lowerIext || strings.HasSuffix(lowerName, "."+lowerIext) {
-				return true
-			}
-		} else {
-			if strings.HasSuffix(lowerName, lowerIext) {
-				return true
-			}
-		}
-	}
-	// 3.5 Check if it's a known text file to avoid IsBinaryFile I/O bottleneck
 	knownTextExts := map[string]bool{
 		".go": true, ".js": true, ".ts": true, ".py": true, ".md": true,
 		".txt": true, ".json": true, ".yaml": true, ".yml": true,
@@ -183,12 +166,13 @@ func ShouldIgnoreFile(repoRoot, relPath string, gitIgnore *ignore.GitIgnore, ign
 
 // DiscoverCodeFiles recursively walks the codebase to find high-signal source files.
 // It ignores build, dependency, and output files, as well as any paths in the custom ignores list.
-func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []string) ([]string, error) {
+func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 	var files []string
 	gitIgnore := ignore.CompileIgnoreLines(ignores...)
 
 	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: error walking path %s: %v\n", path, err)
 			return nil // Skip items with errors
 		}
 
@@ -198,6 +182,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []st
 
 		rel, err := filepath.Rel(repoRoot, path)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to get relative path for %s: %v\n", path, err)
 			return nil
 		}
 
@@ -211,7 +196,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []st
 			return nil
 		}
 
-		if ShouldIgnoreFile(repoRoot, slashRel, gitIgnore, ignoredExtensions) {
+		if ShouldIgnoreFile(repoRoot, slashRel, gitIgnore) {
 			return nil
 		}
 
@@ -228,14 +213,14 @@ func DiscoverCodeFiles(repoRoot string, ignores []string, ignoredExtensions []st
 func IsBinaryFile(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return true
 	}
 	defer f.Close()
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, binaryDetectionBufSize)
 	n, err := f.Read(buf)
 	if err != nil && err != io.EOF {
-		return false
+		return true
 	}
 
 	for i := 0; i < n; i++ {

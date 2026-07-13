@@ -18,7 +18,7 @@ Designed specifically for **local development and private LLMs**, Code-Reducer u
 ## 🏃 Quick Start
 
 ### Prerequisites
-* **Go**: Version 1.21 or higher.
+* **Go**: Version 1.26 or higher.
 * **Ollama**: Running locally with a compatible model downloaded (e.g., `ornith:9b` or `gemma4:26b`).
 
 ### 1. Build from Source (or Download Release)
@@ -107,7 +107,7 @@ extraction_steps:
 ```
 
 ### Precedence Order
-Code-Reducer implements a four-tier configuration resolution chain (defined in `internal/config/env.go`):
+Code-Reducer implements a four-tier configuration resolution chain (defined in `internal/config/resolve.go`):
 
 ```
 [1. CLI Overrides] ──► [2. Environment Variables] ──► [3. YAML Config File] ──► [4. System Defaults]
@@ -199,22 +199,19 @@ To serialize execution across multiple terminal windows or background jobs, the 
 2. **PID Recording**: Writes the current Process ID (PID) to the lockfile.
 3. **Git Isolation**: The runner automatically checks if `.code-reducer.lock` is ignored. If not, it safely appends it to the project's `.gitignore` file.
 
-#### TOCTOU Symlink Hijacking Defense (`WriteFileSafely`)
-When writing documentation files to the filesystem:
-1. **Open Without Truncation**: Omit `O_TRUNC` on initial open (`os.OpenFile`) to prevent truncating a target file if the path has been replaced with a symlink.
-2. **Symlink Verification**: Perform `os.Lstat` on the target path to verify that it is not a symbolic link.
-3. **Descriptor Validation**: Obtain stats on the open file descriptor (`f.Stat()`) and compare it with the `Lstat` results via `os.SameFile()`. If the inodes do not match, a TOCTOU (Time-of-Check to Time-of-Use) symlink replacement race is detected and the write operation is aborted.
-4. **Safe Truncation & Write**: Only after validation is complete is the file safely truncated (`f.Truncate(0)`) and written.
+#### TOCTOU Symlink Hijacking & Safe File I/O
+1. **Safe Reading (`ReadFileSafely`)**: When reading files, the engine performs `os.Lstat` on the path to verify it is not a symbolic link. It then opens the file descriptor, calls `f.Stat()`, and compares it with the `Lstat` results via `os.SameFile()`. If the inodes do not match, a TOCTOU symlink replacement race is detected and the read operation is aborted.
+2. **Atomic Writing (`WriteFileSafely` & `SaveConfig`)**: To prevent data corruption, all file writes are performed atomically. The engine creates a temporary file in the target directory (`os.CreateTemp`), writes the contents, calls `Sync()` to flush to disk, closes the descriptor, sets the permissions, and atomically replaces the target file via `os.Rename`.
 
 ---
 
 ### 3. File Discovery, Binary, and Ignore Filters
 
 Repository scanning is executed using `filepath.WalkDir` coupled with multiple layers of evaluation:
-1. **Pruning Subtrees**: Common default dependency, cache, and build directories (`.git`, `node_modules`, `bower_components`, `dist`, `build`, `cache`, `__pycache__`, `venv`, `.venv`, and directory names ending in `.egg-info`) are skipped using `filepath.SkipDir` at the walk root, saving CPU cycles.
+1. **Pruning Subtrees**: Directories that are dot-prefixed (such as `.git` or `.venv`), end in `.egg-info`, or match any ignore rules (from `.gitignore` or configuration) are skipped entirely using `filepath.SkipDir` during traversal, saving CPU cycles.
 2. **Ignore Matching Rules**: Ignores loaded from the project's `.gitignore` and specified in the YAML configuration are merged and compiled using a dedicated Gitignore library (`go-gitignore`), ensuring 100% compliance with standard Git semantic rules (like negations and deep globs).
 3. **Binary Classification (Null-Byte Scanner & Fast-Path)**: 
-   * **Known Extensions**: Files with explicitly ignored extensions (e.g. `.png`, `.pdf`, `.zip`, `.exe`) or lockfile suffixes (`*-lock.json`, `pnpm-lock.yaml`) are ignored.
+   * **Filter Flow**: Files not matching the text extension allowlist (such as unknown suffixes) are checked via binary signature fallback.
    * **Text Fast-Path**: Common source code extensions (like `.go`, `.js`, `.py`, `.md`) are instantly classified as text, entirely bypassing I/O bottlenecks.
    * **Fallback Null-Byte Scan**: Unlabelled files are caught by checking the first `1024` bytes for a null byte (`0x00`). If a null byte is found, the file is classified as a binary and skipped.
 
@@ -229,7 +226,7 @@ Instead of relying on external Git diff parsing during runtime, Code-Reducer imp
   * **Added**: File is present in the workspace but missing from the cache.
   * **Modified**: File is present in both, but its current SHA256 does not match the cached hash.
   * **Deleted**: File exists in the cache but is missing from the workspace. Deleted files are automatically pruned from the cache.
-* **Caching & Metadata Cache (`.metadata.json`)**: The metadata cache maps file paths to their `SHA256` and generated list of facts, alongside a map of directory modules. During updates, the engine matches active files against the cache, garbage-collects cache entries for deleted files, and updates the `last_documented_commit` tracker to `"local"` upon a successful run.
+* **Caching & Metadata Cache (`.metadata.json`)**: The metadata cache maps file paths to their `SHA256` and generated list of facts, alongside a map of directory modules. During updates, the engine matches active files against the cache and garbage-collects cache entries for deleted files.
 
 ---
 
@@ -238,7 +235,6 @@ Instead of relying on external Git diff parsing during runtime, Code-Reducer imp
 * **HTTP Request Timeout**: Configured to `10 minutes` to handle complex summarizations.
 * **Ollama API Schema**: Communicates with the `/api/chat` POST endpoint.
 * **Fail-Fast Client**: The LLM client is strictly fail-fast and does not perform retry attempts or exponential backoffs when calling the Ollama service. Any failure immediately returns an error.
-* **Stream Processing**: Fully supports streaming response chunks via `StreamLLM` using line-by-line streaming from the `/api/chat` endpoint and invoking a token-callback. However, the recursive Map-Reduce pipeline invokes the synchronous `CallLLM` method for processing stability.
 
 ---
 

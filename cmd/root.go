@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	modelIdFlag string
+	modelIDFlag string
 	numCtxFlag  string
 )
 
@@ -30,7 +30,7 @@ var RootCmd = &cobra.Command{
 }
 
 func init() {
-	RootCmd.PersistentFlags().StringVar(&modelIdFlag, "model-id", "", "Specify LLM model ID")
+	RootCmd.PersistentFlags().StringVar(&modelIDFlag, "model-id", "", "Specify LLM model ID")
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
 }
 
@@ -59,7 +59,7 @@ func executeCommand(mode string) error {
 	}
 
 	// Resolve the merged configuration
-	cfg, err := config.ResolveConfig(repoRoot, modelIdFlag, numCtxFlag)
+	cfg, err := config.ResolveConfig(repoRoot, modelIDFlag, numCtxFlag)
 	if err != nil {
 		return err
 	}
@@ -81,10 +81,10 @@ func executeCommand(mode string) error {
 	defer stop()
 
 	runner := engine.NewRunner(cfg)
-	err = runner.Run(ctx, repoRoot, mode, func(ev engine.Event) {
-		if ev.Type == "status" {
+	err = runner.Run(ctx, repoRoot, engine.Mode(mode), func(ev engine.Event) {
+		if ev.Type == engine.EventStatus {
 			fmt.Println(ev.Message)
-		} else if ev.Type == "error" {
+		} else if ev.Type == engine.EventError {
 			fmt.Fprintf(os.Stderr, "Error: %s\n", ev.Message)
 		} else {
 			fmt.Println(ev.Message)

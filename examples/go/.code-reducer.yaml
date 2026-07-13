@@ -1,0 +1,48 @@
+# Example .code-reducer.yaml for analyzing Go projects
+model_id: "ornith:9b"
+ollama_base_url: "http://localhost:11434"
+ollama_num_ctx: 8192
+docs_dir: "wiki"
+
+# System Prompt defines the AI persona
+system_prompt: |
+  You are Code-Reducer, an expert technical writer and Go code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
+  DEFENSIVE RULES: 
+  1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 
+  2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 
+  3. Do NOT name standard library packages unless explicitly stated in the source text. 
+  4. Only report facts you are 100% sure about.
+
+# Prompts for synthesized output
+module_synthesis_prompt: |
+  Task: Write a technical documentation page for a code module based on the provided list of its internal components.
+  Rule 1: Group related functions and classes under appropriate Markdown headings.
+  Rule 2: Explain the responsibility of the module and the data flow.
+  Rule 3: Keep it highly technical and dense.
+
+architecture_prompt: |
+  Task: Write a global architecture or quickstart document based on the module summaries.
+  Rule 1: Explain the system boundaries and how the modules interact.
+  Rule 2: Provide a dense, developer-friendly overview.
+
+file_fact_consolidation_prompt: |
+  You are a specialized code documentation assistant. Consolidate, deduplicate and merge the following facts extracted from different chunks of the same file into a single, cohesive summary.
+
+# Custom extraction steps during map phase
+extraction_steps:
+  - name: "API_SIGNATURES"
+    prompt: |
+      Task: Extract the public surface area of the file.
+      Output: A strict Markdown list of all exported structs, interfaces, and methods. For each, note the actual input and output types. Ignore internal logic.
+  - name: "BUSINESS_LOGIC"
+    prompt: |
+      Task: Analyze the business logic and domain concepts.
+      Output: Explain what business rules or domain concepts this file solves. Describe the high-level algorithmic flow. Ignore implementation details.
+  - name: "STATE_AND_CONCURRENCY"
+    prompt: |
+      Task: Analyze state mutation and concurrency.
+      Output: List all mutable state (global variables, changing struct fields) and what concurrency mechanisms (e.g., sync.Mutex, channels) protect them. If none, state 'No mutable state'.
+  - name: "ERRORS_AND_SIDE_EFFECTS"
+    prompt: |
+      Task: Analyze side effects and error handling.
+      Output: Detail how this code communicates with the outside world (I/O like network, disk, DB) and how it handles/returns errors (wrap, sentinel, panic).

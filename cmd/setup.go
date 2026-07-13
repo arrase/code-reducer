@@ -67,18 +67,16 @@ func RunSetupFlow(repoRoot string) error {
 	}
 
 	var customIgnores []string
-	var customExtensions []string
 
 	if existingCfg != nil {
-		customIgnores = subtractSlice(existingCfg.Ignore, config.DefaultIgnores)
-		customExtensions = subtractSlice(existingCfg.IgnoreExtensions, config.DefaultIgnoredExtensions)
+		customIgnores = existingCfg.Ignore
 	}
 
-	userInputIgnores, ignoresModified := promptStringList(reader, "Enter custom directories/files to ignore (comma-separated)", customIgnores)
+	userInputIgnores, ignoresModified := promptStringList(reader, "Enter directories, files, or patterns to ignore (comma-separated)", customIgnores)
 	var ignores []string
 	if ignoresModified {
 		if len(userInputIgnores) > 0 {
-			ignores = config.MergeAndDeduplicate(config.DefaultIgnores, userInputIgnores)
+			ignores = userInputIgnores
 		} else {
 			ignores = []string{}
 		}
@@ -86,27 +84,11 @@ func RunSetupFlow(repoRoot string) error {
 		if existingCfg != nil {
 			ignores = existingCfg.Ignore
 		} else {
-			ignores = config.DefaultIgnores
+			ignores = []string{}
 		}
 	}
 
-	userInputExtensions, extensionsModified := promptStringList(reader, "Enter custom file extensions to ignore (comma-separated)", customExtensions)
-	var ignoreExtensions []string
-	if extensionsModified {
-		if len(userInputExtensions) > 0 {
-			ignoreExtensions = config.MergeAndDeduplicate(config.DefaultIgnoredExtensions, userInputExtensions)
-		} else {
-			ignoreExtensions = []string{}
-		}
-	} else {
-		if existingCfg != nil {
-			ignoreExtensions = existingCfg.IgnoreExtensions
-		} else {
-			ignoreExtensions = config.DefaultIgnoredExtensions
-		}
-	}
-
-	existingDocsDir := "wiki"
+	existingDocsDir := config.DefaultDocsDir
 	if existingCfg != nil && existingCfg.DocsDir != "" {
 		existingDocsDir = existingCfg.DocsDir
 	}
@@ -119,14 +101,37 @@ func RunSetupFlow(repoRoot string) error {
 		extractionSteps = config.DefaultExtractionSteps
 	}
 
+	existingSystemPrompt := config.DefaultSystemPrompt
+	existingModuleSynthesisPrompt := config.DefaultModuleSynthesisPrompt
+	existingArchitecturePrompt := config.DefaultArchitecturePrompt
+	existingFileFactConsolidationPrompt := config.DefaultFileFactConsolidationPrompt
+
+	if existingCfg != nil {
+		if existingCfg.SystemPrompt != "" {
+			existingSystemPrompt = existingCfg.SystemPrompt
+		}
+		if existingCfg.ModuleSynthesisPrompt != "" {
+			existingModuleSynthesisPrompt = existingCfg.ModuleSynthesisPrompt
+		}
+		if existingCfg.ArchitecturePrompt != "" {
+			existingArchitecturePrompt = existingCfg.ArchitecturePrompt
+		}
+		if existingCfg.FileFactConsolidationPrompt != "" {
+			existingFileFactConsolidationPrompt = existingCfg.FileFactConsolidationPrompt
+		}
+	}
+
 	newCfg := &config.Config{
-		ModelID:          modelInput,
-		OllamaBaseURL:    urlInput,
-		OllamaNumCtx:     numCtx,
-		DocsDir:          docsDirInput,
-		ExtractionSteps:  extractionSteps,
-		Ignore:           ignores,
-		IgnoreExtensions: ignoreExtensions,
+		ModelID:                     modelInput,
+		OllamaBaseURL:               urlInput,
+		OllamaNumCtx:                numCtx,
+		DocsDir:                     docsDirInput,
+		ExtractionSteps:             extractionSteps,
+		Ignore:                      ignores,
+		SystemPrompt:                existingSystemPrompt,
+		ModuleSynthesisPrompt:       existingModuleSynthesisPrompt,
+		ArchitecturePrompt:          existingArchitecturePrompt,
+		FileFactConsolidationPrompt: existingFileFactConsolidationPrompt,
 	}
 
 	err = config.SaveConfig(repoRoot, newCfg)
@@ -191,16 +196,4 @@ func promptString(reader *bufio.Reader, promptMsg, existingVal string) string {
 	return input
 }
 
-func subtractSlice[T comparable](a, b []T) []T {
-	bMap := make(map[T]bool)
-	for _, item := range b {
-		bMap[item] = true
-	}
-	var result []T
-	for _, item := range a {
-		if !bMap[item] {
-			result = append(result, item)
-		}
-	}
-	return result
-}
+

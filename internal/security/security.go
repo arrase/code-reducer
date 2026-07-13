@@ -8,7 +8,10 @@ import (
 	"sync"
 )
 
-const LockFileName = ".code-reducer.lock"
+const (
+	LockFileName    = ".code-reducer.lock"
+	defaultFilePerm = 0644
+)
 
 // SafeResolve cleans the input path and ensures it lies strictly inside the repository.
 // It resolves symlinks on the existing ancestor parts to prevent path traversal via symlinks.
@@ -59,7 +62,7 @@ func SafeResolve(repoRoot, inputPath string) (string, error) {
 	// Verify that resolvedPath is inside resolvedRoot
 	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
 	if err != nil || strings.HasPrefix(rel, "..") {
-		return "", fmt.Errorf("security violation: path traversal detected: %q", inputPath)
+		return "", fmt.Errorf("%w: %q", ErrPathTraversal, inputPath)
 	}
 
 	return resolvedPath, nil
@@ -103,10 +106,10 @@ func AcquireLock(repoRoot string) (*SimpleLock, error) {
 		return nil, err
 	}
 
-	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	f, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, defaultFilePerm)
 	if err != nil {
 		if os.IsExist(err) {
-			return nil, fmt.Errorf("lock at %s is already held by another process. If you are sure no other code-reducer process is running, delete this stale lockfile manually", lockPath)
+			return nil, fmt.Errorf("%w: lock at %s is already held by another process. If you are sure no other code-reducer process is running, delete this stale lockfile manually", ErrLockHeld, lockPath)
 		}
 		return nil, fmt.Errorf("failed to acquire lock at %s: %w", lockPath, err)
 	}
@@ -122,7 +125,10 @@ func AcquireLock(repoRoot string) (*SimpleLock, error) {
 
 // EnsureGitignoreHasLockfile ensures that the lockfile .code-reducer.lock is in the .gitignore.
 func EnsureGitignoreHasLockfile(repoRoot string) error {
-	gitignorePath := filepath.Join(repoRoot, ".gitignore")
+	gitignorePath, err := SafeResolve(repoRoot, ".gitignore")
+	if err != nil {
+		return err
+	}
 
 	data, err := os.ReadFile(gitignorePath)
 	if err != nil && !os.IsNotExist(err) {
@@ -136,14 +142,39 @@ func EnsureGitignoreHasLockfile(repoRoot string) error {
 		}
 	}
 
-	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open .gitignore for appending: %w", err)
+	contentToAppend := "# Code-Reducer Lockfile\n" + LockFileName + "\n"
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		contentToAppend = "\n" + contentToAppend
 	}
-	defer f.Close()
 
-	if _, err := f.WriteString("\n# Code-Reducer Lockfile\n" + LockFileName + "\n"); err != nil {
-		return fmt.Errorf("failed to write to .gitignore: %w", err)
+	newData := append(data, []byte(contentToAppend)...)
+
+	dir := filepath.Dir(gitignorePath)
+	tmpFile, err := os.CreateTemp(dir, ".gitignore.tmp.*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file for .gitignore: %w", err)
+	}
+	tmpName := tmpFile.Name()
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpName)
+	}()
+
+	if _, err := tmpFile.Write(newData); err != nil {
+		return fmt.Errorf("failed to write to temp file for .gitignore: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temp file for .gitignore: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file for .gitignore: %w", err)
+	}
+	if err := os.Chmod(tmpName, defaultFilePerm); err != nil {
+		return fmt.Errorf("failed to chmod temp file for .gitignore: %w", err)
+	}
+
+	if err := os.Rename(tmpName, gitignorePath); err != nil {
+		return fmt.Errorf("failed to rename temp file for .gitignore: %w", err)
 	}
 
 	return nil
