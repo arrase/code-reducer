@@ -1,16 +1,15 @@
 package engine
 
 import (
-	"strings"
+	"path/filepath"
 )
 
 // toSafeMarkdownFilename converts a module path to a safe filename for markdown docs.
 func toSafeMarkdownFilename(modulePath string) string {
-	safeName := strings.ReplaceAll(modulePath, "/", "_")
-	if safeName == "." || safeName == "" {
-		safeName = "root"
+	if modulePath == "." || modulePath == "" {
+		return "README.md"
 	}
-	return safeName + ".md"
+	return filepath.Join(modulePath, "README.md")
 }
 
 func makeLogEvent(onEvent func(Event)) LogEventFunc {
