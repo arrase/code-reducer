@@ -3,7 +3,7 @@ module github.com/arrase/code-reducer
 go 1.26
 
 require (
-	github.com/mattn/go-isatty v0.0.22
+	github.com/mattn/go-isatty v0.0.23
 	github.com/sabhiram/go-gitignore v0.0.0-20210923224102-525f6e181f06
 	github.com/spf13/cobra v1.10.2
 	gopkg.in/yaml.v3 v3.0.1
