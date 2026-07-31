@@ -55,10 +55,19 @@ func RunSetupFlow(repoRoot string) error {
 		}
 	}
 
-	modelInput := promptString(reader, "Enter LLM Model ID", existingModel)
-	urlInput := promptString(reader, "Enter Ollama Base URL", existingBaseURL)
-	
-	ctxInputStr := promptString(reader, "Enter Ollama Context Size", strconv.Itoa(existingNumCtx))
+	modelInput, err := promptString(reader, "Enter LLM Model ID", existingModel)
+	if err != nil {
+		return fmt.Errorf("error reading model ID: %w", err)
+	}
+	urlInput, err := promptString(reader, "Enter Ollama Base URL", existingBaseURL)
+	if err != nil {
+		return fmt.Errorf("error reading base URL: %w", err)
+	}
+
+	ctxInputStr, err := promptString(reader, "Enter Ollama Context Size", strconv.Itoa(existingNumCtx))
+	if err != nil {
+		return fmt.Errorf("error reading context size: %w", err)
+	}
 	var numCtx int
 	if n, err := strconv.Atoi(ctxInputStr); err == nil && n > 0 {
 		numCtx = n
@@ -72,7 +81,10 @@ func RunSetupFlow(repoRoot string) error {
 		customIgnores = existingCfg.Ignore
 	}
 
-	userInputIgnores, ignoresModified := promptStringList(reader, "Enter directories, files, or patterns to ignore (comma-separated)", customIgnores)
+	userInputIgnores, ignoresModified, err := promptStringList(reader, "Enter directories, files, or patterns to ignore (comma-separated)", customIgnores)
+	if err != nil {
+		return fmt.Errorf("error reading ignores: %w", err)
+	}
 	var ignores []string
 	if ignoresModified {
 		if len(userInputIgnores) > 0 {
@@ -92,7 +104,10 @@ func RunSetupFlow(repoRoot string) error {
 	if existingCfg != nil && existingCfg.DocsDir != "" {
 		existingDocsDir = existingCfg.DocsDir
 	}
-	docsDirInput := promptString(reader, "Enter documentation directory", existingDocsDir)
+	docsDirInput, err := promptString(reader, "Enter documentation directory", existingDocsDir)
+	if err != nil {
+		return fmt.Errorf("error reading docs dir: %w", err)
+	}
 
 	var extractionSteps []config.ExtractionStep
 	if existingCfg != nil && len(existingCfg.ExtractionSteps) > 0 {
@@ -142,13 +157,13 @@ func RunSetupFlow(repoRoot string) error {
 	return nil
 }
 
-func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) ([]string, bool) {
+func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) ([]string, bool, error) {
 	var result []string
 	existingStr := ""
 	if len(existingList) > 0 {
 		existingStr = strings.Join(existingList, ", ")
 	}
-	
+
 	if existingStr == "" {
 		fmt.Printf("%s: ", promptMsg)
 	} else {
@@ -157,18 +172,17 @@ func promptStringList(reader *bufio.Reader, promptMsg string, existingList []str
 
 	input, err := reader.ReadString('\n')
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nWarning: error reading input (%v), keeping existing values.\n", err)
-		return existingList, false
+		return nil, false, err
 	}
 
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return existingList, false
+		return existingList, false, nil
 	}
 
 	lowerInput := strings.ToLower(input)
 	if lowerInput == "clear" || lowerInput == "none" {
-		return []string{}, true
+		return []string{}, true, nil
 	}
 
 	parts := strings.Split(input, ",")
@@ -178,22 +192,23 @@ func promptStringList(reader *bufio.Reader, promptMsg string, existingList []str
 			result = append(result, trimmed)
 		}
 	}
-	
-	return result, true
+
+	return result, true, nil
 }
 
-func promptString(reader *bufio.Reader, promptMsg, existingVal string) string {
-	fmt.Printf("%s [%s]: ", promptMsg, existingVal)
+func promptString(reader *bufio.Reader, promptMsg, existingVal string) (string, error) {
+	if existingVal == "" {
+		fmt.Printf("%s: ", promptMsg)
+	} else {
+		fmt.Printf("%s [%s]: ", promptMsg, existingVal)
+	}
 	input, err := reader.ReadString('\n')
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nWarning: error reading input (%v), using default: %s\n", err, existingVal)
-		return existingVal
+		return "", err
 	}
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return existingVal
+		return existingVal, nil
 	}
-	return input
+	return input, nil
 }
-
-

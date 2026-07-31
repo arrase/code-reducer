@@ -6,6 +6,7 @@ import (
 
 	"github.com/arrase/code-reducer/internal/config"
 	"github.com/arrase/code-reducer/internal/security"
+	"github.com/arrase/code-reducer/internal/tools"
 )
 
 // Mode represents the operation mode of the documentation pipeline.
@@ -13,7 +14,7 @@ type Mode string
 
 const (
 	// ModeInit initializes the project documentation.
-	ModeInit   Mode = "init"
+	ModeInit Mode = "init"
 	// ModeUpdate updates the existing project documentation incrementally.
 	ModeUpdate Mode = "update"
 )
@@ -35,7 +36,7 @@ func (r *Runner) Run(ctx context.Context, repoRoot string, mode Mode, onEvent fu
 	logEvent := makeLogEvent(onEvent)
 
 	// 1. Ensure lockfile is in gitignore
-	if err := security.EnsureGitignoreHasLockfile(repoRoot); err != nil {
+	if err := tools.EnsureGitignoreHasLockfile(repoRoot); err != nil {
 		logEvent(EventStatus, fmt.Sprintf("Warning: failed to ensure gitignore has lockfile: %v", err))
 	}
 

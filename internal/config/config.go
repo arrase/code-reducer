@@ -4,21 +4,21 @@ const (
 	// CodeReducerModelIDEnvKey is the env key for model ID override.
 	CodeReducerModelIDEnvKey = "CODE_REDUCER_MODEL_ID"
 	// OllamaBaseURLEnvKey is the env key for Ollama URL override.
-	OllamaBaseURLEnvKey      = "OLLAMA_BASE_URL"
+	OllamaBaseURLEnvKey = "OLLAMA_BASE_URL"
 	// OllamaNumCtxEnvKey is the env key for context size override.
-	OllamaNumCtxEnvKey       = "OLLAMA_NUM_CTX"
+	OllamaNumCtxEnvKey = "OLLAMA_NUM_CTX"
 
 	// OllamaDefaultBaseURL is the default URL for local Ollama api.
 	OllamaDefaultBaseURL = "http://localhost:11434"
 	// OllamaDefaultModelID is the default LLM model.
 	OllamaDefaultModelID = "ornith:9b"
 	// OllamaDefaultNumCtx is the default context size.
-	OllamaDefaultNumCtx  = 8192
+	OllamaDefaultNumCtx = 8192
 	// DefaultDocsDir is the default documentation folder name.
-	DefaultDocsDir       = "wiki"
+	DefaultDocsDir = "wiki"
 	// ConfigFileName is the configuration filename.
-	ConfigFileName       = ".code-reducer.yaml"
-	configFilePerm       = 0600
+	ConfigFileName = ".code-reducer.yaml"
+	configFilePerm = 0600
 
 	// DefaultSystemPrompt is the default system instructions for the LLM.
 	DefaultSystemPrompt = "You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.\n" +

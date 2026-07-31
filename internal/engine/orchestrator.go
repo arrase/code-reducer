@@ -20,7 +20,7 @@ const (
 	// EventStatus represents progress/status updates.
 	EventStatus EventType = "status"
 	// EventError represents execution errors.
-	EventError  EventType = "error"
+	EventError EventType = "error"
 )
 
 // Event represents a progress or error notification from the pipeline.
@@ -60,20 +60,20 @@ func (o *orchestrator) GenerateStandardDocs(ctx context.Context, repoRoot, docsD
 	return nil
 }
 
-func setupPipeline(repoRoot string, cfg *config.Config, logEvent LogEventFunc) (string, []string, *MetadataCache) {
+func setupPipeline(repoRoot string, cfg *config.Config, logEvent LogEventFunc) (string, []string, *MetadataCache, error) {
 	docsDir := cfg.DocsDir
 	gitignorePatterns, err := tools.LoadGitignore(repoRoot)
-	if err != nil {
-		logEvent(EventStatus, fmt.Sprintf("Warning: failed to load .gitignore: %v", err))
+	if err != nil && !os.IsNotExist(err) {
+		return "", nil, nil, fmt.Errorf("failed to load .gitignore: %w", err)
 	}
 	ignores := append(cfg.Ignore, docsDir)
 	ignores = append(ignores, gitignorePatterns...)
 
 	cache, err := loadMetadataCache(repoRoot, docsDir)
 	if err != nil {
-		logEvent(EventStatus, fmt.Sprintf("Warning: failed to load metadata cache: %v", err))
+		return "", nil, nil, fmt.Errorf("failed to load metadata cache: %w", err)
 	}
-	return docsDir, ignores, cache
+	return docsDir, ignores, cache, nil
 }
 
 func teardownPipeline(repoRoot, docsDir string, cache *MetadataCache, logEvent LogEventFunc, successMsg string) {
@@ -87,8 +87,11 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 	logEvent := makeLogEvent(onEvent)
 	logEvent(EventStatus, "Starting Map-Reduce pipeline: init")
 	logEvent(EventStatus, "Step 1: Code Discovery & Building Tree...")
-	
-	docsDir, ignores, cache := setupPipeline(repoRoot, cfg, logEvent)
+
+	docsDir, ignores, cache, err := setupPipeline(repoRoot, cfg, logEvent)
+	if err != nil {
+		return err
+	}
 	cache.StepsHash = computeStepsHash(cfg.ExtractionSteps)
 
 	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
@@ -182,25 +185,37 @@ Before making changes, analyze these files to align with existing design choices
 	return nil
 }
 
-func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
-	logEvent := makeLogEvent(onEvent)
-	logEvent(EventStatus, "Starting Map-Reduce pipeline: update")
-
-	docsDir, ignores, cache := setupPipeline(repoRoot, cfg, logEvent)
-
-	currentStepsHash := computeStepsHash(cfg.ExtractionSteps)
-	if cache.StepsHash != currentStepsHash {
-		logEvent(EventStatus, "Warning: Extraction steps changed. Invalidating metadata cache to force full documentation regeneration.")
-		cache.Files = make(map[string]FileCacheEntry)
-		cache.Modules = make(map[string]string)
-		cache.StepsHash = currentStepsHash
+func (o *orchestrator) pruneStaleCache(repoRoot string, docsDir string, cache *MetadataCache, tree *DirNode) {
+	activeDirs := make(map[string]bool)
+	var collectDirs func(n *DirNode)
+	collectDirs = func(n *DirNode) {
+		activeDirs[n.Path] = true
+		for _, child := range n.Children {
+			collectDirs(child)
+		}
 	}
+	collectDirs(tree)
 
-	logEvent(EventStatus, "Step 1: Detecting changed files...")
+	for mPath := range cache.Modules {
+		if !activeDirs[mPath] {
+			delete(cache.Modules, mPath)
+			moduleFile := filepath.Join(docsDir, "modules", toSafeMarkdownFilename(mPath))
+			if absModuleFile, err := security.SafeResolve(repoRoot, moduleFile); err == nil {
+				_ = os.Remove(absModuleFile)
+			}
+		}
+	}
+}
 
+func (o *orchestrator) getAffectedDirs(repoRoot, docsDir string, tree *DirNode, cache *MetadataCache, changes []FileChange) map[string]bool {
+	affectedDirs := determineAffected(tree, repoRoot, docsDir, cache, changes)
+	return propagateAffected(tree, affectedDirs)
+}
+
+func (o *orchestrator) detectFileChanges(repoRoot string, ignores []string, cache *MetadataCache, logEvent LogEventFunc) ([]FileChange, map[string]string, []string, error) {
 	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
 	if err != nil {
-		return err
+		return nil, nil, nil, err
 	}
 
 	var filteredChanges []FileChange
@@ -238,7 +253,32 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 		}
 	}
 
-	affectedDirs := make(map[string]bool)
+	return filteredChanges, currentFilesMap, allowedCodeFiles, nil
+}
+
+func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
+	logEvent := makeLogEvent(onEvent)
+	logEvent(EventStatus, "Starting Map-Reduce pipeline: update")
+
+	docsDir, ignores, cache, err := setupPipeline(repoRoot, cfg, logEvent)
+	if err != nil {
+		return err
+	}
+
+	currentStepsHash := computeStepsHash(cfg.ExtractionSteps)
+	if cache.StepsHash != currentStepsHash {
+		logEvent(EventStatus, "Warning: Extraction steps changed. Invalidating metadata cache to force full documentation regeneration.")
+		cache.Files = make(map[string]FileCacheEntry)
+		cache.Modules = make(map[string]string)
+		cache.StepsHash = currentStepsHash
+	}
+
+	logEvent(EventStatus, "Step 1: Detecting changed files...")
+
+	filteredChanges, currentFilesMap, allowedCodeFiles, err := o.detectFileChanges(repoRoot, ignores, cache, logEvent)
+	if err != nil {
+		return err
+	}
 
 	tree := buildTree(allowedCodeFiles)
 
@@ -252,28 +292,9 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 		}
 	}
 
-	activeDirs := make(map[string]bool)
-	var collectDirs func(n *DirNode)
-	collectDirs = func(n *DirNode) {
-		activeDirs[n.Path] = true
-		for _, child := range n.Children {
-			collectDirs(child)
-		}
-	}
-	collectDirs(tree)
+	o.pruneStaleCache(repoRoot, docsDir, cache, tree)
 
-	for mPath := range cache.Modules {
-		if !activeDirs[mPath] {
-			delete(cache.Modules, mPath)
-			moduleFile := filepath.Join(docsDir, "modules", toSafeMarkdownFilename(mPath))
-			if absModuleFile, err := security.SafeResolve(repoRoot, moduleFile); err == nil {
-				_ = os.Remove(absModuleFile)
-			}
-		}
-	}
-
-	determineAffected(tree, repoRoot, docsDir, cache, filteredChanges, affectedDirs)
-	propagateAffected(tree, affectedDirs)
+	affectedDirs := o.getAffectedDirs(repoRoot, docsDir, tree, cache, filteredChanges)
 
 	if len(affectedDirs) == 0 {
 		logEvent(EventStatus, "No modifications detected. Documentation is up to date.")

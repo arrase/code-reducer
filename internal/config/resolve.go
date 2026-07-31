@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -31,7 +32,7 @@ func resolveString(yamlVal, defaultVal string) string {
 func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string) (*Config, error) {
 	cfg, err := LoadConfig(repoRoot)
 	if err != nil {
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("failed to load configuration file: %w", err)
 		}
 		cfg = &Config{}
@@ -78,14 +79,18 @@ func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string) (*Config, error) {
 		resolved.OllamaNumCtx = cfg.OllamaNumCtx
 	}
 	if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
-		if n, err := strconv.Atoi(envVal); err == nil && n > 0 {
-			resolved.OllamaNumCtx = n
+		n, err := strconv.Atoi(envVal)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid value for %s: %s", OllamaNumCtxEnvKey, envVal)
 		}
+		resolved.OllamaNumCtx = n
 	}
 	if numCtxFlag != "" {
-		if n, err := strconv.Atoi(numCtxFlag); err == nil && n > 0 {
-			resolved.OllamaNumCtx = n
+		n, err := strconv.Atoi(numCtxFlag)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid value for num-ctx flag: %s", numCtxFlag)
 		}
+		resolved.OllamaNumCtx = n
 	}
 
 	// 4. Resolve DocsDir: Default > YAML

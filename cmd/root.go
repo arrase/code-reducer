@@ -44,6 +44,23 @@ func executeCommand(mode engine.Mode) error {
 		return err
 	}
 
+	if err := checkAndRunSetup(repoRoot); err != nil {
+		return err
+	}
+
+	cfg, err := config.ResolveConfig(repoRoot, modelIDFlag, numCtxFlag)
+	if err != nil {
+		return err
+	}
+
+	if err := checkInitStatus(repoRoot, cfg.DocsDir, mode); err != nil {
+		return err
+	}
+
+	return runEngine(repoRoot, cfg, mode)
+}
+
+func checkAndRunSetup(repoRoot string) error {
 	needsSetup := !config.ConfigExists(repoRoot)
 	isTTY := isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
 
@@ -52,36 +69,35 @@ func executeCommand(mode engine.Mode) error {
 			return fmt.Errorf("configuration file %s does not exist in the current directory. Please run 'code-reducer setup' to configure the application", config.ConfigFileName)
 		}
 
-		// Run implicit setup flow
 		if err := RunSetupFlow(repoRoot); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
-	// Resolve the merged configuration
-	cfg, err := config.ResolveConfig(repoRoot, modelIDFlag, numCtxFlag)
-	if err != nil {
-		return err
-	}
+func checkInitStatus(repoRoot, docsDir string, mode engine.Mode) error {
+	hasInit := engine.IsInitialized(repoRoot, docsDir)
 
-	// Command flow checks
-	hasInit := engine.IsInitialized(repoRoot, cfg.DocsDir)
-
-	if mode == "init" {
+	if mode == engine.ModeInit {
 		if hasInit {
 			return fmt.Errorf("the project has already been initialized. Please use 'code-reducer update' to refresh documentation")
 		}
-	} else if mode == "update" {
+	} else if mode == engine.ModeUpdate {
 		if !hasInit {
 			return fmt.Errorf("the project has not been initialized yet. Please run 'code-reducer init' first")
 		}
 	}
 
+	return nil
+}
+
+func runEngine(repoRoot string, cfg *config.Config, mode engine.Mode) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	runner := engine.NewRunner(cfg)
-	err = runner.Run(ctx, repoRoot, engine.Mode(mode), func(ev engine.Event) {
+	err := runner.Run(ctx, repoRoot, mode, func(ev engine.Event) {
 		if ev.Type == engine.EventStatus {
 			fmt.Println(ev.Message)
 		} else if ev.Type == engine.EventError {

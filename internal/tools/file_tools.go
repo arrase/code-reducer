@@ -31,31 +31,29 @@ func ReadFileSafely(repoRoot, virtualPath string) ([]byte, error) {
 	return content, nil
 }
 
-
-// WriteFileSafely resolves the virtual path inside the repository and writes content.
-// It ensures that directories are created and uses a TOCTOU-safe write pattern.
-func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
-	safePath, err := security.SafeResolve(repoRoot, virtualPath)
-	if err != nil {
-		return err
-	}
-
-	dir := filepath.Dir(safePath)
+// WriteFileAtomic writes data to a file atomically by first writing to a temporary file
+// and then renaming it to the target path.
+func WriteFileAtomic(targetPath string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, defaultDirPerm); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	tmpFile, err := os.CreateTemp(dir, filepath.Base(safePath)+".tmp.*")
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(targetPath)+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tmpName := tmpFile.Name()
+
+	var success bool
 	defer func() {
-		tmpFile.Close()
-		os.Remove(tmpName)
+		if !success {
+			tmpFile.Close()
+			os.Remove(tmpName)
+		}
 	}()
 
-	if _, err := tmpFile.Write(content); err != nil {
+	if _, err := tmpFile.Write(data); err != nil {
 		return fmt.Errorf("failed to write to temp file: %w", err)
 	}
 	if err := tmpFile.Sync(); err != nil {
@@ -64,14 +62,55 @@ func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
 	if err := tmpFile.Close(); err != nil {
 		return fmt.Errorf("failed to close temp file: %w", err)
 	}
-	if err := os.Chmod(tmpName, defaultFilePerm); err != nil {
+	if err := os.Chmod(tmpName, perm); err != nil {
 		return fmt.Errorf("failed to chmod temp file: %w", err)
 	}
 
-	if err := os.Rename(tmpName, safePath); err != nil {
+	if err := os.Rename(tmpName, targetPath); err != nil {
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
+
+	success = true
 	return nil
+}
+
+// WriteFileSafely resolves the virtual path inside the repository and writes content.
+// It ensures that directories are created and uses a TOCTOU-safe write pattern.
+func WriteFileSafely(repoRoot, virtualPath string, content []byte) error {
+	safePath, err := security.SafeResolve(repoRoot, virtualPath)
+	if err != nil {
+		return err
+	}
+	return WriteFileAtomic(safePath, content, defaultFilePerm)
+}
+
+// EnsureGitignoreHasLockfile ensures that the lockfile .code-reducer.lock is in the .gitignore.
+func EnsureGitignoreHasLockfile(repoRoot string) error {
+	gitignorePath, err := security.SafeResolve(repoRoot, ".gitignore")
+	if err != nil {
+		return err
+	}
+
+	data, err := os.ReadFile(gitignorePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("error reading .gitignore: %w", err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == security.LockFileName {
+			return nil
+		}
+	}
+
+	contentToAppend := "# Code-Reducer Lockfile\n" + security.LockFileName + "\n"
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		contentToAppend = "\n" + contentToAppend
+	}
+
+	newData := append(data, []byte(contentToAppend)...)
+
+	return WriteFileAtomic(gitignorePath, newData, defaultFilePerm)
 }
 
 // LoadGitignore reads the .gitignore file from repoRoot and returns its active ignore patterns.
@@ -126,8 +165,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 
 	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: error walking path %s: %v\n", path, err)
-			return nil // Skip items with errors
+			return fmt.Errorf("error walking path %s: %w", path, err)
 		}
 
 		if path == repoRoot {
@@ -136,8 +174,7 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 
 		rel, err := filepath.Rel(repoRoot, path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to get relative path for %s: %v\n", path, err)
-			return nil
+			return fmt.Errorf("failed to get relative path for %s: %w", path, err)
 		}
 
 		slashRel := filepath.ToSlash(rel)
@@ -160,5 +197,3 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 
 	return files, err
 }
-
-

@@ -22,20 +22,31 @@ type FileChange struct {
 	Status ChangeStatus
 }
 
-func propagateAffected(node *DirNode, affectedDirs map[string]bool) bool {
-	isAffected := affectedDirs[node.Path]
-	for _, child := range node.Children {
-		if propagateAffected(child, affectedDirs) {
-			isAffected = true
+func propagateAffected(node *DirNode, affectedDirs map[string]bool) map[string]bool {
+	newAffected := make(map[string]bool)
+	for k, v := range affectedDirs {
+		newAffected[k] = v
+	}
+
+	var propagate func(*DirNode) bool
+	propagate = func(n *DirNode) bool {
+		isAffected := newAffected[n.Path]
+		for _, child := range n.Children {
+			if propagate(child) {
+				isAffected = true
+			}
 		}
+		if isAffected {
+			newAffected[n.Path] = true
+		}
+		return isAffected
 	}
-	if isAffected {
-		affectedDirs[node.Path] = true
-	}
-	return isAffected
+	propagate(node)
+	return newAffected
 }
 
-func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataCache, filteredChanges []FileChange, affectedDirs map[string]bool) {
+func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataCache, filteredChanges []FileChange) map[string]bool {
+	affectedDirs := make(map[string]bool)
 	changedFiles := make(map[string]bool)
 	for _, c := range filteredChanges {
 		changedFiles[c.Path] = true
@@ -71,6 +82,7 @@ func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataC
 		}
 	}
 	checkNode(node)
+	return affectedDirs
 }
 
 type DirNode struct {

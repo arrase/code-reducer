@@ -25,88 +25,75 @@ type pipelineContext struct {
 }
 
 func extractFileFacts(p *pipelineContext, f string, nodePath string, fileLimit int) (string, error) {
-	var fileHash string
-	var ok bool
-	if p.precalculatedHashes != nil {
-		fileHash, ok = p.precalculatedHashes[f]
+	fileHash, hashOk := p.precalculatedHashes[f]
+	cachedEntry, cacheExists := p.cache.Files[f]
+
+	// 1. Fast path: cache hit with precalculated hash
+	if hashOk && cacheExists && cachedEntry.SHA256 == fileHash {
+		return cachedEntry.Facts, nil
 	}
 
-	var contentBytes []byte
-	var err error
+	// 2. Read file content once
+	contentBytes, err := tools.ReadFileSafely(p.repoRoot, f)
+	if err != nil {
+		p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
+		return "", nil
+	}
 
-	// Check cache hit using precalculated hash without reading file
-	var facts string
-	cachedEntry, exists := p.cache.Files[f]
-	if ok && exists && cachedEntry.SHA256 == fileHash {
-		facts = cachedEntry.Facts
-	} else {
-		// Read file only on cache miss
-		contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
+	// 3. Compute hash if not precalculated and check cache again
+	if !hashOk {
+		hashSum := sha256.Sum256(contentBytes)
+		fileHash = hex.EncodeToString(hashSum[:])
+		if cacheExists && cachedEntry.SHA256 == fileHash {
+			return cachedEntry.Facts, nil
+		}
+	}
+
+	// 4. Extract facts
+	contentStr := string(contentBytes)
+	overlap := defaultChunkOverlap
+	if overlap > fileLimit/4 {
+		overlap = fileLimit / 4
+	}
+	chunks, err := chunkTextWithOverlap(contentStr, fileLimit, overlap)
+	if err != nil {
+		return "", fmt.Errorf("failed to chunk file %s: %w", f, err)
+	}
+
+	var factsBuilder strings.Builder
+	for i, step := range p.cfg.ExtractionSteps {
+		var stepFacts []string
+		for chunkIdx, chunk := range chunks {
+			chunkMsg := ""
+			if len(chunks) > 1 {
+				chunkMsg = fmt.Sprintf(" (Chunk %d of %d)", chunkIdx+1, len(chunks))
+			}
+			p.logEvent(EventStatus, fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(p.cfg.ExtractionSteps), step.Name, chunkMsg, f))
+
+			systemPrompt := p.cfg.SystemPrompt + "\n" + step.Prompt
+			userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, nodePath, chunk)
+			res, err := p.client.CallLLM(p.ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
+			if err != nil {
+				return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
+			}
+			stepFacts = append(stepFacts, stripOuterMarkdownFence(res))
+		}
+
+		consolidatedFact, err := reduceFileFacts(p.ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
 		if err != nil {
-			p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
-			return "", nil
+			return "", err
 		}
 
-		if !ok {
-			hashSum := sha256.Sum256(contentBytes)
-			fileHash = hex.EncodeToString(hashSum[:])
-			
-			// Re-check cache in case hash was not precalculated but exists in cache
-			if exists && cachedEntry.SHA256 == fileHash {
-				facts = cachedEntry.Facts
-			}
-		}
+		factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, consolidatedFact))
+	}
+	facts := strings.TrimSpace(factsBuilder.String())
+
+	// 5. Update cache
+	p.cache.Files[f] = FileCacheEntry{
+		SHA256: fileHash,
+		Facts:  facts,
 	}
 
-	if facts == "" {
-		if contentBytes == nil {
-			contentBytes, err = tools.ReadFileSafely(p.repoRoot, f)
-			if err != nil {
-				p.logEvent(EventStatus, fmt.Sprintf("Warning: failed to read file %s: %v", f, err))
-				return "", nil
-			}
-		}
-		contentStr := string(contentBytes)
-		overlap := defaultChunkOverlap
-		if overlap > fileLimit/4 {
-			overlap = fileLimit / 4
-		}
-		chunks := chunkTextWithOverlap(contentStr, fileLimit, overlap)
-
-		var factsBuilder strings.Builder
-		for i, step := range p.cfg.ExtractionSteps {
-			var stepFacts []string
-			for chunkIdx, chunk := range chunks {
-				chunkMsg := ""
-				if len(chunks) > 1 {
-					chunkMsg = fmt.Sprintf(" (Chunk %d of %d)", chunkIdx+1, len(chunks))
-				}
-				p.logEvent(EventStatus, fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(p.cfg.ExtractionSteps), step.Name, chunkMsg, f))
-				
-				systemPrompt := p.cfg.SystemPrompt + "\n" + step.Prompt
-				userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, nodePath, chunk)
-				res, err := p.client.CallLLM(p.ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
-				if err != nil {
-					return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
-				}
-				stepFacts = append(stepFacts, stripOuterMarkdownFence(res))
-			}
-
-			consolidatedFact, err := reduceFileFacts(p.ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
-			if err != nil {
-				return "", err
-			}
-
-			factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, consolidatedFact))
-		}
-		facts = strings.TrimSpace(factsBuilder.String())
-
-		// Update cache
-		p.cache.Files[f] = FileCacheEntry{
-			SHA256: fileHash,
-			Facts:  facts,
-		}
-	}
 	return facts, nil
 }
 
@@ -140,15 +127,15 @@ func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
 	}
 
 	var components []string
-	
+
 	// Calculate a 100% dynamic file truncation limit based purely on the context size.
-	// Assuming ~4 characters per token, we allocate 75% of the total context window 
+	// Assuming ~4 characters per token, we allocate 75% of the total context window
 	// for the file content, proportionally reserving the remaining 25% for prompts and output.
 	numCtx := p.client.NumCtx()
 	if numCtx < minNumCtxFloor {
 		numCtx = minNumCtxFloor
 	}
-	fileLimit := int(float64(numCtx * 4) * contextWindowAllocRatio)
+	fileLimit := int(float64(numCtx*4) * contextWindowAllocRatio)
 
 	for _, f := range node.Files {
 		if err := p.ctx.Err(); err != nil {
