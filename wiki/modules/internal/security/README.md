@@ -1,106 +1,130 @@
-# internal/security Module
+# Module: `internal/security` — Path Traversal Prevention and Process-Level Locking
 
-## Responsibility and Data Flow
+## Module Responsibility
 
-The `internal/security` package provides two isolated concerns for repository-level operations: (1) safe resolution of user-supplied filesystem paths to prevent traversal escapes, and (2) file-based mutual exclusion ensuring only one instance of code-reducer holds a lock at any time. A third utility integrates the lockfile into version control so stale state is ignored by `git`.
+This module provides two security primitives scoped to a repository root:
 
-Data flow begins with callers invoking `SafeResolve` or `AcquireLock`, both of which return errors to downstream consumers for branching logic. Sentinel errors from `errors.go` are returned via standard Go `error` returns and must be detected using `errors.Is()` or `errors.As()`. No wrapping occurs; propagation is contract-level, not exception-style.
+1. **Path traversal prevention** via `SafeResolve`, which validates that user-supplied paths resolve within the repository boundary, resolving symlinks on existing ancestor parts before comparison.
+2. **Cross-process lock management** via `SimpleLock`/`AcquireLock`/`Unlock`, which ensures only one process holds exclusive access to a protected resource at any given time through an atomic file-based lock mechanism.
 
----
+Both primitives operate against the local filesystem; no network, database, or remote API interactions occur within production code. All errors are returned to callers and propagated via Go's `error` interface; panics are not raised by this module.
 
-## Error Contract Markers (`errors.go`)
+## Data Flow Overview
 
-### Sentinel Definitions
+1. Callers invoke `SafeResolve(repoRoot, inputPath)` with a candidate path string and an anchor directory; the function returns either a resolved absolute path confined within `repoRoot` or an error (typically `ErrPathTraversal`).
+2. Callers invoke `AcquireLock(repoRoot)` to obtain a lock handle; if contention is detected—either via OS-level atomic failure of `O_EXCL` or presence of a stale lockfile—the function returns an error wrapping the sentinel `ErrLockHeld`.
+3. When release is needed, callers call `Unlock()` on the returned `*SimpleLock`; this method is idempotent and thread-safe with respect to itself, closing the file descriptor and removing the lockfile from disk under a mutex guard.
 
-| Variable | Condition | Mechanism |
+## Error Definitions — `errors.go`
+
+The module declares two sentinel error variables used as context markers during error propagation:
+
+| Sentinel | Declaration Scope | Usage Context |
 |---|---|---|
-| `ErrPathTraversal` — `"security violation: path traversal detected"` | Returned when a resolved path falls outside the repository root boundary | Standard Go error return value. Not wrapped; no panic. Detected via `errors.Is()` / `errors.As()`. |
-| `ErrLockHeld` — `"lock is already held by another process"` | Returned when another code-reducer instance holds the file lock | Standard Go error return value. Not wrapped; no panic. Detected via `errors.Is()` / `errors.As()`. |
+| `ErrPathTraversal` | package-level in `internal/security/errors.go` | Returned by `SafeResolve` when the resolved path escapes outside `repoRoot`. The original traversal signal is swallowed and replaced with a formatted message carrying `inputPath` as context. |
+| `ErrLockHeld` | package-level in `internal/security/errors.go` | Returned by `AcquireLock` when another process holds the lock or a stale lockfile persists; returned via `%w` wrapping of the underlying OS error with descriptive context. |
 
-Both errors are raw `*errors.errorString` values constructed using the standard library's `errors.New`. They carry no algorithmic logic and serve solely as contract markers for callers to branch on. No exception-style wrapping occurs in this file; any processing logic resides elsewhere in the module.
+No functions, imports beyond `errors`, or runtime operations exist in this file. Error propagation from these sentinels (e.g., further wrapping via `fmt.Errorf`) occurs elsewhere, not here.
 
----
+## Path Resolution — `SafeResolve`
 
-## Path Sanitization (`security.go`)
+### Signature
 
-### Public API: `SafeResolve`
+```go
+func SafeResolve(repoRoot, inputPath string) (string, error)
+```
 
-**Signature:** `func SafeResolve(repoRoot string, inputPath string) (string, error)`
+### Responsibility
 
-**Responsibility:** Cleans an input path and ensures it lies strictly inside the repository root. Resolves symlinks on existing ancestor parts to block symlink-based traversal.
+Resolves a candidate path against an anchor root while preventing escape through symlinks and directory traversal. The function returns the cleaned absolute path if it remains strictly inside the resolved repository boundary; otherwise it returns `ErrPathTraversal`.
 
-**Algorithm Steps:**
-1. Accept a `repoRoot` absolute reference and a relative or absolute `inputPath`.
-2. Resolve symlinks on existing ancestor directory components so that symlink-based traversal is blocked.
-3. Walk up from the target until hitting an existing physical ancestor (skipping non-existent intermediate components).
-4. Reconstruct the full resolved path from that ancestor plus the skipped suffixes.
-5. Verify the final resolved path lies strictly inside the repository root; reject if it does not.
+### Algorithm Steps
 
-**Error Propagation:** Errors from `filepath.Abs`, `EvalSymlinks(absRoot)`, and `EvalSymlinks(current)` are wrapped with context and returned directly. The `os.Lstat` loop terminates on first success or when reaching the filesystem root (`parent == current`). Non-not-exist errors during stat are wrapped and returned immediately. If `filepath.Rel` returns an error OR the relative path starts with `".."`, a wrapped `ErrPathTraversal` is returned.
+1. Compute the absolute root directory from `repoRoot` via `filepath.Abs`, wrapping any resulting error with `%w`.
+2. Resolve symlinks on the absolute root using `filepath.EvalSymlinks(absRoot)`, again wrapping errors with `%w`.
+3. Walk up from the joined path (`absRoot + inputPath`) until a physically existing ancestor is found via repeated `os.Lstat(current)` calls; each Lstat failure that is not "not exist" is wrapped and returned immediately.
+4. Resolve symlinks on the first physically existing ancestor via `filepath.EvalSymlinks(current)`, wrapping errors with `%w`.
+5. Reconstruct the full target path from the resolved ancestor plus all previously-skipped components.
+6. Verify that the reconstructed path remains inside the resolved root; reject if it escapes by returning a wrapped error using `ErrPathTraversal` with `inputPath` as context.
 
----
+### External I/O Operations
 
-## Process Locking (`security.go`)
+| Operation | Function | Purpose |
+|---|---|---|
+| Absolute path resolution from relative input | `filepath.Abs(repoRoot)` | Establishes the canonical root baseline for comparison |
+| Symlink resolution on root | `filepath.EvalSymlinks(absRoot)` | Prevents symlink-based escape at the boundary |
+| Ancestor existence check | `os.Lstat(current)` loop | Walks up the path tree stopping at first physically existing parent |
+| Symlink resolution on ancestor | `filepath.EvalSymlinks(current)` | Prevents symlink-based escape mid-path |
 
-### Public API: `AcquireLock`
+## Lock Acquisition and Release — `SimpleLock`
 
-**Signature:** `func AcquireLock(repoRoot string) (*SimpleLock, error)`
+### Types
 
-**Responsibility:** Acquires an exclusive lock file (`.code-reducer.lock`) using O_EXCL for atomicity.
+#### `SimpleLock` Struct
 
-**Algorithm Steps:**
-1. Call `SafeResolve` to sanitize the path; errors propagate to caller unchanged.
-2. Open a new file with O_EXCL; failure indicates another process holds the lock or a stale file exists.
-3. On open failure: check `os.IsExist(err)`. If the lock file already exists, return a specific message instructing manual cleanup; otherwise wrap with path context and original error.
-4. Write the current PID to the lock file for identification/verification.
-5. On write failure after successful open: clean up by calling `f.Close()` then `os.Remove`, then return the write error.
+| Field | Type | Mutability | Notes |
+|---|---|---|---|
+| `lockPath` | `string` | Modified once during acquisition, then read-only thereafter. Not mutated by any other method. | Absolute path of the lockfile within the repository root. |
+| `file` | `*os.File` | Modified once during acquisition. Closed during unlock and removed from disk afterward. | File descriptor holding the exclusive lock; opened with `O_WRONLY\|O_CREATE\|O_EXCL`. |
+| `mu` | `sync.Mutex` | Read via lock/unlock primitives only. Field itself is never reassigned after struct initialization. | Protects the close-and-remove sequence in `Unlock()`, making unlock atomic with respect to itself. |
+| `closed` | `bool` | Set to `true` during unlock; read inside unlock for idempotency check (`if l.closed { return nil }`). | Tracks release state so subsequent calls return immediately without further I/O. |
 
-**Return Type:** `*SimpleLock` — a struct holding per-instance state (`lockPath`, `file *os.File`, `mu sync.Mutex`, `closed bool`). No public methods other than `Unlock()`.
+#### Methods
 
----
+##### `AcquireLock(repoRoot string) (*SimpleLock, error)`
 
-### Struct Method: `(*SimpleLock) Unlock`
+**Responsibility**: Acquires an exclusive file-based lock within the provided repository root. Uses O_EXCL to ensure atomicity; failure implies another process holds the lock or a stale lockfile exists.
 
-**Signature:** `func (l *SimpleLock) Unlock() error`
+**Algorithm Steps**:
+1. Calls `SafeResolve(repoRoot, LockFileName)` to obtain the canonical lock file path inside the repo root. If this fails, the error propagates directly without wrapping.
+2. Opens the lockfile with `os.OpenFile(lockPath, O_WRONLY\|O_CREATE\|O_EXCL, 0644)`. The OS-level atomicity of O_EXCL means failure indicates another writer holds the file or a stale lock persists; this is treated as an error condition requiring manual cleanup by the caller.
+3. Writes the current process PID into the lockfile via `f.Write([]byte(fmt.Sprintf("%d\n", os.Getpid())))` for identification/inspection purposes. If this write fails, the method closes the file and removes it before returning a wrapped error.
 
-**Responsibility:** Releases the lock by closing the file and removing it. Idempotent and thread-safe.
+**Error Propagation**:
+- Direct propagation when `SafeResolve` fails (no wrapping).
+- Wraps with `%w` using `ErrLockHeld` plus context string describing stale lockfile when the OS reports `os.IsExist`.
+- On write failure after successful OpenFile: closes file and removes it, then returns a wrapped error that swallows close/remove errors into a single formatted message—only the original write error is surfaced.
 
-**Algorithm Steps:**
-1. Capture close error in an `err` variable.
-2. Attempt `os.Remove`. Only replace `err` if (a) the previous operation succeeded AND (b) remove fails with a non-not-exist error.
-3. Result: if close succeeds but remove fails, that error is returned; if close fails but remove also fails, only the close error is surfaced.
+##### `Unlock() error` (method on `*SimpleLock`)
 
-**Swallowed Error:** The deferred block at the end of `EnsureGitignoreHasLockfile` discards both `tmpFile.Close()` and `os.Remove(tmpName)` return values. If the temp file cannot be closed or removed (e.g., permission denied, interrupted signal), that error information is lost silently. This is a minor leak — not critical for correctness since the rename has already succeeded at that point, but it's worth noting.
+**Responsibility**: Releases the lock by closing the file descriptor and removing the lockfile from disk. Idempotent and thread-safe with respect to itself.
 
----
+**Algorithm Steps**:
+1. Acquires `l.mu.Lock()` at entry; releases via `defer mu.Unlock()`.
+2. Checks `if l.closed { return nil }`; if already closed, returns immediately without further I/O.
+3. Closes the file descriptor (`l.file.Close()`). If this fails, the error is swallowed when reporting removal errors—only surfaces the remove error if it subsequently fails.
+4. Attempts to remove the lockfile from disk via `os.Remove(l.lockPath)`.
 
-## Gitignore Integration (`security.go`)
+**Thread Safety**: The struct owns its own mutex; concurrent calls to `Unlock` on the same instance serialize through `mu.Lock()/defer mu.Unlock()`, making the operation atomic with respect to itself. Concurrent acquisition of different instances each creates independent `SimpleLock` objects with separate mutexes—no contention between instances is modeled or guaranteed by this code.
 
-### Public API: `EnsureGitignoreHasLockfile`
+## Test Coverage — `security_test.go`
 
-**Signature:** `func EnsureGitignoreHasLockfile(repoRoot string) error`
+### Functions Under Test
 
-**Responsibility:** Ensures that `.code-reducer.lock` is present in `.gitignore`.
+| Function | Parameters | Return Values |
+|---|---|---|
+| `SafeResolve(repoRoot, inputPath)` | repository root path; input file/directory path to resolve | resolved absolute path (string); error |
+| `AcquireLock(repoRoot)` | repository root path | lock object (`*SimpleLock`); error |
 
-**External I/O Operations:**
-- `filepath.Abs` / `EvalSymlinks`: Resolve absolute paths and evaluate symlinks on the repository root/ancestor (shared with `SafeResolve`)
-- `os.Lstat` (loop): Walk up directory hierarchy to find closest physically-existing ancestor during path traversal validation
-- `filepath.Rel`: Verify resolved target lies strictly inside resolved root
-- `os.OpenFile(... O_EXCL)`: Atomic create of lock file; failure indicates another process holds the lock or a stale file exists
-- `f.Write([]byte{...})`: Write current PID to lock file for identification/verification
-- `os.ReadFile`: Read existing `.gitignore` contents before appending entry
-- `os.CreateTemp` + `tmpFile.Write`: Atomic write pattern — build new content in temp file, then rename over original
-- `tmpFile.Sync`: Force flush to disk before close/rename
-- `os.Chmod`: Set permissions on temp file matching default (0644)
-- `os.Rename`: Atomically replace `.gitignore` with updated version
+### Test Fixture Operations
 
-**Error Propagation:** SafeResolve errors propagate directly. Non-not-exist read failures are wrapped with `"error reading .gitignore"` context. All temp file operations (`CreateTemp`, `Write`, `Sync`, `Close`, `Chmod`) return wrapped errors to caller on failure. Final `os.Rename` error is returned if it fails.
+All operations below target the local filesystem via Go's standard library:
 
----
+| Operation | Function | Purpose | Error Handling |
+|---|---|---|---|
+| Directory creation for test fixtures | `os.MkdirAll()` | Sets up `src/sub/` directories | Propagated to test framework via `t.Fatal(err)` — terminates immediately, no recovery. |
+| File writing for traversal tests | `os.WriteFile()` | Creates `file.txt`, `..config` | Same as above; propagated to `t.Fatal(err)`. |
+| Symlink creation (conditional) | `os.Symlink()` | Creates a symlink pointing outside the repo root | Swallowed and replaced with `t.Skip("Symlinks not supported on this OS/filesystem")`; test continues if operation fails. |
 
-## Module-Level Observations
+### Test Assertions
 
-- **No network/database interactions:** Confirmed by full code inspection. All I/O targets are local paths under `repoRoot`.
-- **Mutable state:** None at the package level. The file contains only `const` values and function-local variables; no package-level or class-level properties are modified.
-- **Shared/instance state:** `SimpleLock` holds per-instance fields (`lockPath`, `file *os.File`, `mu sync.Mutex`, `closed bool`). `Unlock()` modifies `l.closed = true` under its own internal mutex. This is instance-scoped state, not shared global state.
-- **Package-level constant:** `defaultFilePerm = 0644` — used by temp file permission setting in the gitignore integration path.
+- `security.SafeResolve(repoRoot, inputPath)` returns an error to its caller; tests verify both success and failure paths via a `wantErr` flag comparison (`t.Errorf(...)`).
+- `security.AcquireLock(repoRoot)` returns `(lock, err)`. A second concurrent call failing with `AcquireLock() should have failed when lock is already held` confirms the production code signals contention via error return.
+
+## Concurrency and Synchronization Summary
+
+- No package-level variables are declared anywhere in this module; all mutable state is encapsulated within individual `SimpleLock` instances.
+- `Unlock()` self-synchronizes via `mu.Lock()/defer mu.Unlock()`, making it safe for concurrent calls on the same instance.
+- Concurrent calls to `AcquireLock` on different instances each create their own independent `SimpleLock` with separate mutexes—no contention between instances is modeled or guaranteed by this code.
+- The file-level lock (the `.code-reducer.lock` file itself) provides OS-level mutual exclusion, which complements the in-memory `mu`.
+- No locks/mutexes are used within the test file itself; each `Test*` function runs independently in a single goroutine.

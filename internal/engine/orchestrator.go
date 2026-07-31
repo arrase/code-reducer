@@ -157,7 +157,6 @@ This repository contains automatically generated documentation under the %s dire
 - **Developer Quickstart**: Refer to %s/quickstart.md for onboarding steps, coding patterns, and configuration settings.
 - **Module Details**: Explore %s/modules/ for directory-level summaries and API descriptions of internal packages.
 
-Before making changes, analyze these files to align with existing design choices and code structures.
 `, docsDir, docsDir, docsDir, docsDir)
 
 	agentFileBytes, err := tools.ReadFileSafely(repoRoot, agentFilePath)
