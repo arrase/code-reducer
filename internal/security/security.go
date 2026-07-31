@@ -58,7 +58,7 @@ func SafeResolve(repoRoot, inputPath string) (string, error) {
 
 	// Verify that resolvedPath is inside resolvedRoot
 	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
-	if err != nil || strings.HasPrefix(rel, "..") {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, fmt.Sprintf("..%c", filepath.Separator)) {
 		return "", fmt.Errorf("%w: %q", ErrPathTraversal, inputPath)
 	}
 
@@ -109,67 +109,17 @@ func AcquireLock(repoRoot string) (*SimpleLock, error) {
 	}
 
 	if _, err := f.Write([]byte(fmt.Sprintf("%d\n", os.Getpid()))); err != nil {
-		f.Close()
-		os.Remove(lockPath)
-		return nil, fmt.Errorf("failed to write pid to lockfile: %w", err)
+		errClose := f.Close()
+		errRemove := os.Remove(lockPath)
+		var errMsg string
+		if errClose != nil {
+			errMsg += fmt.Sprintf(", close failed: %v", errClose)
+		}
+		if errRemove != nil {
+			errMsg += fmt.Sprintf(", remove failed: %v", errRemove)
+		}
+		return nil, fmt.Errorf("failed to write pid to lockfile%s: %w", errMsg, err)
 	}
 
 	return &SimpleLock{lockPath: lockPath, file: f}, nil
-}
-
-// EnsureGitignoreHasLockfile ensures that the lockfile .code-reducer.lock is in the .gitignore.
-func EnsureGitignoreHasLockfile(repoRoot string) error {
-	gitignorePath, err := SafeResolve(repoRoot, ".gitignore")
-	if err != nil {
-		return err
-	}
-
-	data, err := os.ReadFile(gitignorePath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("error reading .gitignore: %w", err)
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if strings.TrimSpace(line) == LockFileName {
-			return nil
-		}
-	}
-
-	contentToAppend := "# Code-Reducer Lockfile\n" + LockFileName + "\n"
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		contentToAppend = "\n" + contentToAppend
-	}
-
-	newData := append(data, []byte(contentToAppend)...)
-
-	dir := filepath.Dir(gitignorePath)
-	tmpFile, err := os.CreateTemp(dir, ".gitignore.tmp.*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file for .gitignore: %w", err)
-	}
-	tmpName := tmpFile.Name()
-	defer func() {
-		tmpFile.Close()
-		os.Remove(tmpName)
-	}()
-
-	if _, err := tmpFile.Write(newData); err != nil {
-		return fmt.Errorf("failed to write to temp file for .gitignore: %w", err)
-	}
-	if err := tmpFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync temp file for .gitignore: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("failed to close temp file for .gitignore: %w", err)
-	}
-	if err := os.Chmod(tmpName, defaultFilePerm); err != nil {
-		return fmt.Errorf("failed to chmod temp file for .gitignore: %w", err)
-	}
-
-	if err := os.Rename(tmpName, gitignorePath); err != nil {
-		return fmt.Errorf("failed to rename temp file for .gitignore: %w", err)
-	}
-
-	return nil
 }

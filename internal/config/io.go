@@ -33,13 +33,7 @@ func LoadConfig(cwd string) (*Config, error) {
 	return &cfg, nil
 }
 
-// SaveConfig writes the configuration to .code-reducer.yaml in the specified directory.
-func SaveConfig(cwd string, cfg *Config) error {
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal yaml: %w", err)
-	}
-
+func formatYAML(data []byte) string {
 	yamlStr := string(data)
 	replacements := []string{
 		"\nsystem_prompt:", "\n\nsystem_prompt:",
@@ -52,6 +46,17 @@ func SaveConfig(cwd string, cfg *Config) error {
 	for i := 0; i < len(replacements); i += 2 {
 		yamlStr = strings.ReplaceAll(yamlStr, replacements[i], replacements[i+1])
 	}
+	return yamlStr
+}
+
+// SaveConfig writes the configuration to .code-reducer.yaml in the specified directory.
+func SaveConfig(cwd string, cfg *Config) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+
+	yamlStr := formatYAML(data)
 
 	tmpFile, err := os.CreateTemp(cwd, ConfigFileName+".tmp.*")
 	if err != nil {

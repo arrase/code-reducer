@@ -69,7 +69,10 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 	for _, item := range items {
 		if utf8.RuneCountInString(item) > maxChars {
 			// Chunk large items to ensure they can be batched comfortably
-			chunks := chunkTextWithOverlap(item, maxChars/2, maxChars/10)
+			chunks, err := chunkTextWithOverlap(item, maxChars/2, maxChars/10)
+			if err != nil {
+				return "", err
+			}
 			expanded = append(expanded, chunks...)
 		} else {
 			expanded = append(expanded, item)
@@ -134,22 +137,21 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 }
 
 // chunkTextWithOverlap splits text into chunks of maxRunes length, with overlapRunes of overlap between adjacent chunks.
-func chunkTextWithOverlap(text string, maxRunes int, overlapRunes int) []string {
-	runes := []rune(text)
+func chunkTextWithOverlap(text string, maxRunes int, overlapRunes int) ([]string, error) {
 	if maxRunes <= 0 {
-		return []string{text}
+		return nil, fmt.Errorf("maxRunes must be greater than 0")
 	}
 	if overlapRunes >= maxRunes {
-		overlapRunes = maxRunes / 2
+		return nil, fmt.Errorf("overlapRunes must be strictly less than maxRunes")
 	}
+
+	runes := []rune(text)
 	if len(runes) <= maxRunes {
-		return []string{text}
+		return []string{text}, nil
 	}
+
 	var chunks []string
 	step := maxRunes - overlapRunes
-	if step <= 0 {
-		return []string{text}
-	}
 	for i := 0; i < len(runes); i += step {
 		end := i + maxRunes
 		if end > len(runes) {
@@ -160,5 +162,5 @@ func chunkTextWithOverlap(text string, maxRunes int, overlapRunes int) []string 
 			break
 		}
 	}
-	return chunks
+	return chunks, nil
 }

@@ -115,5 +115,3 @@ func (c *llmClient) CallLLM(ctx context.Context, systemPrompt string, messages [
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	return "", fmt.Errorf("ollama api error: status %d, response: %s", resp.StatusCode, string(body))
 }
-
-

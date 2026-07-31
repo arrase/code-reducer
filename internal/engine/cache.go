@@ -28,7 +28,10 @@ type MetadataCache struct {
 }
 
 func computeStepsHash(steps []config.ExtractionStep) string {
-	data, _ := json.Marshal(steps)
+	data, err := json.Marshal(steps)
+	if err != nil {
+		return ""
+	}
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
 }
