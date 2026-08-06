@@ -1,0 +1,81 @@
+site_name: Code-Reducer
+site_description: Lightweight, high-performance CLI tool for generating developer-friendly code wikis using local LLMs via Ollama.
+site_author: Arrase
+site_url: https://arrase.github.io/code-reducer/
+
+repo_name: arrase/code-reducer
+repo_url: https://github.com/arrase/code-reducer
+
+nav:
+  - Overview: index.md
+  - Architecture & Map-Reduce Engine: architecture.md
+  - Incremental Updates & Caching: map-reduce-caching.md
+  - Security Sandbox & Concurrency: security-concurrency.md
+  - Configuration & Custom Prompts: configuration.md
+  - CLI Commands & Setup Wizard: cli-wizard.md
+  - Performance & VRAM Usage: performance-vram.md
+  - Installation & Building: installation.md
+
+theme:
+  name: material
+  language: en
+  icon:
+    logo: material/book-open-page-variant
+  palette:
+    # Palette toggle for light/dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.top
+    - navigation.sections
+    - content.code.copy
+
+plugins: []
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+extra_css:
+  - https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - admonition
+  - pymdownx.details
+  - pymdownx.arithmatex:
+      generic: true
+
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/arrase/code-reducer
