@@ -13,4 +13,5 @@ code-reducer
 # Build output
 dist/
 tmp/
+site/
 *.tmp.*
