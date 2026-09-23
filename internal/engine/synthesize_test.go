@@ -47,8 +47,8 @@ func TestSynthesizeNode(t *testing.T) {
 	affectedDirs := map[string]bool{".": true, "sub": true}
 	hashes := map[string]string{sampleFile: "hash123"}
 
-	p := &pipelineContext{
-		ctx:                 context.Background(),
+	ctx := context.Background()
+	p := &pipelineState{
 		client:              &mockLLMCaller{numCtx: 2048},
 		repoRoot:            repoRoot,
 		cfg:                 cfg,
@@ -60,7 +60,7 @@ func TestSynthesizeNode(t *testing.T) {
 
 	// 1. Empty node
 	emptyNode := &DirNode{Path: "empty", Children: make(map[string]*DirNode)}
-	res, err := synthesizeNode(p, emptyNode)
+	res, err := synthesizeNode(ctx, p, emptyNode)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestSynthesizeNode(t *testing.T) {
 	// 2. Cached unaffected node
 	cache.Modules["cached"] = "Cached Summary"
 	cachedNode := &DirNode{Path: "cached", Children: make(map[string]*DirNode)}
-	res, err = synthesizeNode(p, cachedNode)
+	res, err = synthesizeNode(ctx, p, cachedNode)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestSynthesizeNode(t *testing.T) {
 		Children: map[string]*DirNode{"sub": childNode},
 	}
 
-	res, err = synthesizeNode(p, rootNode)
+	res, err = synthesizeNode(ctx, p, rootNode)
 	if err != nil {
 		t.Fatalf("unexpected error on synthesis: %v", err)
 	}
