@@ -81,3 +81,46 @@ func TestReduceItems(t *testing.T) {
 		}
 	}
 }
+
+func TestExpandOversizedItems(t *testing.T) {
+	items := []string{"small", "this is a very long item that exceeds limit"}
+	expanded, err := expandOversizedItems(items, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(expanded) <= 2 {
+		t.Fatalf("expected more than 2 items after expansion, got %d", len(expanded))
+	}
+	if expanded[0] != "small" {
+		t.Fatalf("expected first item 'small', got %s", expanded[0])
+	}
+}
+
+func TestBatchItems(t *testing.T) {
+	items := []string{"aaa", "bbb", "ccc"}
+	batches := batchItems(items, 6)
+	if len(batches) != 2 {
+		t.Fatalf("expected 2 batches, got %d", len(batches))
+	}
+}
+
+func TestCountRunes(t *testing.T) {
+	items := []string{"hello", "world"}
+	if total := countRunes(items); total != 10 {
+		t.Fatalf("expected 10 runes, got %d", total)
+	}
+}
+
+func TestCalculateFileLimit(t *testing.T) {
+	// Below floor
+	limit1 := calculateFileLimit(100)
+	if limit1 <= 0 {
+		t.Fatalf("expected positive limit, got %d", limit1)
+	}
+
+	// Above floor
+	limit2 := calculateFileLimit(8192)
+	if limit2 <= limit1 {
+		t.Fatalf("expected limit2 > limit1, got %d <= %d", limit2, limit1)
+	}
+}

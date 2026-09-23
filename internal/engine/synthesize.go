@@ -97,6 +97,59 @@ func extractFileFacts(p *pipelineContext, f string, nodePath string, fileLimit i
 	return facts, nil
 }
 
+func calculateFileLimit(numCtx int) int {
+	if numCtx < minNumCtxFloor {
+		numCtx = minNumCtxFloor
+	}
+	return int(float64(numCtx*4) * contextWindowAllocRatio)
+}
+
+func synthesizeChildren(p *pipelineContext, node *DirNode) (map[string]string, []string, error) {
+	var childNames []string
+	for name := range node.Children {
+		childNames = append(childNames, name)
+	}
+	sort.Strings(childNames)
+
+	childSummaries := make(map[string]string)
+	for _, name := range childNames {
+		sum, err := synthesizeNode(p, node.Children[name])
+		if err != nil {
+			return nil, nil, err
+		}
+		if sum != "" {
+			childSummaries[name] = sum
+		}
+	}
+	return childSummaries, childNames, nil
+}
+
+func collectComponents(p *pipelineContext, node *DirNode, childSummaries map[string]string, childNames []string) ([]string, error) {
+	fileLimit := calculateFileLimit(p.client.NumCtx())
+
+	var components []string
+	for _, f := range node.Files {
+		if err := p.ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		facts, err := extractFileFacts(p, f, node.Path, fileLimit)
+		if err != nil {
+			return nil, err
+		}
+		if facts != "" {
+			components = append(components, fmt.Sprintf("### File: %s\n%s", filepath.Base(f), facts))
+		}
+	}
+
+	for _, childName := range childNames {
+		if sum := childSummaries[childName]; sum != "" {
+			components = append(components, fmt.Sprintf("### Subsystem: %s\n%s", childName, sum))
+		}
+	}
+	return components, nil
+}
+
 func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
 	if err := p.ctx.Err(); err != nil {
 		return "", err
@@ -108,53 +161,14 @@ func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
 		return p.cache.Modules[node.Path], nil
 	}
 
-	var childNames []string
-	for name := range node.Children {
-		childNames = append(childNames, name)
-	}
-	sort.Strings(childNames)
-
-	childSummaries := make(map[string]string)
-	for _, name := range childNames {
-		child := node.Children[name]
-		sum, err := synthesizeNode(p, child)
-		if err != nil {
-			return "", err
-		}
-		if sum != "" {
-			childSummaries[name] = sum
-		}
+	childSummaries, childNames, err := synthesizeChildren(p, node)
+	if err != nil {
+		return "", err
 	}
 
-	var components []string
-
-	// Calculate a 100% dynamic file truncation limit based purely on the context size.
-	// Assuming ~4 characters per token, we allocate 75% of the total context window
-	// for the file content, proportionally reserving the remaining 25% for prompts and output.
-	numCtx := p.client.NumCtx()
-	if numCtx < minNumCtxFloor {
-		numCtx = minNumCtxFloor
-	}
-	fileLimit := int(float64(numCtx*4) * contextWindowAllocRatio)
-
-	for _, f := range node.Files {
-		if err := p.ctx.Err(); err != nil {
-			return "", err
-		}
-
-		facts, err := extractFileFacts(p, f, node.Path, fileLimit)
-		if err != nil {
-			return "", err
-		}
-		if facts != "" {
-			components = append(components, fmt.Sprintf("### File: %s\n%s", filepath.Base(f), facts))
-		}
-	}
-
-	for _, childName := range childNames {
-		if sum, exists := childSummaries[childName]; exists && sum != "" {
-			components = append(components, fmt.Sprintf("### Subsystem: %s\n%s", childName, sum))
-		}
+	components, err := collectComponents(p, node, childSummaries, childNames)
+	if err != nil {
+		return "", err
 	}
 
 	if len(components) == 0 {

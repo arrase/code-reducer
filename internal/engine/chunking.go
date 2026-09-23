@@ -9,77 +9,85 @@ import (
 	"github.com/arrase/code-reducer/internal/config"
 )
 
+type reductionConfig struct {
+	sysPrompt   string
+	buildPrompt func(batch []string) string
+	logMsg      func(batch []string) string
+	errMsg      string
+	logEvent    LogEventFunc
+}
+
 func reduceWithLLM(
 	ctx context.Context,
 	c llmCaller,
 	items []string,
-	sysPrompt string,
-	buildPrompt func(batch []string) string,
-	logMsg func(batch []string) string,
-	errMsg string,
-	logEvent LogEventFunc,
+	cfg reductionConfig,
 ) (string, error) {
 	if len(items) == 0 {
 		return "", nil
 	}
 	maxChars := c.NumCtx() * maxCharsMultiplier
 	return reduceItems(ctx, items, maxChars, func(batch []string) (string, error) {
-		prompt := buildPrompt(batch)
-		logEvent(EventStatus, logMsg(batch))
-		res, err := c.CallLLM(ctx, sysPrompt, []Message{{Role: "user", Content: prompt}}, false)
+		prompt := cfg.buildPrompt(batch)
+		cfg.logEvent(EventStatus, cfg.logMsg(batch))
+		res, err := c.CallLLM(ctx, cfg.sysPrompt, []Message{{Role: "user", Content: prompt}}, false)
 		if err != nil {
-			return "", fmt.Errorf("%s: %w", errMsg, err)
+			return "", fmt.Errorf("%s: %w", cfg.errMsg, err)
 		}
 		return stripOuterMarkdownFence(res), nil
 	})
 }
 
 func reduceInChunks(ctx context.Context, c llmCaller, nodePath string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error) {
-	sysPrompt := cfg.SystemPrompt + "\n" + cfg.ModuleSynthesisPrompt
-	buildPrompt := func(batch []string) string {
-		return fmt.Sprintf("Synthesize architecture for %s:\n%s", nodePath, strings.Join(batch, "\n\n"))
+	redCfg := reductionConfig{
+		sysPrompt: cfg.SystemPrompt + "\n" + cfg.ModuleSynthesisPrompt,
+		buildPrompt: func(batch []string) string {
+			return fmt.Sprintf("Synthesize architecture for %s:\n%s", nodePath, strings.Join(batch, "\n\n"))
+		},
+		logMsg: func(batch []string) string {
+			return fmt.Sprintf("➜ LLM Synthesizing chunk for %s (%d items)", nodePath, len(batch))
+		},
+		errMsg:   "LLM error during synthesis",
+		logEvent: logEvent,
 	}
-	logMsg := func(batch []string) string {
-		return fmt.Sprintf("➜ LLM Synthesizing chunk for %s (%d items)", nodePath, len(batch))
-	}
-	return reduceWithLLM(ctx, c, items, sysPrompt, buildPrompt, logMsg, "LLM error during synthesis", logEvent)
+	return reduceWithLLM(ctx, c, items, redCfg)
 }
 
 func reduceFileFacts(ctx context.Context, c llmCaller, filePath string, stepName string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error) {
 	if len(items) == 1 {
 		return items[0], nil
 	}
-	sysPrompt := cfg.SystemPrompt + "\n" + cfg.FileFactConsolidationPrompt
-	buildPrompt := func(batch []string) string {
-		return fmt.Sprintf("Consolidate and deduplicate the extracted facts for %s regarding step '%s':\n%s", filePath, stepName, strings.Join(batch, "\n\n"))
+	redCfg := reductionConfig{
+		sysPrompt: cfg.SystemPrompt + "\n" + cfg.FileFactConsolidationPrompt,
+		buildPrompt: func(batch []string) string {
+			return fmt.Sprintf("Consolidate and deduplicate the extracted facts for %s regarding step '%s':\n%s", filePath, stepName, strings.Join(batch, "\n\n"))
+		},
+		logMsg: func(batch []string) string {
+			return fmt.Sprintf("➜ LLM Consolidating facts for %s (%d items)", filePath, len(batch))
+		},
+		errMsg:   "LLM error during file fact consolidation",
+		logEvent: logEvent,
 	}
-	logMsg := func(batch []string) string {
-		return fmt.Sprintf("➜ LLM Consolidating facts for %s (%d items)", filePath, len(batch))
-	}
-	return reduceWithLLM(ctx, c, items, sysPrompt, buildPrompt, logMsg, "LLM error during file fact consolidation", logEvent)
+	return reduceWithLLM(ctx, c, items, redCfg)
 }
 
-func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn func(batch []string) (string, error)) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	// 1. Expand items that are too large (More layers)
+func expandOversizedItems(items []string, maxChars int) ([]string, error) {
 	var expanded []string
 	for _, item := range items {
-		if utf8.RuneCountInString(item) > maxChars {
-			// Chunk large items to ensure they can be batched comfortably
-			chunks, err := chunkTextWithOverlap(item, maxChars/2, maxChars/10)
-			if err != nil {
-				return "", err
-			}
-			expanded = append(expanded, chunks...)
-		} else {
+		if utf8.RuneCountInString(item) <= maxChars {
 			expanded = append(expanded, item)
+			continue
 		}
+		chunks, err := chunkTextWithOverlap(item, maxChars/2, maxChars/10)
+		if err != nil {
+			return nil, err
+		}
+		expanded = append(expanded, chunks...)
 	}
-	items = expanded
+	return expanded, nil
+}
 
+func batchItems(items []string, maxChars int) [][]string {
 	var batches [][]string
 	var currentBatch []string
 	currentLen := 0
@@ -98,17 +106,35 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 	if len(currentBatch) > 0 {
 		batches = append(batches, currentBatch)
 	}
+	return batches
+}
 
+func countRunes(items []string) int {
+	total := 0
+	for _, item := range items {
+		total += utf8.RuneCountInString(item)
+	}
+	return total
+}
+
+func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn func(batch []string) (string, error)) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	expanded, err := expandOversizedItems(items, maxChars)
+	if err != nil {
+		return "", err
+	}
+	items = expanded
+
+	batches := batchItems(items, maxChars)
 	if len(batches) == 1 {
 		return reduceFn(batches[0])
 	}
 
+	totalInputRunes := countRunes(items)
 	var intermediate []string
-	totalInputRunes := 0
-	for _, item := range items {
-		totalInputRunes += utf8.RuneCountInString(item)
-	}
-
 	for _, batch := range batches {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -120,16 +146,9 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 		intermediate = append(intermediate, chunkRes)
 	}
 
-	totalOutputRunes := 0
-	for _, item := range intermediate {
-		totalOutputRunes += utf8.RuneCountInString(item)
-	}
-
 	// Loop Prevention: If the LLM is failing to condense the information (output >= 95% of input),
 	// we stop adding layers and concatenate. This prevents infinite map-reduce loops.
-	// Since the downstream processes (like next level in the tree) will automatically chunk
-	// oversized inputs, we safely preserve all information without exceeding the context window.
-	if totalOutputRunes >= (totalInputRunes * 95 / 100) {
+	if countRunes(intermediate) >= (totalInputRunes * 95 / 100) {
 		return strings.Join(intermediate, "\n\n"), nil
 	}
 

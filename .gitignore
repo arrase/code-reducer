@@ -15,3 +15,7 @@ dist/
 tmp/
 site/
 *.tmp.*
+
+# SonarQube
+.scannerwork/
+coverage.out

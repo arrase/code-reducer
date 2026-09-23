@@ -83,6 +83,69 @@ func teardownPipeline(repoRoot, docsDir string, cache *MetadataCache, logEvent L
 	logEvent(EventStatus, successMsg)
 }
 
+func computeFilesHashes(repoRoot string, files []string, logEvent LogEventFunc) map[string]string {
+	hashes := make(map[string]string)
+	for _, f := range files {
+		hash, err := computeSHA256(repoRoot, f)
+		if err != nil {
+			logEvent(EventStatus, fmt.Sprintf("Warning: failed to compute hash for %s: %v", f, err))
+			continue
+		}
+		hashes[f] = hash
+	}
+	return hashes
+}
+
+func markAllTreeAffected(tree *DirNode) map[string]bool {
+	affected := make(map[string]bool)
+	var walk func(n *DirNode)
+	walk = func(n *DirNode) {
+		affected[n.Path] = true
+		for _, child := range n.Children {
+			walk(child)
+		}
+	}
+	walk(tree)
+	return affected
+}
+
+func updateAgentGuidelines(repoRoot, docsDir string) error {
+	agentGuidelines := fmt.Sprintf(`# AI Agent Guidelines
+
+This repository contains automatically generated documentation under the %s directory to help AI coding agents understand the system architecture, design patterns, and module structure:
+
+- **System Blueprint**: Refer to %s/architecture.md for a high-level system overview, module relationships, and boundary definitions.
+- **Developer Quickstart**: Refer to %s/quickstart.md for onboarding steps, coding patterns, and configuration settings.
+- **Module Details**: Explore %s/modules/ for directory-level summaries and API descriptions of internal packages.
+
+`, docsDir, docsDir, docsDir, docsDir)
+
+	agentFileBytes, err := tools.ReadFileSafely(repoRoot, agentsFileName)
+	if err != nil {
+		if err := tools.WriteFileSafely(repoRoot, agentsFileName, []byte(agentGuidelines)); err != nil {
+			return fmt.Errorf("failed to write %s: %w", agentsFileName, err)
+		}
+		return nil
+	}
+
+	content := string(agentFileBytes)
+	if strings.Contains(content, "AI Agent Guidelines") {
+		return nil
+	}
+
+	separator := "\n\n"
+	if strings.HasSuffix(content, "\n\n") {
+		separator = ""
+	} else if strings.HasSuffix(content, "\n") {
+		separator = "\n"
+	}
+	newContent := content + separator + agentGuidelines
+	if err := tools.WriteFileSafely(repoRoot, agentsFileName, []byte(newContent)); err != nil {
+		return fmt.Errorf("failed to append to %s: %w", agentsFileName, err)
+	}
+	return nil
+}
+
 func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config.Config, onEvent func(Event)) error {
 	logEvent := makeLogEvent(onEvent)
 	logEvent(EventStatus, "Starting Map-Reduce pipeline: init")
@@ -99,16 +162,7 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 		return err
 	}
 
-	precalculatedHashes := make(map[string]string)
-	for _, f := range codeFiles {
-		hash, err := computeSHA256(repoRoot, f)
-		if err == nil {
-			precalculatedHashes[f] = hash
-		} else {
-			logEvent(EventStatus, fmt.Sprintf("Warning: failed to compute hash for %s: %v", f, err))
-		}
-	}
-
+	precalculatedHashes := computeFilesHashes(repoRoot, codeFiles, logEvent)
 	tree := buildTree(codeFiles)
 	modulesDir := filepath.Join(repoRoot, docsDir, "modules")
 	if err := os.MkdirAll(modulesDir, defaultDirPerm); err != nil {
@@ -116,16 +170,7 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 	}
 
 	logEvent(EventStatus, "Step 2: Hierarchical Tree-Merging (Map-Reduce)...")
-
-	affectedDirs := make(map[string]bool)
-	var markAllAffected func(n *DirNode)
-	markAllAffected = func(n *DirNode) {
-		affectedDirs[n.Path] = true
-		for _, child := range n.Children {
-			markAllAffected(child)
-		}
-	}
-	markAllAffected(tree)
+	affectedDirs := markAllTreeAffected(tree)
 
 	pCtx := &pipelineContext{
 		ctx:                 ctx,
@@ -148,36 +193,8 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 	}
 
 	logEvent(EventStatus, fmt.Sprintf("Step 5: Updating %s...", agentsFileName))
-	agentFilePath := agentsFileName
-	agentGuidelines := fmt.Sprintf(`# AI Agent Guidelines
-
-This repository contains automatically generated documentation under the %s directory to help AI coding agents understand the system architecture, design patterns, and module structure:
-
-- **System Blueprint**: Refer to %s/architecture.md for a high-level system overview, module relationships, and boundary definitions.
-- **Developer Quickstart**: Refer to %s/quickstart.md for onboarding steps, coding patterns, and configuration settings.
-- **Module Details**: Explore %s/modules/ for directory-level summaries and API descriptions of internal packages.
-
-`, docsDir, docsDir, docsDir, docsDir)
-
-	agentFileBytes, err := tools.ReadFileSafely(repoRoot, agentFilePath)
-	if err != nil {
-		if err := tools.WriteFileSafely(repoRoot, agentFilePath, []byte(agentGuidelines)); err != nil {
-			return fmt.Errorf("failed to write %s: %w", agentsFileName, err)
-		}
-	} else {
-		content := string(agentFileBytes)
-		if !strings.Contains(content, "AI Agent Guidelines") {
-			separator := "\n\n"
-			if strings.HasSuffix(content, "\n\n") {
-				separator = ""
-			} else if strings.HasSuffix(content, "\n") {
-				separator = "\n"
-			}
-			newContent := content + separator + agentGuidelines
-			if err := tools.WriteFileSafely(repoRoot, agentFilePath, []byte(newContent)); err != nil {
-				return fmt.Errorf("failed to append to %s: %w", agentsFileName, err)
-			}
-		}
+	if err := updateAgentGuidelines(repoRoot, docsDir); err != nil {
+		return err
 	}
 
 	teardownPipeline(repoRoot, docsDir, cache, logEvent, "Pipeline completed successfully!")

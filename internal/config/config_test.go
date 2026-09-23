@@ -92,4 +92,15 @@ func TestResolveConfig(t *testing.T) {
 			t.Fatal("expected error, got nil")
 		}
 	})
+
+	t.Run("resolve base url from env", func(t *testing.T) {
+		t.Setenv(OllamaBaseURLEnvKey, "http://custom-ollama:11434")
+		resolved, err := ResolveConfig(t.TempDir(), "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if resolved.OllamaBaseURL != "http://custom-ollama:11434" {
+			t.Errorf("expected http://custom-ollama:11434, got %s", resolved.OllamaBaseURL)
+		}
+	})
 }
