@@ -172,8 +172,7 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 	logEvent(EventStatus, "Step 2: Hierarchical Tree-Merging (Map-Reduce)...")
 	affectedDirs := markAllTreeAffected(tree)
 
-	pCtx := &pipelineContext{
-		ctx:                 ctx,
+	pState := &pipelineState{
 		client:              o.client,
 		repoRoot:            repoRoot,
 		cfg:                 cfg,
@@ -183,7 +182,7 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 		logEvent:            logEvent,
 	}
 
-	rootSum, err := synthesizeNode(pCtx, tree)
+	rootSum, err := synthesizeNode(ctx, pState, tree)
 	if err != nil {
 		return err
 	}
@@ -318,8 +317,7 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 	}
 
 	logEvent(EventStatus, fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
-	pCtx := &pipelineContext{
-		ctx:                 ctx,
+	pState := &pipelineState{
 		client:              o.client,
 		repoRoot:            repoRoot,
 		cfg:                 cfg,
@@ -329,7 +327,7 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 		logEvent:            logEvent,
 	}
 
-	rootSum, err := synthesizeNode(pCtx, tree)
+	rootSum, err := synthesizeNode(ctx, pState, tree)
 	if err != nil {
 		return err
 	}

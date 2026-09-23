@@ -44,7 +44,7 @@ func newEmptyCache() *MetadataCache {
 	}
 }
 
-func loadMetadataCache(repoRoot string, docsDir string) (*MetadataCache, error) {
+func loadMetadataCache(repoRoot, docsDir string) (*MetadataCache, error) {
 	metadataPath := filepath.Join(docsDir, metadataFileName)
 	data, err := tools.ReadFileSafely(repoRoot, metadataPath)
 	if err != nil {
@@ -77,7 +77,7 @@ func IsInitialized(repoRoot, docsDir string) bool {
 	return err == nil
 }
 
-func saveMetadataCache(repoRoot string, docsDir string, cache *MetadataCache) error {
+func saveMetadataCache(repoRoot, docsDir string, cache *MetadataCache) error {
 	cache.Version = currentCacheVersion
 	metadataPath := filepath.Join(docsDir, metadataFileName)
 	data, err := json.MarshalIndent(cache, "", "  ")

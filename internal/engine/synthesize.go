@@ -13,8 +13,7 @@ import (
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
-type pipelineContext struct {
-	ctx                 context.Context
+type pipelineState struct {
 	client              llmCaller
 	repoRoot            string
 	cfg                 *config.Config
@@ -24,7 +23,7 @@ type pipelineContext struct {
 	logEvent            LogEventFunc
 }
 
-func extractFileFacts(p *pipelineContext, f string, nodePath string, fileLimit int) (string, error) {
+func extractFileFacts(ctx context.Context, p *pipelineState, f string, nodePath string, fileLimit int) (string, error) {
 	fileHash, hashOk := p.precalculatedHashes[f]
 	cachedEntry, cacheExists := p.cache.Files[f]
 
@@ -72,14 +71,14 @@ func extractFileFacts(p *pipelineContext, f string, nodePath string, fileLimit i
 
 			systemPrompt := p.cfg.SystemPrompt + "\n" + step.Prompt
 			userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, nodePath, chunk)
-			res, err := p.client.CallLLM(p.ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
+			res, err := p.client.CallLLM(ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
 			if err != nil {
 				return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
 			}
 			stepFacts = append(stepFacts, stripOuterMarkdownFence(res))
 		}
 
-		consolidatedFact, err := reduceFileFacts(p.ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
+		consolidatedFact, err := reduceFileFacts(ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
 		if err != nil {
 			return "", err
 		}
@@ -104,7 +103,7 @@ func calculateFileLimit(numCtx int) int {
 	return int(float64(numCtx*4) * contextWindowAllocRatio)
 }
 
-func synthesizeChildren(p *pipelineContext, node *DirNode) (map[string]string, []string, error) {
+func synthesizeChildren(ctx context.Context, p *pipelineState, node *DirNode) (map[string]string, []string, error) {
 	var childNames []string
 	for name := range node.Children {
 		childNames = append(childNames, name)
@@ -113,7 +112,7 @@ func synthesizeChildren(p *pipelineContext, node *DirNode) (map[string]string, [
 
 	childSummaries := make(map[string]string)
 	for _, name := range childNames {
-		sum, err := synthesizeNode(p, node.Children[name])
+		sum, err := synthesizeNode(ctx, p, node.Children[name])
 		if err != nil {
 			return nil, nil, err
 		}
@@ -124,16 +123,16 @@ func synthesizeChildren(p *pipelineContext, node *DirNode) (map[string]string, [
 	return childSummaries, childNames, nil
 }
 
-func collectComponents(p *pipelineContext, node *DirNode, childSummaries map[string]string, childNames []string) ([]string, error) {
+func collectComponents(ctx context.Context, p *pipelineState, node *DirNode, childSummaries map[string]string, childNames []string) ([]string, error) {
 	fileLimit := calculateFileLimit(p.client.NumCtx())
 
 	var components []string
 	for _, f := range node.Files {
-		if err := p.ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		facts, err := extractFileFacts(p, f, node.Path, fileLimit)
+		facts, err := extractFileFacts(ctx, p, f, node.Path, fileLimit)
 		if err != nil {
 			return nil, err
 		}
@@ -150,8 +149,8 @@ func collectComponents(p *pipelineContext, node *DirNode, childSummaries map[str
 	return components, nil
 }
 
-func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
-	if err := p.ctx.Err(); err != nil {
+func synthesizeNode(ctx context.Context, p *pipelineState, node *DirNode) (string, error) {
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 
@@ -161,12 +160,12 @@ func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
 		return p.cache.Modules[node.Path], nil
 	}
 
-	childSummaries, childNames, err := synthesizeChildren(p, node)
+	childSummaries, childNames, err := synthesizeChildren(ctx, p, node)
 	if err != nil {
 		return "", err
 	}
 
-	components, err := collectComponents(p, node, childSummaries, childNames)
+	components, err := collectComponents(ctx, p, node, childSummaries, childNames)
 	if err != nil {
 		return "", err
 	}
@@ -177,7 +176,7 @@ func synthesizeNode(p *pipelineContext, node *DirNode) (string, error) {
 	}
 
 	p.logEvent(EventStatus, fmt.Sprintf("➜ Synthesizing directory: %s (%d total components)", node.Path, len(components)))
-	finalSum, err := reduceInChunks(p.ctx, p.client, node.Path, components, p.cfg, p.logEvent)
+	finalSum, err := reduceInChunks(ctx, p.client, node.Path, components, p.cfg, p.logEvent)
 	if err != nil {
 		return "", err
 	}
