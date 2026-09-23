@@ -45,6 +45,28 @@ func propagateAffected(node *DirNode, affectedDirs map[string]bool) map[string]b
 	return newAffected
 }
 
+func isNodeAffected(n *DirNode, changedFiles map[string]bool, repoRoot, docsDir string, cache *MetadataCache) bool {
+	if cache.Modules[n.Path] == "" {
+		return true
+	}
+
+	for _, f := range n.Files {
+		if changedFiles[f] {
+			return true
+		}
+	}
+
+	modulePath := filepath.Join(docsDir, "modules", toSafeMarkdownFilename(n.Path))
+	absModulePath, err := security.SafeResolve(repoRoot, modulePath)
+	if err == nil {
+		if _, err := os.Stat(absModulePath); os.IsNotExist(err) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataCache, filteredChanges []FileChange) map[string]bool {
 	affectedDirs := make(map[string]bool)
 	changedFiles := make(map[string]bool)
@@ -57,23 +79,7 @@ func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataC
 
 	var checkNode func(n *DirNode)
 	checkNode = func(n *DirNode) {
-		for _, f := range n.Files {
-			if changedFiles[f] {
-				affectedDirs[n.Path] = true
-				break
-			}
-		}
-
-		safeName := toSafeMarkdownFilename(n.Path)
-		modulePath := filepath.Join(docsDir, "modules", safeName)
-		absModulePath, err := security.SafeResolve(repoRoot, modulePath)
-		if err == nil {
-			if _, err := os.Stat(absModulePath); os.IsNotExist(err) {
-				affectedDirs[n.Path] = true
-			}
-		}
-
-		if cache.Modules[n.Path] == "" {
+		if isNodeAffected(n, changedFiles, repoRoot, docsDir, cache) {
 			affectedDirs[n.Path] = true
 		}
 

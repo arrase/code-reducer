@@ -1,4 +1,4 @@
-model_id: ornith:9b
+model_id: gemma4:26b-a4b-it-qat
 ollama_base_url: http://localhost:11434
 ollama_num_ctx: 20000
 docs_dir: wiki

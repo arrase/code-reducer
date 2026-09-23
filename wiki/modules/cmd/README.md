@@ -1,65 +1,73 @@
-# cmd Package: CLI Orchestration Layer
+# Module: `cmd`
 
-## Responsibility
-
-This package implements the command-line interface for `code-reducer`, an interactive LLM-driven documentation agent. It routes user input through a lifecycle of three engine modes (`init`, `update`, and an additional mode resolved by `executeCommand`) while managing project state transitions—configuring setup when no configuration exists, validating git repository requirements, loading flags, checking initialization status against the requested mode, executing the engine with signal handling, and streaming events to stdout/stderr.
+## Module Overview
+The `cmd` module serves as the command-line interface (CLI) orchestration layer. It manages the lifecycle of project documentation generation by coordinating user input, configuration persistence, git repository validation, and the execution of the underlying documentation engine.
 
 ## Data Flow
+1.  **Input Acquisition**: CLI arguments are parsed via `RootCmd`. User-provided flags (`--model-id`, `--num-ctx`) and interactive input (`os.Stdin`) are captured.
+2.  **Environment Validation**: The module verifies the presence of a git repository and determines the current working directory via `os.Getwd`.
+3.  **State Assessment**: The module checks for existing configuration files and determines if the project is in an initialized state to validate the requested operation (`init` vs. `update`).
+4.  **Configuration Resolution**: Configuration is loaded from disk, merged with defaults, and optionally updated via an interactive setup flow.
+5.  **Execution Dispatch**: The validated configuration and mode are passed to the `engine` package to perform documentation generation or incremental updates.
+6.  **Output Stream**: Results, status updates, and errors are streamed to `stdout` and `stderr`.
 
-```
-User Terminal ──► RootCmd (cobra) ◄──► init() / RunSetupFlow(repoRoot)
-                                                              │
-                                                              ▼
-                                              executeCommand(Mode)
-                                        ┌──► checkAndRunSetup(repoRoot)
-                                        │    Check git repo, config existence, TTY check
-                                        │    If no config + stdin is TTY → RunSetupFlow
-                                        │
-                                        ├──► checkInitStatus(repoRoot, docsDir, Mode)
-                                        │    Validates init marker presence; enforces:
-                                        │      - ModeInit fails if already initialized
-                                        │      - ModeUpdate fails if not yet initialized
-                                        │
-                                        ├──► runEngine(repoRoot, cfg, Mode)
-                                        │    Registers SIGINT/SIGTERM handlers
-                                        │    Instantiates runner
-                                        │    Streams events (status → stdout, error → stderr)
-                                        │
-                                        └──► executeCommand returns engine.Error or nil
-```
+## Core Components
 
-## Command Registration and Delegation
+### Command Orchestration (`root.go`)
+The central logic for the CLI lifecycle is contained within this file.
 
-The `init()` function registers a `*cobra.Command` named `update` under the root command. Its `RunE` handler delegates to `executeCommand(engine.ModeUpdate)`. The same delegation pattern applies elsewhere: `setup.go` defines `*cobra.Command setupCmd`, whose `RunE` invokes `RunSetupFlow(repoRoot)` and propagates errors upward through cobra's exit path.
+*   **`RootCmd`** (`*cobra.Command`): The entry point for the CLI application.
+*   **`executeCommand(mode engine.Mode) error`**: The primary controller. It performs the following sequence:
+    *   Resolves the working directory.
+    *   Verifies the git repository status.
+    *   Triggers `checkAndRunSetup` if configuration is missing and `os.Stdin` is a TTY.
+    *   Resolves the final configuration.
+    *   Validates that the current project state matches the requested `engine.Mode`.
+    *   Dispatches execution to `runEngine`.
+*   **`checkAndRunSetup(repoRoot string) error`**: Evaluates if `RunSetupFlow` is required based on the existence of configuration files and terminal availability.
+*   **`checkInitStatus(repoRoot, docsDir string, mode engine.Mode) error`**: Enforces state transition rules:
+    *   `ModeInit` is prohibited if the project is already initialized.
+    *   `ModeUpdate` is prohibited if the project is not yet initialized.
+*   **`runEngine(repoRoot string, cfg *config.Config, mode engine.Mode) error`**: Orchestrates engine execution with signal handling for `os.Interrupt` and `syscall.SIGTERM`.
 
-## Flag Registration
+### Command Definitions (`init.go`, `update.go`)
+These files act as thin wrappers that map CLI subcommands to specific engine modes.
 
-The package-level variables `modelIDFlag` (string) and `numCtxFlag` (string) are registered on the root command via `StringVar`. They persist for the lifetime of the process and are read by downstream functions including `executeCommand`, `checkAndRunSetup`, and `runEngine`. No synchronization primitives—locks, mutexes, atomics, channels—are used.
+*   **`init` subcommand**: Dispatches `engine.ModeInit` to trigger the initial scanning of the repository and generation of wiki markdown files.
+*   **`update` subcommand**: Dispatches `engine.ModeUpdate` to perform incremental updates by comparing current file states against the last documented git commit.
 
-## Initialization State Validation
+### Configuration Lifecycle (`setup.go`)
+Handles the interactive provisioning of project settings.
 
-`checkInitStatus(repoRoot, docsDir string, mode engine.Mode) error` validates that the project has been initialized before allowing non-init operations. It calls `engine.IsInitialized(repoRoot, docsDir)` to check for init marker files in the docs directory. User-facing errors are created inline via `fmt.Errorf(...)`; no wrapping of previous errors occurs—error chains terminate at this point.
+*   **`RunSetupFlow(repoRoot string) error`**: Manages a stateful, interactive session to collect:
+    *   LLM Model ID.
+    *   Ollama Base URL.
+    *   Ollama Context Size.
+    *   File/directory ignore patterns.
+    *   Documentation directory paths.
+*   **Persistence**: Finalized settings are consolidated into a `config.Config` object and written to disk via `config.SaveConfig`.
 
-## Interactive Configuration Setup
+## State and Side Effects
 
-`RunSetupFlow(repoRoot string) error` guides the user through setting up `.code-reducer.yaml`. It loads any previously saved configuration to preserve preferences across sessions, then walks each configurable domain (model identity, LLM endpoint URL, context size limit, ignore patterns, documentation directory path, four system prompt templates), prompting via `promptString` and `promptStringList`. For every field, empty input or a clear/none directive falls back to the prior value. The context size specifically validates numeric input via `strconv.Atoi`; on parse failure or non-positive values it silently returns `existingNumCtx` with no error propagation—this is intentional fallback behavior only.
+### Mutable State
+*   **Global Flags**: `modelIDFlag` and `numCtxFlag` are modified during the `init()` phase and persist for the lifetime of the process.
+*   **Command State**: `RootCmd` state is modified via `.SetArgs()` and `.Execute()` during testing.
 
-## Engine Execution and Signal Handling
+### External I/O
+*   **Filesystem**:
+    *   Directory/file creation via `os.MkdirAll` and `os.WriteFile`.
+    *   Configuration persistence via `config.SaveConfig` and `config.LoadConfig`.
+    *   Git verification via `tools.VerifyGitRepo`.
+    *   State check via `engine.IsInitialized`.
+*   **Standard Streams**:
+    *   `os.Stdin`: Used for interactive parameter collection.
+    *   `os.Stdout`: Used for status messages and engine events.
+    *   `os.Stderr`: Used for error reporting.
 
-`runEngine(repoRoot string, cfg *config.Config, mode engine.Mode) error` registers interrupt/terminate handlers (`os.Interrupt`, `syscall.SIGTERM`) via `signal.NotifyContext(context.Background(), ...)`. The context is stored in a local variable and deferred stop on exit. It instantiates the engine runner and executes documentation generation while streaming events of three types—status (stdout), error (stderr, prefixed with "Error: "), and other—to stdout or stderr as appropriate.
-
-## Error Propagation Summary
-
-| Source | Pattern |
-|---|---|
-| `engine.IsInitialized` | New `fmt.Errorf(...)`; chain terminates here |
-| `RunSetupFlow` read failures | Wrapped with prefix (`"error reading model ID: %w"`); propagated to cobra exit |
-| `config.SaveConfig` failure | Wrapped as `"error saving configuration: %w"`; returned from `RunE` |
-| `engine.ExecuteCommand` return | Pass-through; no wrapping |
-| Git verification (`tools.VerifyGitRepo`) | Returned verbatim; chain terminates |
-| Config resolution | Passed through unchanged |
-| `RootCmd.Execute()` in tests | Discarded (`_ = RootCmd.Execute()`); known pattern for CLI exit-code testing |
-
-## Test Coverage
-
-`cmd_test.go` exercises the public API surface indirectly. It validates flag parsing via package-level variables, prompt input handling via buffered readers simulating stdin, and initialization state management through filesystem operations confined to `t.TempDir()`.
+### Error Handling
+*   **Propagation**: Errors are passed up the call stack via return values.
+*   **Wrapping**: `os.Getwd` and `runner.Run` errors are wrapped with context using `%w`.
+*   **Swallowed Errors**: 
+    *   `config.LoadConfig` errors are swallowed in `RunSetupFlow` (defaults are returned instead).
+    *   `strconv.Atoi` errors in `promptContextSize` are swallowed (default values are returned instead).
+    *   `RootCmd.Execute()` return values are swallowed in `cmd_test.go`.

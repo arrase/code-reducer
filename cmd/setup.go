@@ -30,110 +30,113 @@ func init() {
 	RootCmd.AddCommand(setupCmd)
 }
 
+func loadInitialSetupConfig(repoRoot string) *config.Config {
+	cfg, err := config.LoadConfig(repoRoot)
+	if err != nil || cfg == nil {
+		return &config.Config{
+			ModelID:                     config.OllamaDefaultModelID,
+			OllamaBaseURL:               config.OllamaDefaultBaseURL,
+			OllamaNumCtx:                config.OllamaDefaultNumCtx,
+			DocsDir:                     config.DefaultDocsDir,
+			ExtractionSteps:             config.DefaultExtractionSteps,
+			SystemPrompt:                config.DefaultSystemPrompt,
+			ModuleSynthesisPrompt:       config.DefaultModuleSynthesisPrompt,
+			ArchitecturePrompt:          config.DefaultArchitecturePrompt,
+			FileFactConsolidationPrompt: config.DefaultFileFactConsolidationPrompt,
+		}
+	}
+
+	if cfg.ModelID == "" {
+		cfg.ModelID = config.OllamaDefaultModelID
+	}
+	if cfg.OllamaBaseURL == "" {
+		cfg.OllamaBaseURL = config.OllamaDefaultBaseURL
+	}
+	if cfg.OllamaNumCtx <= 0 {
+		cfg.OllamaNumCtx = config.OllamaDefaultNumCtx
+	}
+	if cfg.DocsDir == "" {
+		cfg.DocsDir = config.DefaultDocsDir
+	}
+	if len(cfg.ExtractionSteps) == 0 {
+		cfg.ExtractionSteps = config.DefaultExtractionSteps
+	}
+	if cfg.SystemPrompt == "" {
+		cfg.SystemPrompt = config.DefaultSystemPrompt
+	}
+	if cfg.ModuleSynthesisPrompt == "" {
+		cfg.ModuleSynthesisPrompt = config.DefaultModuleSynthesisPrompt
+	}
+	if cfg.ArchitecturePrompt == "" {
+		cfg.ArchitecturePrompt = config.DefaultArchitecturePrompt
+	}
+	if cfg.FileFactConsolidationPrompt == "" {
+		cfg.FileFactConsolidationPrompt = config.DefaultFileFactConsolidationPrompt
+	}
+	return cfg
+}
+
+func promptContextSize(reader *bufio.Reader, defaultVal int) (int, error) {
+	ctxInputStr, err := promptString(reader, "Enter Ollama Context Size", strconv.Itoa(defaultVal))
+	if err != nil {
+		return 0, fmt.Errorf("error reading context size: %w", err)
+	}
+	if n, err := strconv.Atoi(ctxInputStr); err == nil && n > 0 {
+		return n, nil
+	}
+	return defaultVal, nil
+}
+
+func promptIgnores(reader *bufio.Reader, defaultIgnores []string) ([]string, error) {
+	userInputIgnores, ignoresModified, err := promptStringList(reader, "Enter directories, files, or patterns to ignore (comma-separated)", defaultIgnores)
+	if err != nil {
+		return nil, fmt.Errorf("error reading ignores: %w", err)
+	}
+	if !ignoresModified {
+		if defaultIgnores != nil {
+			return defaultIgnores, nil
+		}
+		return []string{}, nil
+	}
+	if len(userInputIgnores) > 0 {
+		return userInputIgnores, nil
+	}
+	return []string{}, nil
+}
+
 // RunSetupFlow guides the user through setting up the configuration file.
 func RunSetupFlow(repoRoot string) error {
-	reader := bufio.NewReader(os.Stdin)
+	return runSetupFlowWithReader(bufio.NewReader(os.Stdin), repoRoot)
+}
+
+func runSetupFlowWithReader(reader *bufio.Reader, repoRoot string) error {
 	fmt.Println("Welcome to Code-Reducer CLI Setup")
 	fmt.Println("---------------------------------")
 
-	existingModel := config.OllamaDefaultModelID
-	existingBaseURL := config.OllamaDefaultBaseURL
-	existingNumCtx := config.OllamaDefaultNumCtx
+	current := loadInitialSetupConfig(repoRoot)
 
-	var existingCfg *config.Config
-	cfg, err := config.LoadConfig(repoRoot)
-	if err == nil && cfg != nil {
-		existingCfg = cfg
-		if cfg.ModelID != "" {
-			existingModel = cfg.ModelID
-		}
-		if cfg.OllamaBaseURL != "" {
-			existingBaseURL = cfg.OllamaBaseURL
-		}
-		if cfg.OllamaNumCtx > 0 {
-			existingNumCtx = cfg.OllamaNumCtx
-		}
-	}
-
-	modelInput, err := promptString(reader, "Enter LLM Model ID", existingModel)
+	modelInput, err := promptString(reader, "Enter LLM Model ID", current.ModelID)
 	if err != nil {
 		return fmt.Errorf("error reading model ID: %w", err)
 	}
-	urlInput, err := promptString(reader, "Enter Ollama Base URL", existingBaseURL)
+	urlInput, err := promptString(reader, "Enter Ollama Base URL", current.OllamaBaseURL)
 	if err != nil {
 		return fmt.Errorf("error reading base URL: %w", err)
 	}
 
-	ctxInputStr, err := promptString(reader, "Enter Ollama Context Size", strconv.Itoa(existingNumCtx))
+	numCtx, err := promptContextSize(reader, current.OllamaNumCtx)
 	if err != nil {
-		return fmt.Errorf("error reading context size: %w", err)
-	}
-	var numCtx int
-	if n, err := strconv.Atoi(ctxInputStr); err == nil && n > 0 {
-		numCtx = n
-	} else {
-		numCtx = existingNumCtx
+		return err
 	}
 
-	var customIgnores []string
-
-	if existingCfg != nil {
-		customIgnores = existingCfg.Ignore
-	}
-
-	userInputIgnores, ignoresModified, err := promptStringList(reader, "Enter directories, files, or patterns to ignore (comma-separated)", customIgnores)
+	ignores, err := promptIgnores(reader, current.Ignore)
 	if err != nil {
-		return fmt.Errorf("error reading ignores: %w", err)
-	}
-	var ignores []string
-	if ignoresModified {
-		if len(userInputIgnores) > 0 {
-			ignores = userInputIgnores
-		} else {
-			ignores = []string{}
-		}
-	} else {
-		if existingCfg != nil {
-			ignores = existingCfg.Ignore
-		} else {
-			ignores = []string{}
-		}
+		return err
 	}
 
-	existingDocsDir := config.DefaultDocsDir
-	if existingCfg != nil && existingCfg.DocsDir != "" {
-		existingDocsDir = existingCfg.DocsDir
-	}
-	docsDirInput, err := promptString(reader, "Enter documentation directory", existingDocsDir)
+	docsDirInput, err := promptString(reader, "Enter documentation directory", current.DocsDir)
 	if err != nil {
 		return fmt.Errorf("error reading docs dir: %w", err)
-	}
-
-	var extractionSteps []config.ExtractionStep
-	if existingCfg != nil && len(existingCfg.ExtractionSteps) > 0 {
-		extractionSteps = existingCfg.ExtractionSteps
-	} else {
-		extractionSteps = config.DefaultExtractionSteps
-	}
-
-	existingSystemPrompt := config.DefaultSystemPrompt
-	existingModuleSynthesisPrompt := config.DefaultModuleSynthesisPrompt
-	existingArchitecturePrompt := config.DefaultArchitecturePrompt
-	existingFileFactConsolidationPrompt := config.DefaultFileFactConsolidationPrompt
-
-	if existingCfg != nil {
-		if existingCfg.SystemPrompt != "" {
-			existingSystemPrompt = existingCfg.SystemPrompt
-		}
-		if existingCfg.ModuleSynthesisPrompt != "" {
-			existingModuleSynthesisPrompt = existingCfg.ModuleSynthesisPrompt
-		}
-		if existingCfg.ArchitecturePrompt != "" {
-			existingArchitecturePrompt = existingCfg.ArchitecturePrompt
-		}
-		if existingCfg.FileFactConsolidationPrompt != "" {
-			existingFileFactConsolidationPrompt = existingCfg.FileFactConsolidationPrompt
-		}
 	}
 
 	newCfg := &config.Config{
@@ -141,12 +144,12 @@ func RunSetupFlow(repoRoot string) error {
 		OllamaBaseURL:               urlInput,
 		OllamaNumCtx:                numCtx,
 		DocsDir:                     docsDirInput,
-		ExtractionSteps:             extractionSteps,
+		ExtractionSteps:             current.ExtractionSteps,
 		Ignore:                      ignores,
-		SystemPrompt:                existingSystemPrompt,
-		ModuleSynthesisPrompt:       existingModuleSynthesisPrompt,
-		ArchitecturePrompt:          existingArchitecturePrompt,
-		FileFactConsolidationPrompt: existingFileFactConsolidationPrompt,
+		SystemPrompt:                current.SystemPrompt,
+		ModuleSynthesisPrompt:       current.ModuleSynthesisPrompt,
+		ArchitecturePrompt:          current.ArchitecturePrompt,
+		FileFactConsolidationPrompt: current.FileFactConsolidationPrompt,
 	}
 
 	err = config.SaveConfig(repoRoot, newCfg)
