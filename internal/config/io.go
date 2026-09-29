@@ -41,6 +41,7 @@ func formatYAML(data []byte) string {
 		"\narchitecture_prompt:", "\n\narchitecture_prompt:",
 		"\nfile_fact_consolidation_prompt:", "\n\nfile_fact_consolidation_prompt:",
 		"\nextraction_steps:", "\n\nextraction_steps:",
+		"\ninclude_tests:", "\n\ninclude_tests:",
 		"\nignore:", "\n\nignore:",
 	}
 	for i := 0; i < len(replacements); i += 2 {

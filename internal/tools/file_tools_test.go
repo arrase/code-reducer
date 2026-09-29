@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/arrase/code-reducer/internal/tools"
@@ -80,6 +81,43 @@ func TestShouldIgnoreFile(t *testing.T) {
 	}
 }
 
+func TestIsTestFile(t *testing.T) {
+	tests := []struct {
+		relPath string
+		want    bool
+	}{
+		{"internal/engine/client.go", false},
+		{"internal/engine/synthesize_test.go", true},
+		{"pkg/parser_test.py", true},
+		{"pkg/test_parser.py", true},
+		{"src/parser_test.py", true},
+		{"src/parser_test.js", true},
+		{"src/parser.test.js", true},
+		{"src/parser.spec.js", true},
+		{"src/parser.test.ts", true},
+		{"src/parser.spec.ts", true},
+		{"src/OrderServiceTest.java", true},
+		{"src/OrderRepositoryTests.cs", true},
+		{"src/OrderSpec.scala", false},
+		{"src/OrderServiceTests.scala", true},
+		{"spec/orders_spec.rb", true},
+		{"spec/test_orders.rb", true},
+		{"src/orders_test.rs", true},
+		{"src/contest.go", false},
+		{"src/latest.java", false},
+		{"docs/testing.md", false},
+		{"test/main.go", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.relPath, func(t *testing.T) {
+			if got := tools.IsTestFile(tt.relPath); got != tt.want {
+				t.Errorf("IsTestFile(%q) = %v, want %v", tt.relPath, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDiscoverCodeFiles(t *testing.T) {
 	repoRoot := t.TempDir()
 
@@ -98,6 +136,8 @@ func TestDiscoverCodeFiles(t *testing.T) {
 	files := []string{
 		"src/main.go",
 		"src/utils.go",
+		"src/utils_test.go",
+		"src/test_utils.py",
 		"src/.hidden/secret.txt",
 		"build/output.bin",
 		"test.log",
@@ -109,25 +149,33 @@ func TestDiscoverCodeFiles(t *testing.T) {
 	}
 
 	ignores := []string{"*.log", "build/"}
-	discovered, err := tools.DiscoverCodeFiles(repoRoot, ignores)
+	discovered, err := tools.DiscoverCodeFiles(repoRoot, tools.DiscoveryOptions{Ignores: ignores})
 	if err != nil {
 		t.Fatalf("DiscoverCodeFiles() failed: %v", err)
 	}
 
 	expected := []string{"src/main.go", "src/utils.go"}
-	if len(discovered) != len(expected) {
-		t.Fatalf("Expected %d files, got %d: %v", len(expected), len(discovered), discovered)
-	}
+	assertDiscovered(t, discovered, expected)
 
-	// Order might vary depending on OS, but WalkDir is usually deterministic.
-	// We sort just in case or do a map check.
-	found := make(map[string]bool)
-	for _, f := range discovered {
-		found[f] = true
+	withTests, err := tools.DiscoverCodeFiles(repoRoot, tools.DiscoveryOptions{Ignores: ignores, IncludeTests: true})
+	if err != nil {
+		t.Fatalf("DiscoverCodeFiles() with tests failed: %v", err)
 	}
-	for _, f := range expected {
-		if !found[f] {
-			t.Errorf("Expected to find %s", f)
-		}
+	assertDiscovered(t, withTests, []string{"src/main.go", "src/test_utils.py", "src/utils.go", "src/utils_test.go"})
+
+	ignoresWithTests := append([]string{"**/*_test.go"}, ignores...)
+	explicitlyIgnored, err := tools.DiscoverCodeFiles(repoRoot, tools.DiscoveryOptions{Ignores: ignoresWithTests, IncludeTests: true})
+	if err != nil {
+		t.Fatalf("DiscoverCodeFiles() with an explicit test ignore failed: %v", err)
+	}
+	assertDiscovered(t, explicitlyIgnored, []string{"src/main.go", "src/test_utils.py", "src/utils.go"})
+}
+
+// assertDiscovered checks that discovery returned exactly the expected files.
+func assertDiscovered(t *testing.T, got, want []string) {
+	t.Helper()
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("DiscoverCodeFiles() = %v, want %v", got, want)
 	}
 }

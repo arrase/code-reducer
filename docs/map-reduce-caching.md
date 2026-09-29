@@ -37,7 +37,7 @@ sequenceDiagram
                 Engine->>LLM: Run Extract & Reduce File Facts
                 Engine->>Cache: Store SHA256 + Facts
             end
-            Engine->>LLM: Synthesize Module README (wiki/modules/<module>.md)
+            Engine->>LLM: Fill Prose Slots of the Module Page (wiki/modules/<module>/README.md)
             Engine->>Cache: Store Module Summary
         end
         alt Root Node (.) Affected OR Global Docs Missing
@@ -100,6 +100,8 @@ During `detectFileChanges`, active repository files discovered by `DiscoverCodeF
 | **`Modified`** | Present in both workspace and cache, but current SHA256 $\neq$ cached SHA256. | Directory marked **affected**. Fact cache invalidated for file; full extraction re-run. |
 | **`Deleted`** | Present in `cache.Files`, missing from active workspace. | Immediate parent directory marked **affected**. Cache entry pruned from `cache.Files`. |
 
+Toggling `include_tests` moves files in and out of the discovered set, so it is classified like any other membership change: a newly included test file is `Added`, and a newly excluded one is `Deleted`, which prunes its cache entry and rebuilds the module pages that used to document it. A directory that held only test files leaves the tree entirely, and `pruneStaleCache` removes its cached summary and its page from disk.
+
 ---
 
 ## 🌲 Bottom-Up Change Propagation
@@ -110,7 +112,7 @@ When source files change deep inside a project subfolder, child module changes m
 A directory node `n` is directly marked **affected** if:
 - Any file in `n.Files` has a `Modified` or `Added` status.
 - Any file associated with `n.Path` was `Deleted`.
-- The directory's module documentation file (`wiki/modules/<module>.md`) is physically missing on disk.
+- The directory's module documentation directory (`wiki/modules/<module>/README.md`) is physically missing on disk.
 - The directory entry `cache.Modules[n.Path]` is missing.
 
 ### 2. Recursive Bottom-Up Propagation (`propagateAffected`)

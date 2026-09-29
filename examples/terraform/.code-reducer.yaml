@@ -4,6 +4,23 @@ ollama_base_url: "http://localhost:11434"
 ollama_num_ctx: 8192
 docs_dir: "wiki"
 
+# Reasoning output. Reasoning models such as ornith:9b charge their hidden
+# thinking against every generation budget when this is true, which slows every
+# call and can leave a slot answer with no visible content. Keep it false.
+think: false
+
+# Client-wide generation cap. 0 lets Ollama decide, which only bounds the fact
+# extraction calls: every documentation slot is capped by its own per-kind cap
+# below. A value lower than a per-kind cap caps that cap as well.
+num_predict: 0
+
+# Generation caps for the documentation prose slots, the shipped defaults. The
+# page structure is written by the engine, so these are ceilings a well-behaved
+# answer never reaches: a one-line slot measures 34 tokens and a paragraph slot
+# 63 with think: false.
+slot_num_predict: 192
+paragraph_num_predict: 1024
+
 # Tell the LLM to behave as a Cloud Architect and IaC analyzer
 system_prompt: |
   You are Code-Reducer, an expert Cloud Architect and Terraform infrastructure analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
@@ -12,18 +29,21 @@ system_prompt: |
   2. Do NOT guess downstream resource side effects unless directly linked (e.g., via security group attachments or subnet associations).
   3. Only report resource definitions and configurations you are 100% sure about.
 
-# Synthesis prompt for directory modules (which represent infrastructure sub-components)
+# Prose style for every slot of a module page (which represents an infrastructure
+# sub-component). The engine owns the headings, their order and the component names,
+# so this prompt must never ask the model for structure.
 module_synthesis_prompt: |
-  Task: Write a technical documentation page for a Terraform module based on the provided list of its internal resources, variables, and sub-modules.
-  Rule 1: Group related resources (e.g., networking, compute, database, IAM) under appropriate Markdown headings.
-  Rule 2: Explain the primary responsibility of this module, the resource dependency flow, and security configurations.
-  Rule 3: Keep it highly technical, listing key resources, inputs, and outputs.
+  Task: Write the prose for one slot of a Terraform module documentation page.
+  Rule 1: The headings, their order and the resource names are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+  Rule 2: Answer with the requested slot text only, dense and technical, and keep it as short as the slot instruction asks.
+  Rule 3: Only report resources, variables and modules that appear in the supplied facts.
 
-# Synthesis prompt for the global infrastructure overview
+# Prose style for every section of the global infrastructure overview pages
 architecture_prompt: |
-  Task: Write a global cloud architecture overview and deployment guide based on the module summaries.
-  Rule 1: Explain the high-level cloud topology, provider requirements, and how modules connect (e.g., VPC connecting to EKS and RDS).
-  Rule 2: Provide a dense, developer-friendly infrastructure overview and standard Terraform deployment commands (init, plan, apply).
+  Task: Write the prose for one slot of a cloud architecture or quickstart page.
+  Rule 1: The title, the headings and their order are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+  Rule 2: Cover cloud topology, provider requirements, inter-module networking and the standard Terraform deployment commands, as densely as the slot instruction allows.
+  Rule 3: Never invent a resource, provider or command you were not shown.
 
 file_fact_consolidation_prompt: |
   You are a specialized infrastructure documentation assistant. Consolidate, deduplicate and merge the following facts extracted from different chunks of the same Terraform file into a single, cohesive summary.

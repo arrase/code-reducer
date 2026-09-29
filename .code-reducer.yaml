@@ -1,22 +1,52 @@
-model_id: gemma4:26b-a4b-it-qat
+model_id: ornith:9b
 ollama_base_url: http://localhost:11434
 ollama_num_ctx: 20000
 docs_dir: wiki
+
+# Reasoning output. ornith:9b is a reasoning model: with thinking enabled it
+# charges its hidden thinking against every generation budget, so a one-line slot
+# costs 400 tokens instead of 34 and the slot budgets below are no longer
+# reachable. Keep this false.
+think: false
+
+# Client-wide generation cap. 0 lets Ollama decide, which only bounds the fact
+# extraction calls: every documentation slot is capped by its own per-kind cap
+# instead. A value lower than a per-kind cap caps that cap as well.
+num_predict: 0
+
+# Generation caps for the documentation prose slots. The page structure is written
+# by the engine, so these are ceilings a well-behaved answer never reaches: a
+# one-line slot measures 34 tokens and a paragraph slot 63. A clipped answer is
+# salvaged to its last complete sentence instead of failing.
+slot_num_predict: 192
+paragraph_num_predict: 1024
+
+# Characters per token, used to turn the context budget into a prompt payload
+# budget, and the context tokens held back from every prompt for generation.
+chars_per_token: 3.0
+output_token_reserve: 1024
+
+# Test files are excluded by default.
+include_tests: false
 
 system_prompt: |
     You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
     DEFENSIVE RULES: 1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 3. Do NOT name standard library packages unless explicitly stated in the source text. 4. Only report facts you are 100% sure about.
 
+# Prose style for every slot of a module page. The engine owns the headings, their
+# order and the component names, so this prompt must never ask for structure.
 module_synthesis_prompt: |-
-    Task: Write a technical documentation page for a code module based on the provided list of its internal components.
-    Rule 1: Group related functions and classes under appropriate Markdown headings.
-    Rule 2: Explain the responsibility of the module and the data flow.
-    Rule 3: Keep it highly technical and dense.
+    Task: Write the prose for one slot of a module documentation page.
+    Rule 1: The headings, their order and the component names are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+    Rule 2: Answer with the requested slot text only, dense and technical, and keep it as short as the slot instruction asks.
+    Rule 3: Use only the supplied facts, and say nothing about code you were not shown.
 
+# Prose style for every section of the architecture and quickstart pages.
 architecture_prompt: |-
-    Task: Write a global architecture or quickstart document based on the module summaries.
-    Rule 1: Explain the system boundaries and how the modules interact.
-    Rule 2: Provide a dense, developer-friendly overview.
+    Task: Write the prose for one slot of a project documentation page (architecture or quickstart).
+    Rule 1: The title, the headings and their order are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+    Rule 2: Answer with the requested slot text only, dense and developer-friendly, and keep it as short as the slot instruction asks.
+    Rule 3: Use only the supplied module summaries, and never invent a module, a command or a workflow you were not shown.
 
 file_fact_consolidation_prompt: |-
     You are a specialized code documentation assistant.

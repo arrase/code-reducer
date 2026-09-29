@@ -20,33 +20,45 @@ This low VRAM footprint enables developers to execute high-density Map-Reduce do
 
 ## Context Window Budgeting Strategy
 
-To prevent context truncation, out-of-memory (OOM) errors, or prompt degradation during file processing, Code-Reducer implements an automated **75% / 25% Context Budgeting Rule**.
+To prevent context truncation, out-of-memory (OOM) errors, or prompt degradation during file processing, Code-Reducer reserves part of the context for generation and budgets the rest in characters.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │               Total Context Window (NumCtx)             │
 ├───────────────────────────────────┬─────────────────────┤
-│ 75% Source File Payload           │ 25% Prompt & Output │
-│ (~4 chars / token)                │ Reserve             │
+│ Source File Payload               │ Output Reserve      │
+│ (NumCtx - reserve) * chars/token  │ (1024 tokens)       │
 └───────────────────────────────────┴─────────────────────┘
 ```
 
 ### 1. Dynamic File Chunking (Map Stage)
 
-For source files that exceed available token budgets:
+For source files that exceed the available budget:
 
-1. **Character Ratio Calculation**: Code-Reducer assumes an average of ~4 characters per token.
-2. **Payload Limit**: Assigns 75% of `NumCtx` to file payload chunks. For an 8,192 token window, the chunk payload limit is:
-   $$\text{Limit} = 8192 \times 0.75 \times 4 = 24,576 \text{ characters}$$
-3. **Context Boundary Overlap**: Each chunk includes an **800-character overlap margin** relative to the preceding chunk, preserving variable definitions, scopes, and comment context across chunk boundaries.
+1. **Output Reserve**: `output_token_reserve` (default `1024` tokens) is held back from every prompt payload so generation always has room.
+2. **Character Ratio**: `chars_per_token` (default `3.0`) is the measured characters-per-token ratio for Go and Markdown payloads.
+3. **Payload Limit**: The chunk payload limit is `chars_per_token * (NumCtx - output_token_reserve)`. For an 8,192 token window with the defaults that is `3.0 * (8192 - 1024)` = 21,504 characters.
+4. **Context Boundary Overlap**: Each chunk includes an **800-character overlap margin** relative to the preceding chunk, preserving variable definitions, scopes, and comment context across chunk boundaries.
 
-### 2. Batch Consolidation (Reduce Stage)
+### 2. Fact Consolidation (Map Stage)
 
-During directory-level reduction:
+When one file is split into several chunks, the facts of each extraction step are
+consolidated back into one briefing per step:
 
-- Component summaries are merged into dynamic batches capped at `NumCtx * 3` characters.
-- If a single batch exceeds the character limit, Code-Reducer splits it into sub-batches and applies multi-layer recursive reduction.
+- Items are merged into batches capped at the same character budget.
+- If a single batch exceeds the limit, Code-Reducer splits it into sub-batches and applies multi-layer recursive reduction.
 - To prevent infinite reduction loops (e.g. if an LLM fails to compress input text), the engine tracks input vs output size reduction ratios and gracefully terminates recursion before memory limits are breached.
+
+### 3. Documentation Slots (Reduce Stage)
+
+A module page is not generated as a payload of prose. The engine writes the headings and
+sends one bounded micro-task per prose slot, so the only payload a reduce step ever
+assembles is a component facts digest sized to the same budget, and every generation is
+capped by the cap of its slot kind: `slot_num_predict` (default `192`) for a one-line
+slot and `paragraph_num_predict` (default `1024`) for a paragraph slot. Both defaults
+are sized for a non-thinking answer, since a reasoning model charges its hidden
+thinking against the same cap: measured with `think: false` a one-line slot costs 34
+tokens and a paragraph slot 63, while with thinking enabled they cost 400 and 795.
 
 ---
 

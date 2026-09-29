@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -157,11 +158,53 @@ func ShouldIgnoreFile(relPath string, gitIgnore *ignore.GitIgnore) bool {
 	return false
 }
 
+// testFileSuffixes and testFilePrefixes hold the naming conventions the common
+// languages use for test files. They are matched against the base name only, and
+// case-sensitively, so a source file that merely ends in a similar word is kept.
+var (
+	testFileSuffixes = []string{
+		// Go, Python, JavaScript, Ruby, Rust
+		"_test.go", "_test.py", "_test.js", ".test.js", ".spec.js", "_spec.rb", "_test.rb", "_test.rs",
+		// TypeScript
+		".test.ts", ".spec.ts",
+		// JVM and .NET
+		"Test.java", "Tests.cs", "Tests.scala",
+	}
+	testFilePrefixes = []string{"test_"}
+)
+
+// IsTestFile reports whether a repository-relative path is a test file by naming
+// convention. Documentation of a test file mostly restates its assertions, so
+// discovery drops these unless the user asks for them.
+func IsTestFile(relPath string) bool {
+	name := path.Base(filepath.ToSlash(relPath))
+	for _, suffix := range testFileSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	for _, prefix := range testFilePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// DiscoveryOptions controls which repository files the discovery walk keeps.
+type DiscoveryOptions struct {
+	// Ignores holds the gitignore-style patterns from the config and .gitignore.
+	Ignores []string
+	// IncludeTests keeps files that follow a test-file naming convention.
+	IncludeTests bool
+}
+
 // DiscoverCodeFiles recursively walks the codebase to find high-signal source files.
-// It ignores build, dependency, and output files, as well as any paths in the custom ignores list.
-func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
+// It ignores build, dependency, and output files, as well as any paths in the custom
+// ignores list, and drops test files unless IncludeTests is set.
+func DiscoverCodeFiles(repoRoot string, opts DiscoveryOptions) ([]string, error) {
 	var files []string
-	gitIgnore := ignore.CompileIgnoreLines(ignores...)
+	gitIgnore := ignore.CompileIgnoreLines(opts.Ignores...)
 
 	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -188,6 +231,10 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 		}
 
 		if ShouldIgnoreFile(slashRel, gitIgnore) {
+			return nil
+		}
+
+		if !opts.IncludeTests && IsTestFile(slashRel) {
 			return nil
 		}
 

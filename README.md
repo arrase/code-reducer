@@ -10,7 +10,8 @@ Designed specifically for **local development and private LLMs**, Code-Reducer u
 
 * **Hierarchical Map-Reduce Pipeline**: Breaks codebase synthesis into a structured Map-Reduce pipeline to document large directories recursively, staying strictly within local LLM context limits.
 * **Optimized for Private & Local LLMs**: Built specifically to leverage Ollama (e.g., `ornith:9b` or `gemma4:26b`), eliminating expensive cloud API costs and keeping proprietary code local.
-* **Fully Customizable Prompting System**: Allows overriding default system prompts, synthesis rules, architecture blueprints, and file fact consolidation directly from YAML configuration.
+* **Deterministic Page Structure**: The engine writes every title, heading, heading order and component entry, and the model fills one bounded prose slot at a time, so page structure no longer depends on the model complying.
+* **Fully Customizable Prompting System**: Allows overriding the default system prompt, the prose style of module and architecture pages, and the file fact consolidation rules directly from YAML configuration.
 * **Enterprise-Grade Security Sandbox**: Features path traversal guards, atomic process locking, and TOCTOU symlink hijacking defenses for safe workspace operations.
 * **Fast Incremental Updates**: Uses a filesystem SHA256 hash cache to only re-document modified files, propagating changes upward to minimize LLM calls.
 * **Extraction Steps Cache Invalidation**: Automatically detects changes in your extraction steps pipeline and invalidates the cache to ensure documentation accuracy.
@@ -63,6 +64,8 @@ Runs an interactive setup flow in the current directory to generate the `.code-r
 * Custom files and directories to ignore (comma-separated)
 * Documentation output folder name (defaults to `wiki`)
 
+Every key the wizard does not ask about (the prompts, the extraction steps, the generation budgets and `include_tests`) is carried through to the saved file unchanged.
+
 ### 2. `code-reducer init`
 Scans the repository, builds the hierarchical tree, and generates the initial set of wiki markdown pages:
 * Generates a metadata cache in `<docs_dir>/.metadata.json` containing the baseline metadata file summaries.
@@ -97,6 +100,35 @@ ollama_base_url: http://localhost:11434
 # Custom context window size
 ollama_num_ctx: 20000
 
+# Ask the model for reasoning output. Required to be false for a reasoning model such
+# as ornith:9b, which otherwise charges its hidden thinking against every generation
+# budget: the same slot then costs 400 tokens instead of 34, and can return no content.
+think: false
+
+# Client-wide generation cap per LLM call. 0 lets Ollama decide. A value lower than
+# a per-slot cap also caps that slot kind.
+num_predict: 0
+
+# Generation caps for the documentation prose slots, split by slot kind. The engine
+# writes the page structure, so both are ceilings, not targets: a well-behaved slot
+# returns far fewer tokens than allowed, and a generation that reaches one is
+# salvaged down to its complete sentences instead of being written clipped.
+# A line slot is trimmed by the code to its first sentence and to 40 words, so it
+# only needs room for that sentence. A paragraph slot keeps everything it wrote.
+# Measured with think: false, they cost 34 and 63 tokens.
+slot_num_predict: 192
+paragraph_num_predict: 1024
+
+# Prompt payload budgeting: characters per token, and the context tokens held
+# back from every prompt so generation always has room.
+chars_per_token: 3.0
+output_token_reserve: 1024
+
+# Document test files as well. They are excluded by default because a test file
+# is usually a restatement of its assertions, and each one costs a full
+# extraction pass.
+include_tests: false
+
 # Target directory to write generated markdown documentation
 docs_dir: wiki
 
@@ -105,18 +137,21 @@ system_prompt: |
     You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
     DEFENSIVE RULES: 1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 3. Do NOT name standard library packages unless explicitly stated in the source text. 4. Only report facts you are 100% sure about.
 
-# Synthesis prompt for directory modules
+# Prose style applied to every slot of a directory module page. The engine owns
+# the headings, their order and the component names, so this must never ask the
+# model for structure.
 module_synthesis_prompt: |-
-    Task: Write a technical documentation page for a code module based on the provided list of its internal components.
-    Rule 1: Group related functions and classes under appropriate Markdown headings.
-    Rule 2: Explain the responsibility of the module and the data flow.
-    Rule 3: Keep it highly technical and dense.
+    Task: Write the prose for one slot of a module documentation page.
+    Rule 1: The headings, their order and the component names are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+    Rule 2: Answer with the requested slot text only, dense and technical, and keep it as short as the slot instruction asks.
+    Rule 3: Use only the supplied facts, and say nothing about code you were not shown.
 
-# Synthesis prompt for the global architecture overview
+# Prose style applied to every section of the global architecture and quickstart pages
 architecture_prompt: |-
-    Task: Write a global architecture or quickstart document based on the module summaries.
-    Rule 1: Explain the system boundaries and how the modules interact.
-    Rule 2: Provide a dense, developer-friendly overview.
+    Task: Write the prose for one slot of a project documentation page (architecture or quickstart).
+    Rule 1: The title, the headings and their order are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+    Rule 2: Answer with the requested slot text only, dense and developer-friendly, and keep it as short as the slot instruction asks.
+    Rule 3: Use only the supplied module summaries, and never invent a module, a command or a workflow you were not shown.
 
 # Prompt used to consolidate chunks of the same file
 file_fact_consolidation_prompt: |-
@@ -164,8 +199,16 @@ Code-Reducer implements a four-tier configuration resolution chain:
    * `CODE_REDUCER_MODEL_ID` overrides `model_id`
    * `OLLAMA_BASE_URL` overrides `ollama_base_url`
    * `OLLAMA_NUM_CTX` overrides `ollama_num_ctx`
+   * `CODE_REDUCER_THINK` overrides `think`
+   * `OLLAMA_NUM_PREDICT` overrides `num_predict`
+   * `CODE_REDUCER_SLOT_NUM_PREDICT` overrides `slot_num_predict`
+   * `CODE_REDUCER_PARAGRAPH_NUM_PREDICT` overrides `paragraph_num_predict`
+   * `CODE_REDUCER_INCLUDE_TESTS` overrides `include_tests`
 3. **YAML File (`.code-reducer.yaml`)**: Read from the repository root.
 4. **Defaults**: Hardcoded fallbacks if no other configuration exists.
+
+### Incomplete Output Is Never Written
+Every call is bounded, and every incomplete answer is rejected instead of reaching a page. A generation that stopped on the generation limit (`done_reason: "length"`) is salvaged only when it left complete sentences: a one-line slot keeps its first complete sentence, and a paragraph slot keeps the text up to its last complete sentence. A run therefore aborts only when a slot answer holds no complete sentence at all, or when a fact extraction call is truncated, and then it aborts naming the call and the token counts without writing or caching anything. See [docs/configuration.md](docs/configuration.md) for the full table.
 
 ### Multi-language & Infrastructure Support
 Code-Reducer can be configured to document not only software codebases but also Infrastructure-as-Code (IaC) or cloud topology. You can inspect an example config tailored for Terraform project analysis in [examples/terraform/.code-reducer.yaml](examples/terraform/.code-reducer.yaml).
@@ -180,15 +223,15 @@ Code-Reducer can be configured to document not only software codebases but also 
 graph TD
     A[Code Discovery & Filtering] --> B[Build Hierarchical Tree]
     B --> C[Map: File-level API Extraction]
-    C --> D[Reduce: Batch Synthesis - Context Size Budgeted]
-    D --> E[Directory Module Summary .md]
+    C --> D[Reduce: Facts Consolidation per Chunked File]
+    D --> E[Render Fixed Module Skeleton & Fill Bounded Prose Slots]
     E --> F[Hierarchical Subsystem Synthesis]
     F --> G[Root Level Reduction]
     G --> H[Global Docs: architecture.md & quickstart.md]
 ```
 
 #### Tree Structure Construction
-Code-Reducer groups scanned files into a logical directory hierarchy using a node prefix tree (`DirNode` containing children, files, and path values).
+Code-Reducer groups scanned files into a logical directory hierarchy using a node prefix tree (`DirNode` containing children, files, and path values). Discovery drops test files by naming convention (`*_test.go`, `test_*.py`, `*.test.js`, `*Test.java`, `*Tests.cs`, `*_spec.rb`, `*_test.rs`, `*Tests.scala` and more) unless `include_tests: true` or `--include-tests` is set, because a documented test file is mostly a restatement of its assertions and costs a full extraction pass.
 
 #### State Tracking & Change Propagation (`RunUpdate`)
 In `update` mode, the engine dynamically determines which directory nodes are "affected" to avoid full-repository rebuilds. A directory is marked "affected" if:
@@ -204,21 +247,44 @@ The metadata cache contains a `steps_hash` field representing the SHA256 of the 
 For every code file in an affected directory, the engine calculates the `SHA256` of its contents:
 * **Cache Hit**: Reuses the stored facts string from the cache.
 * **Cache Miss**: Analyzes the file using the configurable `extraction_steps` pipeline.
-* **Llm Context-Based File Limits**: Large files are split into overlapping fragments. The engine calculates a dynamic truncation limit: it allocates 75% of `NumCtx` (typically assuming ~4 characters per token) to the file content, reserving the remaining 25% for prompts and output context. An overlap margin (defaults to 800 characters) is used to prevent context blindness at boundaries.
+* **Llm Context-Based File Limits**: Large files are split into overlapping fragments. The engine budgets the payload from the context window: `output_token_reserve` tokens are held back for generation and the rest is converted into characters with `chars_per_token`. An overlap margin (defaults to 800 characters) is used to prevent context blindness at boundaries.
 * Isolated inference is run on each chunk for each extraction step.
+* **Prompt-Cache Friendly Layout**: The system message is always `system_prompt` and nothing else, so it is byte-identical on every call of a run and Ollama can reuse it (`prompt_eval_cached_count`). The per-step instruction rides in the user turn instead, after the file block, which keeps the shared prefix intact.
 
-#### The Reduce Phase (Hierarchical Consolidation & Truncation Safety)
-To prevent massive folders from blowing out Ollama's context window, Code-Reducer applies a recursive bottom-up consolidation strategy grouped in dynamically sized batches (capped at `NumCtx * 3` characters):
-* **File-Level Reduce**: If a single file was split into multiple chunks during the Map phase, their extracted facts are consolidated into a unified briefing via `reduceFileFacts`.
-* **Directory-Level Reduce**: File briefings and child directory summaries are grouped into batches.
-  * If a directory's components fit into a single batch, they are joined and sent to the LLM with the `module_synthesis_prompt` to yield a unified directory summary.
-  * If they exceed the limit, they are split into sub-batches, reduced independently, and recursively merged.
-  * **Dynamic Multi-Layer Map-Reduce**: In `reduceItems`, if a single item exceeds the character limit, it is automatically chunked into smaller pieces to create a deeper reduction layer. This preserves all information without truncation. To avoid infinite map-reduce loops (e.g. if the LLM refuses to condense text), the engine compares input and output payload sizes and gracefully halts recursion without losing context or exceeding buffer limits.
+#### The Reduce Phase (Deterministic Skeleton & Bounded Prose Slots)
+A module page is not written by the model. The engine renders the title, the section headings, their order, the component names and the component order, then fills each prose slot with one bounded micro-task:
+
+```markdown
+# Module: internal/engine
+
+## Responsibility
+<one line>
+
+## Components
+
+### File: client.go
+<one line>
+
+### Subsystem: config
+<one line>
+
+## Data Flow
+<short paragraph>
+
+## Error Handling
+<short paragraph>
+```
+
+* **Minimal Context Per Slot**: The responsibility slot sees component identities only, a component slot sees only that component's facts, and the two paragraph slots see the identities plus a bounded per-component facts digest.
+* **One Deterministic Line Per Line Slot**: A model asked for one line still answers with a bullet list or a rambling paragraph, so Go takes the first meaningful line (the item text when it is bulleted, otherwise the first sentence), bounds it to 40 words on a clause or word boundary, and drops the rest.
+* **Parents Read Children as Identities**: A child subsystem reaches its parent as the head of its own page (title, responsibility, component entries), and a module with children is asked what flows *between* its components and how errors cross the boundary, instead of restating each child's interior. A leaf module keeps the per-component framing.
+* **Bounded Per Slot**: Every slot passes its own `num_predict`, selected by slot kind (`slot_num_predict`, default `192`, for a one-line slot, `paragraph_num_predict`, default `1024`, for a paragraph slot), and a lower global `num_predict` wins for both. The defaults are sized on measurements taken with `think: false` (34 and 63 tokens), so `think: false` is required on a reasoning model such as `ornith:9b`: with thinking on, the same slots cost 400 and 795 tokens of which the tool never reads a word.
+* **All-or-Nothing Pages**: A failing slot aborts the page, so nothing is written to disk and nothing is cached. A run aborts only when a slot answer holds no complete sentence to salvage, or when a fact extraction call is truncated.
 
 #### Global Synthesis Phase
-After reducing the root directory (`.`), the final summary is sent to the LLM to generate:
-1. **System Blueprint**: `wiki/architecture.md` (High-level architecture, module boundaries, external integrations).
-2. **Developer Quickstart**: `wiki/quickstart.md` (Onboarding guide, configuration guidelines).
+After the root directory (`.`) is reduced, its module page is used to generate:
+1. **System Blueprint**: `wiki/architecture.md` (Overview, system boundaries, module interaction), built from the root module page.
+2. **Developer Quickstart**: `wiki/quickstart.md` (What the project does, project layout, common workflows), built from the architecture page that was just generated rather than from the root page.
 3. **AI Agent Guidelines**: During the initial initialization (`init`), the pipeline writes guidelines to `AGENTS.md` (or appends to it) to help other incoming agentic developers find and utilize the generated documentation.
 
 ---
@@ -294,22 +360,22 @@ $ code-reducer init
 Starting Map-Reduce pipeline: init
 Step 1: Code Discovery & Building Tree...
 Step 2: Hierarchical Tree-Merging (Map-Reduce)...
-➜ Extracting file (Step 1/4 - API_SIGNATURES): cmd/init.go
-➜ Extracting file (Step 2/4 - BUSINESS_LOGIC): cmd/init.go
-➜ Extracting file (Step 3/4 - STATE_AND_CONCURRENCY): cmd/init.go
-➜ Extracting file (Step 4/4 - ERRORS_AND_SIDE_EFFECTS): cmd/init.go
 ➜ Extracting file (Step 1/4 - API_SIGNATURES): cmd/root.go
+➜ Extracting file (Step 2/4 - BUSINESS_LOGIC): cmd/root.go
+➜ Extracting file (Step 3/4 - STATE_AND_CONCURRENCY): cmd/root.go
+➜ Extracting file (Step 4/4 - ERRORS_AND_SIDE_EFFECTS): cmd/root.go
+➜ Assembling module page: cmd (4 total components)
+➜ Describing responsibility of cmd
+➜ Describing component File: init.go of cmd
+➜ Describing component File: root.go of cmd
 ...
-➜ Synthesizing directory: cmd (4 total components)
-➜ LLM Synthesizing chunk for cmd (4 items)
+➜ Describing data flow of cmd
+➜ Describing error handling of cmd
+➜ Assembling module page: internal/config (3 total components)
 ...
-➜ Extracting file (Step 1/4 - API_SIGNATURES): internal/config/resolve.go
+➜ Assembling module page: . (3 total components)
+➜ Describing responsibility of .
 ...
-➜ Synthesizing directory: internal/config (3 total components)
-➜ LLM Synthesizing chunk for internal/config (3 items)
-...
-➜ Synthesizing directory: . (4 total components)
-➜ LLM Synthesizing chunk for . (4 items)
 Step 3: Global Architecture Synthesis...
 Step 4: Generating Quickstart...
 Step 5: Updating AGENTS.md...
@@ -327,7 +393,7 @@ You can inspect the actual documentation generated by Code-Reducer for this repo
   * [internal/README.md](wiki/modules/internal/README.md) – Synthesis of core application library packages.
   * [internal/config/README.md](wiki/modules/internal/config/README.md) – Configuration engine and environment management details.
   * [internal/engine/README.md](wiki/modules/internal/engine/README.md) – Core Map-Reduce execution pipeline and LLM client logic.
-  * [internal/security/README.md](wiki/modules/internal/security/README.md) – Path traversal checks and flock-based concurrency controls.
+  * [internal/security/README.md](wiki/modules/internal/security/README.md) – Path traversal checks and atomic lockfile-based process serialization.
   * [internal/tools/README.md](wiki/modules/internal/tools/README.md) – Helper utilities for Git integration and directory/binary discovery.
 
 ---

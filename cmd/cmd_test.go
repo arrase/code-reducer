@@ -15,8 +15,26 @@ func TestRootFlags(t *testing.T) {
 	// reset flags
 	modelIDFlag = ""
 	numCtxFlag = ""
+	thinkFlag = ""
+	numPredictFlag = ""
+	slotNumPredictFlag = ""
+	paragraphNumPredictFlag = ""
+	charsPerTokenFlag = ""
+	outputTokenReserveFlag = ""
+	includeTestsFlag = ""
 
-	RootCmd.SetArgs([]string{"--model-id", "test-model", "--num-ctx", "4096", "help"}) // run something harmless like help
+	RootCmd.SetArgs([]string{
+		"--model-id", "test-model",
+		"--num-ctx", "4096",
+		"--think", "true",
+		"--num-predict", "2048",
+		"--slot-num-predict", "96",
+		"--paragraph-num-predict", "768",
+		"--chars-per-token", "2.5",
+		"--output-token-reserve", "512",
+		"--include-tests", "true",
+		"help",
+	}) // run something harmless like help
 	_ = RootCmd.Execute()
 
 	if modelIDFlag != "test-model" {
@@ -25,6 +43,34 @@ func TestRootFlags(t *testing.T) {
 
 	if numCtxFlag != "4096" {
 		t.Errorf("Expected numCtxFlag to be '4096', got '%s'", numCtxFlag)
+	}
+
+	if thinkFlag != "true" {
+		t.Errorf("Expected thinkFlag to be 'true', got '%s'", thinkFlag)
+	}
+
+	if numPredictFlag != "2048" {
+		t.Errorf("Expected numPredictFlag to be '2048', got '%s'", numPredictFlag)
+	}
+
+	if slotNumPredictFlag != "96" {
+		t.Errorf("Expected slotNumPredictFlag to be '96', got '%s'", slotNumPredictFlag)
+	}
+
+	if paragraphNumPredictFlag != "768" {
+		t.Errorf("Expected paragraphNumPredictFlag to be '768', got '%s'", paragraphNumPredictFlag)
+	}
+
+	if charsPerTokenFlag != "2.5" {
+		t.Errorf("Expected charsPerTokenFlag to be '2.5', got '%s'", charsPerTokenFlag)
+	}
+
+	if outputTokenReserveFlag != "512" {
+		t.Errorf("Expected outputTokenReserveFlag to be '512', got '%s'", outputTokenReserveFlag)
+	}
+
+	if includeTestsFlag != "true" {
+		t.Errorf("Expected includeTestsFlag to be 'true', got '%s'", includeTestsFlag)
 	}
 }
 
@@ -169,10 +215,15 @@ func TestLoadInitialSetupConfig(t *testing.T) {
 	if cfg.ModelID == "" || cfg.OllamaNumCtx <= 0 {
 		t.Fatalf("expected non-empty defaults, got %+v", cfg)
 	}
+	if cfg.SlotNumPredict != config.SlotNumPredictDefault || cfg.ParagraphNumPredict != config.ParagraphNumPredictDefault {
+		t.Fatalf("expected the shipped slot bounds as defaults, got %+v", cfg)
+	}
 
 	testCfg := &config.Config{
-		ModelID:      "custom-model",
-		OllamaNumCtx: 8192,
+		ModelID:             "custom-model",
+		OllamaNumCtx:        8192,
+		SlotNumPredict:      96,
+		ParagraphNumPredict: 768,
 	}
 	if err := config.SaveConfig(tmp, testCfg); err != nil {
 		t.Fatalf("failed to save config: %v", err)
@@ -180,6 +231,9 @@ func TestLoadInitialSetupConfig(t *testing.T) {
 	loaded := loadInitialSetupConfig(tmp)
 	if loaded.ModelID != "custom-model" || loaded.OllamaNumCtx != 8192 {
 		t.Fatalf("expected custom values, got %+v", loaded)
+	}
+	if loaded.SlotNumPredict != 96 || loaded.ParagraphNumPredict != 768 {
+		t.Fatalf("expected the custom slot bounds to survive, got %+v", loaded)
 	}
 }
 
@@ -198,5 +252,67 @@ func TestRunSetupFlow(t *testing.T) {
 	}
 	if cfg.ModelID != config.OllamaDefaultModelID {
 		t.Errorf("expected default model ID, got %s", cfg.ModelID)
+	}
+}
+
+func TestRunSetupFlowKeepsIncludeTests(t *testing.T) {
+	tmp := t.TempDir()
+	if err := config.SaveConfig(tmp, &config.Config{ModelID: "custom-model", IncludeTests: true}); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	reader := bufio.NewReader(bytes.NewBufferString("\n\n\n\n\n"))
+	if err := runSetupFlowWithReader(reader, tmp); err != nil {
+		t.Fatalf("unexpected error running setup flow: %v", err)
+	}
+
+	cfg, err := config.LoadConfig(tmp)
+	if err != nil {
+		t.Fatalf("expected config to be saved: %v", err)
+	}
+	if !cfg.IncludeTests {
+		t.Error("expected the setup wizard to keep include_tests from the existing config")
+	}
+}
+
+func TestRunSetupFlowKeepsSlotBounds(t *testing.T) {
+	tmp := t.TempDir()
+	if err := config.SaveConfig(tmp, &config.Config{ModelID: "custom-model", SlotNumPredict: 96, ParagraphNumPredict: 768}); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	reader := bufio.NewReader(bytes.NewBufferString("\n\n\n\n\n"))
+	if err := runSetupFlowWithReader(reader, tmp); err != nil {
+		t.Fatalf("unexpected error running setup flow: %v", err)
+	}
+
+	cfg, err := config.LoadConfig(tmp)
+	if err != nil {
+		t.Fatalf("expected config to be saved: %v", err)
+	}
+	if cfg.SlotNumPredict != 96 {
+		t.Errorf("expected the setup wizard to keep slot_num_predict, got %d", cfg.SlotNumPredict)
+	}
+	if cfg.ParagraphNumPredict != 768 {
+		t.Errorf("expected the setup wizard to keep paragraph_num_predict, got %d", cfg.ParagraphNumPredict)
+	}
+}
+
+func TestRunSetupFlowWritesShippedSlotBounds(t *testing.T) {
+	tmp := t.TempDir()
+	reader := bufio.NewReader(bytes.NewBufferString("\n\n\n\n\n"))
+	if err := runSetupFlowWithReader(reader, tmp); err != nil {
+		t.Fatalf("unexpected error running setup flow: %v", err)
+	}
+
+	cfg, err := config.LoadConfig(tmp)
+	if err != nil {
+		t.Fatalf("expected config to be saved: %v", err)
+	}
+	if cfg.SlotNumPredict != config.SlotNumPredictDefault {
+		t.Errorf("expected slot_num_predict %d, got %d", config.SlotNumPredictDefault, cfg.SlotNumPredict)
+	}
+	if cfg.ParagraphNumPredict != config.ParagraphNumPredictDefault {
+		t.Errorf("expected paragraph_num_predict %d, got %d", config.ParagraphNumPredictDefault, cfg.ParagraphNumPredict)
 	}
 }

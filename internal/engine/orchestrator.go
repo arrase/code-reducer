@@ -33,28 +33,32 @@ type orchestrator struct {
 	client llmCaller
 }
 
+// generateStandardPage builds one standard page from source, writes it to docsDir
+// and returns the rendered content so a later page can be derived from it.
+func (o *orchestrator) generateStandardPage(ctx context.Context, repoRoot, docsDir string, page standardDocPage, source string, cfg *config.Config, logEvent LogEventFunc) (string, error) {
+	doc, err := buildStandardDocPage(ctx, o.client, cfg, page, source, logEvent)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate the %s page: %w", page.title, err)
+	}
+	if err := tools.WriteFileSafely(repoRoot, filepath.Join(docsDir, page.fileName), []byte(doc)); err != nil {
+		return "", fmt.Errorf("failed to write %s: %w", page.fileName, err)
+	}
+	return doc, nil
+}
+
+// GenerateStandardDocs writes the two standard pages. The architecture page is
+// built from the root module summary, and the quickstart is built from the
+// architecture page that was just generated, so the two never read the same input.
 func (o *orchestrator) GenerateStandardDocs(ctx context.Context, repoRoot, docsDir, rootSum string, cfg *config.Config, logEvent LogEventFunc) error {
 	logEvent(EventStatus, "Step 3: Global Architecture Synthesis...")
-	archPath := filepath.Join(docsDir, "architecture.md")
-	archMsg := fmt.Sprintf("Write the global architecture overview (%s/architecture.md) based on the root summary.\n\n%s", docsDir, rootSum)
-	sysPrompt := cfg.SystemPrompt + "\n" + cfg.ArchitecturePrompt
-	archDoc, err := o.client.CallLLM(ctx, sysPrompt, []Message{{Role: "user", Content: archMsg}}, false)
+	archDoc, err := o.generateStandardPage(ctx, repoRoot, docsDir, architecturePage, rootSum, cfg, logEvent)
 	if err != nil {
-		return fmt.Errorf("failed to generate global architecture: %w", err)
-	}
-	if err := tools.WriteFileSafely(repoRoot, archPath, []byte(stripOuterMarkdownFence(archDoc))); err != nil {
-		return fmt.Errorf("failed to write architecture.md: %w", err)
+		return err
 	}
 
 	logEvent(EventStatus, "Step 4: Generating Quickstart...")
-	qsPath := filepath.Join(docsDir, "quickstart.md")
-	qsMsg := fmt.Sprintf("Write the %s/quickstart.md page based on this architecture.\n\n%s", docsDir, rootSum)
-	qsDoc, err := o.client.CallLLM(ctx, sysPrompt, []Message{{Role: "user", Content: qsMsg}}, false)
-	if err != nil {
-		return fmt.Errorf("failed to generate quickstart documentation: %w", err)
-	}
-	if err := tools.WriteFileSafely(repoRoot, qsPath, []byte(stripOuterMarkdownFence(qsDoc))); err != nil {
-		return fmt.Errorf("failed to write quickstart.md: %w", err)
+	if _, err := o.generateStandardPage(ctx, repoRoot, docsDir, quickstartPage, archDoc, cfg, logEvent); err != nil {
+		return err
 	}
 
 	return nil
@@ -157,7 +161,10 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 	}
 	cache.StepsHash = computeStepsHash(cfg.ExtractionSteps)
 
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, tools.DiscoveryOptions{
+		Ignores:      ignores,
+		IncludeTests: cfg.IncludeTests,
+	})
 	if err != nil {
 		return err
 	}
@@ -227,8 +234,11 @@ func (o *orchestrator) getAffectedDirs(repoRoot, docsDir string, tree *DirNode, 
 	return propagateAffected(tree, affectedDirs)
 }
 
-func (o *orchestrator) detectFileChanges(repoRoot string, ignores []string, cache *MetadataCache, logEvent LogEventFunc) ([]FileChange, map[string]string, []string, error) {
-	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, ignores)
+func (o *orchestrator) detectFileChanges(repoRoot string, ignores []string, cache *MetadataCache, includeTests bool, logEvent LogEventFunc) ([]FileChange, map[string]string, []string, error) {
+	codeFiles, err := tools.DiscoverCodeFiles(repoRoot, tools.DiscoveryOptions{
+		Ignores:      ignores,
+		IncludeTests: includeTests,
+	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -290,7 +300,7 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 
 	logEvent(EventStatus, "Step 1: Detecting changed files...")
 
-	filteredChanges, currentFilesMap, allowedCodeFiles, err := o.detectFileChanges(repoRoot, ignores, cache, logEvent)
+	filteredChanges, currentFilesMap, allowedCodeFiles, err := o.detectFileChanges(repoRoot, ignores, cache, cfg.IncludeTests, logEvent)
 	if err != nil {
 		return err
 	}

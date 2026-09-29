@@ -48,7 +48,7 @@ func (r *Runner) Run(ctx context.Context, repoRoot string, mode Mode, onEvent fu
 	defer lock.Unlock()
 
 	// 3. Instantiate LLM Client & Orchestrator
-	client := newLLMClient(r.cfg.ModelID, r.cfg.OllamaBaseURL, r.cfg.OllamaNumCtx)
+	client := newLLMClient(r.cfg)
 	orch := &orchestrator{client: client}
 
 	// 4. Run the documentation pipeline

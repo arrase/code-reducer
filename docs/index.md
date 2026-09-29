@@ -27,7 +27,7 @@ Hierarchical Map-Reduce Wiki Generator for Local LLMs
   <div class="feature-card">
     <i class="fa-solid fa-sliders feature-icon"></i>
     <h3>Fully Customizable Prompting</h3>
-    <p>Tailor extraction steps, system prompts, module synthesis blueprints, and file fact consolidation rules directly via <code>.code-reducer.yaml</code>.</p>
+    <p>Tailor extraction steps, the system prompt, and the prose style of module and architecture pages directly via <code>.code-reducer.yaml</code>. The engine owns the page structure.</p>
   </div>
   <div class="feature-card">
     <i class="fa-solid fa-lock feature-icon"></i>
@@ -64,7 +64,7 @@ Explore the documentation guides below to learn more about Code-Reducer's design
   <a href="architecture.md" class="feature-card">
     <i class="fa-solid fa-cubes feature-icon"></i>
     <h3>Architecture & Map-Reduce Engine</h3>
-    <p>Deep dive into node prefix trees (<code>DirNode</code>), dynamic file chunking, sub-batch reduction, and global synthesis phases.</p>
+    <p>Deep dive into node prefix trees (<code>DirNode</code>), context-budgeted file chunking, the deterministic page skeleton with its bounded prose slots, and global synthesis phases.</p>
   </a>
   <a href="map-reduce-caching.md" class="feature-card">
     <i class="fa-solid fa-database feature-icon"></i>

@@ -10,11 +10,14 @@ import (
 )
 
 type reductionConfig struct {
-	sysPrompt   string
-	buildPrompt func(batch []string) string
-	logMsg      func(batch []string) string
-	errMsg      string
-	logEvent    LogEventFunc
+	sysPrompt     string
+	buildPrompt   func(batch []string) string
+	logMsg        func(batch []string) string
+	errMsg        string
+	subject       string
+	logEvent      LogEventFunc
+	outputReserve int
+	charsPerToken float64
 }
 
 func reduceWithLLM(
@@ -26,7 +29,7 @@ func reduceWithLLM(
 	if len(items) == 0 {
 		return "", nil
 	}
-	maxChars := c.NumCtx() * maxCharsMultiplier
+	maxChars := promptCharBudget(c.NumCtx(), cfg.outputReserve, cfg.charsPerToken)
 	return reduceItems(ctx, items, maxChars, func(batch []string) (string, error) {
 		prompt := cfg.buildPrompt(batch)
 		cfg.logEvent(EventStatus, cfg.logMsg(batch))
@@ -34,23 +37,8 @@ func reduceWithLLM(
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", cfg.errMsg, err)
 		}
-		return stripOuterMarkdownFence(res), nil
+		return requireCompleteContent(res, cfg.subject)
 	})
-}
-
-func reduceInChunks(ctx context.Context, c llmCaller, nodePath string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error) {
-	redCfg := reductionConfig{
-		sysPrompt: cfg.SystemPrompt + "\n" + cfg.ModuleSynthesisPrompt,
-		buildPrompt: func(batch []string) string {
-			return fmt.Sprintf("Synthesize architecture for %s:\n%s", nodePath, strings.Join(batch, "\n\n"))
-		},
-		logMsg: func(batch []string) string {
-			return fmt.Sprintf("➜ LLM Synthesizing chunk for %s (%d items)", nodePath, len(batch))
-		},
-		errMsg:   "LLM error during synthesis",
-		logEvent: logEvent,
-	}
-	return reduceWithLLM(ctx, c, items, redCfg)
 }
 
 func reduceFileFacts(ctx context.Context, c llmCaller, filePath string, stepName string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error) {
@@ -58,15 +46,19 @@ func reduceFileFacts(ctx context.Context, c llmCaller, filePath string, stepName
 		return items[0], nil
 	}
 	redCfg := reductionConfig{
-		sysPrompt: cfg.SystemPrompt + "\n" + cfg.FileFactConsolidationPrompt,
+		sysPrompt: cfg.SystemPrompt,
 		buildPrompt: func(batch []string) string {
-			return fmt.Sprintf("Consolidate and deduplicate the extracted facts for %s regarding step '%s':\n%s", filePath, stepName, strings.Join(batch, "\n\n"))
+			return userMessage(cfg.FileFactConsolidationPrompt,
+				fmt.Sprintf("Consolidate and deduplicate the extracted facts for %s regarding step '%s':\n%s", filePath, stepName, strings.Join(batch, "\n\n")))
 		},
 		logMsg: func(batch []string) string {
 			return fmt.Sprintf("➜ LLM Consolidating facts for %s (%d items)", filePath, len(batch))
 		},
-		errMsg:   "LLM error during file fact consolidation",
-		logEvent: logEvent,
+		errMsg:        "LLM error during file fact consolidation",
+		subject:       fmt.Sprintf("consolidating facts for %s step %s", filePath, stepName),
+		logEvent:      logEvent,
+		outputReserve: cfg.OutputTokenReserve,
+		charsPerToken: cfg.CharsPerToken,
 	}
 	return reduceWithLLM(ctx, c, items, redCfg)
 }

@@ -4,6 +4,23 @@ ollama_base_url: "http://localhost:11434"
 ollama_num_ctx: 8192
 docs_dir: "wiki"
 
+# ornith:9b is a reasoning model. With think: true it charges its hidden
+# reasoning against every generation budget, which slows every call and can
+# leave a slot answer with no visible content. Keep it false.
+think: false
+
+# Client-wide generation cap. 0 lets Ollama decide, which only bounds the fact
+# extraction calls: every documentation slot is capped by its own per-kind cap
+# below. A value lower than a per-kind cap caps that cap as well.
+num_predict: 0
+
+# Generation caps for the documentation prose slots, the shipped defaults. The
+# page structure is written by the engine, so these are ceilings a well-behaved
+# answer never reaches: a one-line slot measures 34 tokens and a paragraph slot
+# 63 with think: false.
+slot_num_predict: 192
+paragraph_num_predict: 1024
+
 # System Prompt defines the AI persona
 system_prompt: |
   You are Code-Reducer, an expert technical writer and Go code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
@@ -13,17 +30,19 @@ system_prompt: |
   3. Do NOT name standard library packages unless explicitly stated in the source text. 
   4. Only report facts you are 100% sure about.
 
-# Prompts for synthesized output
+# Prose style applied to every slot of a module page. The engine writes the page
+# skeleton, so these prompts must never ask the model for structure.
 module_synthesis_prompt: |
-  Task: Write a technical documentation page for a code module based on the provided list of its internal components.
-  Rule 1: Group related functions and classes under appropriate Markdown headings.
-  Rule 2: Explain the responsibility of the module and the data flow.
-  Rule 3: Keep it highly technical and dense.
+  Task: Write the prose for one slot of a module documentation page.
+  Rule 1: The headings, their order and the component names are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+  Rule 2: Answer with the requested slot text only, dense and technical, and keep it as short as the slot instruction asks.
+  Rule 3: Use only the supplied facts, and say nothing about code you were not shown.
 
 architecture_prompt: |
-  Task: Write a global architecture or quickstart document based on the module summaries.
-  Rule 1: Explain the system boundaries and how the modules interact.
-  Rule 2: Provide a dense, developer-friendly overview.
+  Task: Write the prose for one slot of a project documentation page (architecture or quickstart).
+  Rule 1: The title, the headings and their order are already fixed by the tooling. Never emit headings, lists, code fences or any other structure.
+  Rule 2: Answer with the requested slot text only, dense and developer-friendly, and keep it as short as the slot instruction asks.
+  Rule 3: Use only the supplied module summaries, and never invent a module, a command or a workflow you were not shown.
 
 file_fact_consolidation_prompt: |
   You are a specialized code documentation assistant. Consolidate, deduplicate and merge the following facts extracted from different chunks of the same file into a single, cohesive summary.

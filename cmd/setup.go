@@ -38,6 +38,13 @@ func loadInitialSetupConfig(repoRoot string) *config.Config {
 			OllamaBaseURL:               config.OllamaDefaultBaseURL,
 			OllamaNumCtx:                config.OllamaDefaultNumCtx,
 			DocsDir:                     config.DefaultDocsDir,
+			Think:                       config.ThinkDefault,
+			NumPredict:                  config.NumPredictDefault,
+			SlotNumPredict:              config.SlotNumPredictDefault,
+			ParagraphNumPredict:         config.ParagraphNumPredictDefault,
+			CharsPerToken:               config.CharsPerTokenDefault,
+			OutputTokenReserve:          config.OutputTokenReserveDefault,
+			IncludeTests:                config.IncludeTestsDefault,
 			ExtractionSteps:             config.DefaultExtractionSteps,
 			SystemPrompt:                config.DefaultSystemPrompt,
 			ModuleSynthesisPrompt:       config.DefaultModuleSynthesisPrompt,
@@ -60,6 +67,18 @@ func loadInitialSetupConfig(repoRoot string) *config.Config {
 	}
 	if len(cfg.ExtractionSteps) == 0 {
 		cfg.ExtractionSteps = config.DefaultExtractionSteps
+	}
+	if cfg.SlotNumPredict <= 0 {
+		cfg.SlotNumPredict = config.SlotNumPredictDefault
+	}
+	if cfg.ParagraphNumPredict <= 0 {
+		cfg.ParagraphNumPredict = config.ParagraphNumPredictDefault
+	}
+	if cfg.CharsPerToken <= 0 {
+		cfg.CharsPerToken = config.CharsPerTokenDefault
+	}
+	if cfg.OutputTokenReserve <= 0 {
+		cfg.OutputTokenReserve = config.OutputTokenReserveDefault
 	}
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = config.DefaultSystemPrompt
@@ -144,6 +163,13 @@ func runSetupFlowWithReader(reader *bufio.Reader, repoRoot string) error {
 		OllamaBaseURL:               urlInput,
 		OllamaNumCtx:                numCtx,
 		DocsDir:                     docsDirInput,
+		Think:                       current.Think,
+		NumPredict:                  current.NumPredict,
+		SlotNumPredict:              current.SlotNumPredict,
+		ParagraphNumPredict:         current.ParagraphNumPredict,
+		CharsPerToken:               current.CharsPerToken,
+		OutputTokenReserve:          current.OutputTokenReserve,
+		IncludeTests:                current.IncludeTests,
 		ExtractionSteps:             current.ExtractionSteps,
 		Ignore:                      ignores,
 		SystemPrompt:                current.SystemPrompt,

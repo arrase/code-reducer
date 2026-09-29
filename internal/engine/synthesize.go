@@ -69,13 +69,19 @@ func extractFileFacts(ctx context.Context, p *pipelineState, f string, nodePath 
 			}
 			p.logEvent(EventStatus, fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(p.cfg.ExtractionSteps), step.Name, chunkMsg, f))
 
-			systemPrompt := p.cfg.SystemPrompt + "\n" + step.Prompt
-			userContent := fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, nodePath, chunk)
-			res, err := p.client.CallLLM(ctx, systemPrompt, []Message{{Role: "user", Content: userContent}}, false)
+			userContent := userMessage(
+				fmt.Sprintf("File: %s%s inside Module: %s\n```\n%s\n```", filepath.Base(f), chunkMsg, nodePath, chunk),
+				step.Prompt,
+			)
+			res, err := p.client.CallLLM(ctx, p.cfg.SystemPrompt, []Message{{Role: "user", Content: userContent}}, false)
 			if err != nil {
 				return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
 			}
-			stepFacts = append(stepFacts, stripOuterMarkdownFence(res))
+			chunkFacts, err := requireCompleteContent(res, fmt.Sprintf("extracting %s for %s", step.Name, f))
+			if err != nil {
+				return "", err
+			}
+			stepFacts = append(stepFacts, chunkFacts)
 		}
 
 		consolidatedFact, err := reduceFileFacts(ctx, p.client, f, step.Name, stepFacts, p.cfg, p.logEvent)
@@ -96,11 +102,8 @@ func extractFileFacts(ctx context.Context, p *pipelineState, f string, nodePath 
 	return facts, nil
 }
 
-func calculateFileLimit(numCtx int) int {
-	if numCtx < minNumCtxFloor {
-		numCtx = minNumCtxFloor
-	}
-	return int(float64(numCtx*4) * contextWindowAllocRatio)
+func calculateFileLimit(numCtx int, cfg *config.Config) int {
+	return promptCharBudget(numCtx, cfg.OutputTokenReserve, cfg.CharsPerToken)
 }
 
 func synthesizeChildren(ctx context.Context, p *pipelineState, node *DirNode) (map[string]string, []string, error) {
@@ -124,7 +127,7 @@ func synthesizeChildren(ctx context.Context, p *pipelineState, node *DirNode) (m
 }
 
 func collectComponents(ctx context.Context, p *pipelineState, node *DirNode, childSummaries map[string]string, childNames []string) ([]string, error) {
-	fileLimit := calculateFileLimit(p.client.NumCtx())
+	fileLimit := calculateFileLimit(p.client.NumCtx(), p.cfg)
 
 	var components []string
 	for _, f := range node.Files {
@@ -143,7 +146,7 @@ func collectComponents(ctx context.Context, p *pipelineState, node *DirNode, chi
 
 	for _, childName := range childNames {
 		if sum := childSummaries[childName]; sum != "" {
-			components = append(components, fmt.Sprintf("### Subsystem: %s\n%s", childName, sum))
+			components = append(components, fmt.Sprintf("%s%s\n%s", markdownHeadingPrefix, subsystemPrefix+childName, sum))
 		}
 	}
 	return components, nil
@@ -175,19 +178,19 @@ func synthesizeNode(ctx context.Context, p *pipelineState, node *DirNode) (strin
 		return "", nil
 	}
 
-	p.logEvent(EventStatus, fmt.Sprintf("➜ Synthesizing directory: %s (%d total components)", node.Path, len(components)))
-	finalSum, err := reduceInChunks(ctx, p.client, node.Path, components, p.cfg, p.logEvent)
+	p.logEvent(EventStatus, fmt.Sprintf("➜ Assembling module page: %s (%d total components)", node.Path, len(components)))
+	page, err := buildModulePage(ctx, p, node.Path, parseModuleComponents(components))
 	if err != nil {
 		return "", err
 	}
 
 	// Update module cache
-	p.cache.Modules[node.Path] = finalSum
+	p.cache.Modules[node.Path] = page
 
 	modulePath := filepath.Join(p.cfg.DocsDir, "modules", toSafeMarkdownFilename(node.Path))
-	if err := tools.WriteFileSafely(p.repoRoot, modulePath, []byte(finalSum)); err != nil {
+	if err := tools.WriteFileSafely(p.repoRoot, modulePath, []byte(page)); err != nil {
 		return "", fmt.Errorf("failed to write module documentation for %s: %w", node.Path, err)
 	}
 
-	return finalSum, nil
+	return page, nil
 }

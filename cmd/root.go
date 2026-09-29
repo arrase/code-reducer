@@ -16,8 +16,15 @@ import (
 )
 
 var (
-	modelIDFlag string
-	numCtxFlag  string
+	modelIDFlag             string
+	numCtxFlag              string
+	thinkFlag               string
+	numPredictFlag          string
+	slotNumPredictFlag      string
+	paragraphNumPredictFlag string
+	charsPerTokenFlag       string
+	outputTokenReserveFlag  string
+	includeTestsFlag        string
 )
 
 var RootCmd = &cobra.Command{
@@ -32,6 +39,13 @@ var RootCmd = &cobra.Command{
 func init() {
 	RootCmd.PersistentFlags().StringVar(&modelIDFlag, "model-id", "", "Specify LLM model ID")
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
+	RootCmd.PersistentFlags().StringVar(&thinkFlag, "think", "", "Enable reasoning output on reasoning models (default false)")
+	RootCmd.PersistentFlags().StringVar(&numPredictFlag, "num-predict", "", "Cap the number of generated tokens per call (default 0, Ollama decides)")
+	RootCmd.PersistentFlags().StringVar(&slotNumPredictFlag, "slot-num-predict", "", "Cap the generated tokens for each one-line documentation slot (default 192)")
+	RootCmd.PersistentFlags().StringVar(&paragraphNumPredictFlag, "paragraph-num-predict", "", "Cap the generated tokens for each documentation paragraph slot (default 1024)")
+	RootCmd.PersistentFlags().StringVar(&charsPerTokenFlag, "chars-per-token", "", "Characters per token used to size prompt payloads (default 3.0)")
+	RootCmd.PersistentFlags().StringVar(&outputTokenReserveFlag, "output-token-reserve", "", "Context tokens held back from prompt payloads for generation (default 1024)")
+	RootCmd.PersistentFlags().StringVar(&includeTestsFlag, "include-tests", "", "Document test files as well (default false)")
 }
 
 func executeCommand(mode engine.Mode) error {
@@ -48,7 +62,17 @@ func executeCommand(mode engine.Mode) error {
 		return err
 	}
 
-	cfg, err := config.ResolveConfig(repoRoot, modelIDFlag, numCtxFlag)
+	cfg, err := config.ResolveConfig(repoRoot, config.Flags{
+		ModelID:             modelIDFlag,
+		NumCtx:              numCtxFlag,
+		Think:               thinkFlag,
+		NumPredict:          numPredictFlag,
+		SlotNumPredict:      slotNumPredictFlag,
+		ParagraphNumPredict: paragraphNumPredictFlag,
+		CharsPerToken:       charsPerTokenFlag,
+		OutputTokenReserve:  outputTokenReserveFlag,
+		IncludeTests:        includeTestsFlag,
+	})
 	if err != nil {
 		return err
 	}
