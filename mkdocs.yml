@@ -2,6 +2,7 @@ site_name: Code-Reducer
 site_description: Lightweight, high-performance CLI tool for generating developer-friendly code wikis using local LLMs via Ollama.
 site_author: Arrase
 site_url: https://arrase.github.io/code-reducer/
+docs_dir: gh-pages
 
 repo_name: arrase/code-reducer
 repo_url: https://github.com/arrase/code-reducer
