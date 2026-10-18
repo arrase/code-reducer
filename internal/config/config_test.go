@@ -68,6 +68,9 @@ func TestResolveConfig(t *testing.T) {
 		if resolved.ModelID != "flag-model" {
 			t.Errorf("expected flag-model, got %s", resolved.ModelID)
 		}
+		if resolved.QuickstartPrompt != DefaultQuickstartPrompt {
+			t.Errorf("expected default quickstart prompt, got %s", resolved.QuickstartPrompt)
+		}
 	})
 
 	t.Run("fail fast on invalid num ctx env", func(t *testing.T) {

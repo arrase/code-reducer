@@ -1,86 +1,136 @@
-# Package `internal/config`
+# internal/config
 
 ## Module Responsibility
-The `internal/config` package manages the lifecycle, hierarchical resolution, and persistence of configuration settings for the Code-Reducer system. It provides the mechanism to merge settings from multiple sources—including command-line flags, environment variables, and configuration files—into a unified `Config` struct. This configuration directs an LLM-based pipeline through specific extraction and synthesis phases.
 
-### Data Flow
-1.  **Ingestion**: The system gathers data from the local filesystem (via `.code-reducer.yaml`), environment variables, and CLI arguments.
-2.  **Resolution**: A hierarchical merge process applies overrides based on a defined priority: CLI flags > Environment variables > Configuration file values > System defaults.
-3.  **Validation**: Numerical parameters, such as context size, undergo validation to ensure they meet non-zero requirements.
-4.  **Output**: A validated `*Config` pointer is returned for use in LLM prompt construction and execution logic.
-5.  **Persistence**: Configuration changes are serialized to YAML and written to the filesystem using an atomic rename pattern to ensure integrity.
+The `internal/config` package manages the configuration lifecycle for Code-Reducer, an AI-driven code analysis and documentation generation tool. It handles three concerns: (1) persistence of a `.code-reducer.yaml` configuration file, (2) resolution of configuration values from multiple sources with defined priority ordering, and (3) application of system defaults to empty or zero-valued fields.
 
-## Data Structures
+**Data flow:** `ResolveConfig` is the primary entry point. It loads a base configuration from disk via `loadBaseConfig` (which delegates to `LoadConfig` in `io.go`), applies system defaults via `ApplyDefaults`, then resolves individual fields (`ModelID`, `OllamaBaseURL`, `OllamaNumCtx`) by merging CLI flags, environment variables, and config file values. The `Ignore` slice is deduplicated via `deduplicate`. The resolved `Config` struct is returned to callers.
 
-### `Config`
-The primary schema representing the system's operational parameters.
+---
 
-| Field | Type | Description |
+## Configuration Persistence (`io.go`)
+
+### Public API
+
+| Function | Parameters | Return Types |
 |---|---|---|
-| `ModelID` | `string` | The identifier for the LLM model. |
-| `OllamaBaseURL` | `string` | The base endpoint for the local Ollama API. |
-| `OllamaNumCtx` | `int` | The context window size for the LLM. |
-| `DocsDir` | `string` | The target directory for generated documentation. |
-| `SystemPrompt` | `string` | The primary system message for the LLM. |
-| `ModuleSynthesisPrompt` | `string` | Prompt template for module-level synthesis. |
-| `ArchitecturePrompt` | `string` | Prompt template for architectural analysis. |
-| `FileFactConsolidationPrompt` | `string` | Prompt template for consolidating file facts. |
-| `ExtractionSteps` | `[]ExtractionStep` | A sequence of extraction phases for the analysis pipeline. |
-| `Ignore` | `[]string` | A list of paths or patterns to be excluded from analysis. |
+| `ConfigExists` | `cwd string` | `bool` |
+| `LoadConfig` | `cwd string` | `*Config`, `error` |
+| `SaveConfig` | `cwd string`, `cfg *Config` | `error` |
 
-### `ExtractionStep`
-Defines a single phase in the multi-step LLM extraction process.
+### Internal Functions
 
-| Field | Type | Description |
+| Function | Parameters | Return Types |
 |---|---|---|
-| `Name` | `string` | The identifier for the extraction phase. |
-| `Prompt` | `string` | The specific prompt utilized for this phase. |
+| `getConfigPath` | `cwd string` | `string` |
+| `formatYAML` | `data []byte` | `string` |
 
-## Hierarchical Resolution
+### File System Interactions
 
-The `ResolveConfig` function implements the precedence logic to determine the final state of a `Config` instance.
+- **Disk reads:** `os.Stat` in `ConfigExists`; `os.ReadFile` in `LoadConfig`.
+- **Disk writes:** `tools.WriteFileAtomic` in `SaveConfig`.
+- No network, database, or API interactions.
 
-### Resolution Precedence
-For each parameter, the first non-default/non-empty value found in the following order is selected:
-1.  **Command-line Flags** (e.g., `modelIDFlag`, `numCtxFlag`).
-2.  **Environment Variables** (defined by `CodeReducerModelIDEnvKey`, `OllamaNumCtxEnvKey`, and `OllamaBaseURLEnvKey`).
-3.  **Configuration File** (values stored in `.code-reducer.yaml`).
-4.  **System Defaults** (hardcoded values).
+### Error Propagation
 
-### Numerical Validation
-The resolution of `OllamaNumCtx` requires that the value—whether sourced from a flag, environment variable, or file—is a valid integer and greater than zero. If an environment variable is non-empty but fails `strconv.Atoi` or is $\le 0$, `ResolveConfig` returns an error.
+- `LoadConfig` returns `(*Config, error)`. If `os.ReadFile` fails, the raw error is returned. If YAML parsing fails, the error is wrapped with `fmt.Errorf("failed to parse yaml config: %w", err)`.
+- `SaveConfig` returns `error`. If `yaml.Marshal` fails, the error is wrapped with `fmt.Errorf("failed to marshal yaml: %w", err)` before being passed to `tools.WriteFileAtomic`.
+- `ConfigExists` derives a boolean from `os.Stat` error check (`err == nil`).
+- `getConfigPath` and `formatYAML` have no error handling; failures result in panics.
 
-### List and Default Initialization
-*   **Ignore List**: The `Ignore` slice is deduplicated during resolution.
-*   **Extraction Steps**: If the configuration file provides an empty list for `ExtractionSteps`, the system defaults to the `DefaultExtractionSteps` slice.
+---
 
-## I/O and Persistence
+## Configuration Resolution (`resolve.go`)
 
-### Filesystem Operations
-The module utilizes a `ConfigFileName` (`.code-reducer.yaml`) within a specified directory to manage persistence.
+### Public API
 
-*   **`ConfigExists`**: Checks for the existence of the configuration file using `os.Stat`. All errors encountered during this operation are swallowed, and the function returns `false`.
-*   **`LoadConfig`**: Reads the configuration file via `os.ReadFile` and unmarshals the content via `yaml.Unmarshal`. Errors from file reading or YAML parsing are wrapped and returned to the caller.
-*   **`SaveConfig`**: Implements an atomic write pattern to prevent file corruption:
-    1.  Serializes the `Config` struct to YAML bytes via `yaml.Marshal`.
-    2.  Creates a temporary file in the target directory using `os.CreateTemp`.
-    3.  Writes the data and ensures durability via `os.Sync`.
-    4.  Sets file permissions via `os.Chmod`.
-    5.  Closes the file and uses `os.Rename` to atomically replace the target file.
-    *   **Note**: The deferred cleanup (via `os.Remove`) in `SaveConfig` does not contain `recover()`; panics during the deferred execution are not handled.
+| Function | Parameters | Return Type |
+|---|---|---|
+| `ApplyDefaults` | `cfg *Config` | (none) |
+| `ResolveConfig` | `repoRoot string`, `modelIDFlag string`, `numCtxFlag string` | `(*Config, error)` |
 
-## Constants and Defaults
+### Internal Functions
 
-### Environment Variable Keys
-| Key | Purpose |
+| Function | Parameters | Return Type |
+|---|---|---|
+| `deduplicate` | `a []string` | `[]string` |
+| `loadBaseConfig` | `repoRoot string` | `(*Config, error)` |
+| `resolveModelID` | `cfgVal string`, `flagVal string` | `string` |
+| `resolveBaseURL` | `cfgVal string` | `string` |
+| `parsePositiveInt` | `val string`, `errMsg string` | `(int, error)` |
+| `resolveNumCtx` | `cfgVal int`, `flagVal string` | `(int, error)` |
+
+### External I/O Interactions
+
+- **Disk I/O:** `loadBaseConfig` calls `LoadConfig(repoRoot)` from `io.go`. If the file does not exist (`os.ErrNotExist`), an empty `Config{}` is returned instead of an error. Other read errors are wrapped and returned.
+- **Environment Variables:** Three environment variables are read via `os.Getenv`:
+  - `CodeReducerModelIDEnvKey` in `resolveModelID`
+  - `OllamaBaseURLEnvKey` in `resolveBaseURL`
+  - `OllamaNumCtxEnvKey` in `resolveNumCtx`
+- No network, database, or API calls.
+
+### Error Propagation
+
+- `ResolveConfig` returns errors from `loadBaseConfig` (which wraps non-`os.ErrNotExist` errors from `LoadConfig`) and from `resolveNumCtx` (which wraps errors from `parsePositiveInt`).
+- `ApplyDefaults` and `deduplicate` swallow all errors silently.
+- `resolveModelID` and `resolveBaseURL` return values without errors; callers handle the empty-string case implicitly.
+- `parsePositiveInt` returns a formatted error string via `fmt.Errorf`.
+- Errors are propagated via Go's `error` return convention; no panics or exceptions are used.
+
+---
+
+## Configuration Schema (`config.go`)
+
+### Constants
+
+| Constant | Value |
 |---|---|
-| `CODE_REDUCER_MODEL_ID` | Overrides the LLM `ModelID`. |
-| `OLLAMA_BASE_URL` | Overrides the `OllamaBaseURL`. |
-| `OLLAMA_NUM_CTX` | Overrides the `OllamaNumCtx`. |
+| `ConfigFileName` | `.code-reducer.yaml` |
+| `ConfigFileName` | `ConfigFileName` (referenced in `io.go` and `resolve.go`) |
+| `configFilePerm` | `0600` |
+| `configFilePerm` | `configFilePerm` (referenced in `io.go`) |
+| `OllamaDefaultBaseURL` | `http://localhost:11434` |
+| `OllamaDefaultModelID` | `ornith:9b` |
+| `OllamaDefaultNumCtx` | `8192` |
+| `DefaultDocsDir` | `wiki` |
+| `CodeReducerModelIDEnvKey` | `CODE_REDUCER_MODEL_ID` |
+| `OllamaBaseURLEnvKey` | `OLLAMA_BASE_URL` |
+| `OllamaNumCtxEnvKey` | `OLLAMA_NUM_CTX` |
 
-### Default Extraction Pipeline (`DefaultExtractionSteps`)
-When no custom extraction steps are provided, the system executes these four stages:
-1.  **`API_SIGNATURES`**: Extracts public types, functions, and methods.
-2.  **`BUSINESS_LOGIC`**: Synthesizes the primary domain problem and high-level algorithmic steps.
-3.  **`STATE_AND_CONCURRENCY`**: Identifies mutable state and synchronization mechanisms. Returns "No mutable state" if none are found.
-4.  **`ERRORS_AND_SIDE_EFFECTS`**: Details external I/O interactions and error propagation. Returns "No external side effects" if no I/O is detected.
+### Default Prompts
+
+The following multi-line string constants define system prompts for downstream synthesis steps:
+
+- `DefaultSystemPrompt` — Code-Reducer role and rules (extract facts, no speculation, no code blocks)
+- `DefaultModuleSynthesisPrompt` — Folder summary generation
+- `DefaultArchitecturePrompt` — Global architecture document generation
+- `DefaultQuickstartPrompt` — Developer quickstart guide generation
+- `DefaultFileFactConsolidationPrompt` — Fact consolidation and deduplication
+
+### Structs
+
+| Type | Fields |
+|---|---|
+| `ExtractionStep` | `Name` string, `Prompt` string |
+| `Config` | `ModelID` string, `OllamaBaseURL` string, `OllamaNumCtx` int, `DocsDir` string, `SystemPrompt` string, `ModuleSynthesisPrompt` string, `ArchitecturePrompt` string, `QuickstartPrompt` string, `FileFactConsolidationPrompt` string, `ExtractionSteps` []ExtractionStep, `Ignore` []string |
+
+### Default Extraction Steps
+
+`DefaultExtractionSteps` is a `[]ExtractionStep` containing: `API_SIGNATURES`, `BUSINESS_LOGIC`, `STATE_AND_CONCURRENCY`, `ERRORS_AND_SIDE_EFFECTS`.
+
+---
+
+## Resolution Priority Ordering
+
+The following priority ordering is enforced by `ResolveConfig` and its helpers:
+
+| Field | Priority Order |
+|---|---|
+| `ModelID` | CLI flag → `CODE_REDUCER_MODEL_ID` env var → config file value |
+| `OllamaBaseURL` | `OLLAMA_BASE_URL` env var → config file value |
+| `OllamaNumCtx` | CLI flag → `OLLAMA_NUM_CTX` env var → config file value |
+| `DocsDir` | System default (`wiki`) when empty/zero |
+| `ExtractionSteps` | System default when empty |
+| All prompt fields | System default when empty |
+
+`DocsDir` is additionally trimmed and path-cleaned during default application.

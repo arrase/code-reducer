@@ -97,12 +97,9 @@ func TestPromptStringList(t *testing.T) {
 	input := "a, b, c\n"
 	reader := bufio.NewReader(bytes.NewBufferString(input))
 
-	result, modified, err := promptStringList(reader, "Prompt", []string{"default"})
+	result, err := promptStringList(reader, "Prompt", []string{"default"})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
-	}
-	if !modified {
-		t.Errorf("Expected modified to be true")
 	}
 	if len(result) != 3 || result[0] != "a" || result[1] != "b" || result[2] != "c" {
 		t.Errorf("Unexpected result: %v", result)
@@ -111,12 +108,9 @@ func TestPromptStringList(t *testing.T) {
 	// Test empty input falls back
 	input = "\n"
 	reader = bufio.NewReader(bytes.NewBufferString(input))
-	result, modified, err = promptStringList(reader, "Prompt", []string{"default"})
+	result, err = promptStringList(reader, "Prompt", []string{"default"})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
-	}
-	if modified {
-		t.Errorf("Expected modified to be false")
 	}
 	if len(result) != 1 || result[0] != "default" {
 		t.Errorf("Unexpected result: %v", result)
@@ -166,7 +160,7 @@ func TestPromptIgnores(t *testing.T) {
 func TestLoadInitialSetupConfig(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := loadInitialSetupConfig(tmp)
-	if cfg.ModelID == "" || cfg.OllamaNumCtx <= 0 {
+	if cfg.ModelID == "" || cfg.OllamaNumCtx <= 0 || cfg.QuickstartPrompt == "" {
 		t.Fatalf("expected non-empty defaults, got %+v", cfg)
 	}
 
@@ -178,8 +172,8 @@ func TestLoadInitialSetupConfig(t *testing.T) {
 		t.Fatalf("failed to save config: %v", err)
 	}
 	loaded := loadInitialSetupConfig(tmp)
-	if loaded.ModelID != "custom-model" || loaded.OllamaNumCtx != 8192 {
-		t.Fatalf("expected custom values, got %+v", loaded)
+	if loaded.ModelID != "custom-model" || loaded.OllamaNumCtx != 8192 || loaded.QuickstartPrompt != config.DefaultQuickstartPrompt {
+		t.Fatalf("expected custom values and default prompts, got %+v", loaded)
 	}
 }
 
@@ -198,5 +192,8 @@ func TestRunSetupFlow(t *testing.T) {
 	}
 	if cfg.ModelID != config.OllamaDefaultModelID {
 		t.Errorf("expected default model ID, got %s", cfg.ModelID)
+	}
+	if cfg.QuickstartPrompt != config.DefaultQuickstartPrompt {
+		t.Errorf("expected default quickstart prompt, got %s", cfg.QuickstartPrompt)
 	}
 }

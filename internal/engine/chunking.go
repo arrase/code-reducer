@@ -9,12 +9,44 @@ import (
 	"github.com/arrase/code-reducer/internal/config"
 )
 
+const (
+	defaultChunkOverlap     = 800
+	maxCharsMultiplier      = 2
+	partialBatchInstruction = "Summarize and consolidate the key technical facts from this partial batch without repeating boilerplate headers"
+)
+
+// stripOuterMarkdownFence strips surrounding markdown code fences only if there are no intermediate fences.
+func stripOuterMarkdownFence(text string) string {
+	trimmed := strings.TrimSpace(text)
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 2 {
+		return trimmed
+	}
+	if !strings.HasPrefix(strings.TrimSpace(lines[0]), "```") || strings.TrimSpace(lines[len(lines)-1]) != "```" {
+		return trimmed
+	}
+	for _, line := range lines[1 : len(lines)-1] {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			return trimmed
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n"))
+}
+
 type reductionConfig struct {
 	sysPrompt   string
 	buildPrompt func(batch []string) string
 	logMsg      func(batch []string) string
 	errMsg      string
-	logEvent    LogEventFunc
+	onStatus    StatusFunc
+}
+
+func calculateFileLimit(numCtx int, sysPrompt string) int {
+	limit := numCtx*maxCharsMultiplier - utf8.RuneCountInString(sysPrompt)
+	if limit < defaultChunkOverlap*2 {
+		return defaultChunkOverlap * 2
+	}
+	return limit
 }
 
 func reduceWithLLM(
@@ -26,11 +58,12 @@ func reduceWithLLM(
 	if len(items) == 0 {
 		return "", nil
 	}
-	maxChars := c.NumCtx() * maxCharsMultiplier
+	promptOverhead := cfg.sysPrompt + "\n" + cfg.buildPrompt(nil) + "\n" + partialBatchInstruction
+	maxChars := calculateFileLimit(c.NumCtx(), promptOverhead)
 	return reduceItems(ctx, items, maxChars, func(batch []string) (string, error) {
 		prompt := cfg.buildPrompt(batch)
-		cfg.logEvent(EventStatus, cfg.logMsg(batch))
-		res, err := c.CallLLM(ctx, cfg.sysPrompt, []Message{{Role: "user", Content: prompt}}, false)
+		cfg.onStatus(cfg.logMsg(batch))
+		res, err := c.CallLLM(ctx, cfg.sysPrompt, prompt)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", cfg.errMsg, err)
 		}
@@ -38,7 +71,7 @@ func reduceWithLLM(
 	})
 }
 
-func reduceInChunks(ctx context.Context, c llmCaller, nodePath string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error) {
+func reduceInChunks(ctx context.Context, c llmCaller, nodePath string, items []string, cfg *config.Config, onStatus StatusFunc) (string, error) {
 	redCfg := reductionConfig{
 		sysPrompt: cfg.SystemPrompt + "\n" + cfg.ModuleSynthesisPrompt,
 		buildPrompt: func(batch []string) string {
@@ -48,14 +81,31 @@ func reduceInChunks(ctx context.Context, c llmCaller, nodePath string, items []s
 			return fmt.Sprintf("➜ LLM Synthesizing chunk for %s (%d items)", nodePath, len(batch))
 		},
 		errMsg:   "LLM error during synthesis",
-		logEvent: logEvent,
+		onStatus: onStatus,
 	}
 	return reduceWithLLM(ctx, c, items, redCfg)
 }
 
-func reduceFileFacts(ctx context.Context, c llmCaller, filePath string, stepName string, items []string, cfg *config.Config, logEvent LogEventFunc) (string, error) {
-	if len(items) == 1 {
-		return items[0], nil
+func isNoneFact(s string) bool {
+	cleaned := strings.TrimSpace(s)
+	cleaned = strings.TrimPrefix(cleaned, "- ")
+	cleaned = strings.TrimPrefix(cleaned, "* ")
+	cleaned = strings.TrimSuffix(strings.TrimSpace(cleaned), ".")
+	return cleaned == "" || strings.EqualFold(cleaned, "none") || strings.EqualFold(cleaned, "n/a")
+}
+
+func reduceFileFacts(ctx context.Context, c llmCaller, filePath string, stepName string, items []string, cfg *config.Config, onStatus StatusFunc) (string, error) {
+	var validItems []string
+	for _, item := range items {
+		if !isNoneFact(item) {
+			validItems = append(validItems, item)
+		}
+	}
+	if len(validItems) == 0 {
+		return "", nil
+	}
+	if len(validItems) == 1 {
+		return validItems[0], nil
 	}
 	redCfg := reductionConfig{
 		sysPrompt: cfg.SystemPrompt + "\n" + cfg.FileFactConsolidationPrompt,
@@ -66,9 +116,16 @@ func reduceFileFacts(ctx context.Context, c llmCaller, filePath string, stepName
 			return fmt.Sprintf("➜ LLM Consolidating facts for %s (%d items)", filePath, len(batch))
 		},
 		errMsg:   "LLM error during file fact consolidation",
-		logEvent: logEvent,
+		onStatus: onStatus,
 	}
-	return reduceWithLLM(ctx, c, items, redCfg)
+	res, err := reduceWithLLM(ctx, c, validItems, redCfg)
+	if err != nil {
+		return "", err
+	}
+	if isNoneFact(res) {
+		return "", nil
+	}
+	return res, nil
 }
 
 func expandOversizedItems(items []string, maxChars int) ([]string, error) {
@@ -139,7 +196,8 @@ func reduceItems(ctx context.Context, items []string, maxChars int, reduceFn fun
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		chunkRes, err := reduceItems(ctx, batch, maxChars, reduceFn)
+		partialBatch := append([]string{partialBatchInstruction}, batch...)
+		chunkRes, err := reduceFn(partialBatch)
 		if err != nil {
 			return "", err
 		}
@@ -160,8 +218,8 @@ func chunkTextWithOverlap(text string, maxRunes int, overlapRunes int) ([]string
 	if maxRunes <= 0 {
 		return nil, fmt.Errorf("maxRunes must be greater than 0")
 	}
-	if overlapRunes >= maxRunes {
-		return nil, fmt.Errorf("overlapRunes must be strictly less than maxRunes")
+	if overlapRunes < 0 || overlapRunes >= maxRunes {
+		return nil, fmt.Errorf("overlapRunes must be between 0 and maxRunes-1")
 	}
 
 	runes := []rune(text)
@@ -170,16 +228,24 @@ func chunkTextWithOverlap(text string, maxRunes int, overlapRunes int) ([]string
 	}
 
 	var chunks []string
-	step := maxRunes - overlapRunes
-	for i := 0; i < len(runes); i += step {
-		end := i + maxRunes
-		if end > len(runes) {
-			end = len(runes)
-		}
-		chunks = append(chunks, string(runes[i:end]))
-		if end == len(runes) {
+	for start := 0; start < len(runes); {
+		end := start + maxRunes
+		if end >= len(runes) {
+			chunks = append(chunks, string(runes[start:]))
 			break
 		}
+		for j := end - 1; j >= start+(maxRunes*3)/4; j-- {
+			if runes[j] == '\n' {
+				end = j + 1
+				break
+			}
+		}
+		chunks = append(chunks, string(runes[start:end]))
+		nextStart := end - overlapRunes
+		if nextStart <= start {
+			nextStart = end
+		}
+		start = nextStart
 	}
 	return chunks, nil
 }

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // deduplicate removes duplicates from a slice.
@@ -20,11 +22,40 @@ func deduplicate(a []string) []string {
 	return result
 }
 
-func resolveString(yamlVal, defaultVal string) string {
-	if yamlVal != "" {
-		return yamlVal
+// ApplyDefaults populates empty or zero fields in cfg with system default values.
+func ApplyDefaults(cfg *Config) {
+	if cfg.ModelID == "" {
+		cfg.ModelID = OllamaDefaultModelID
 	}
-	return defaultVal
+	if cfg.OllamaBaseURL == "" {
+		cfg.OllamaBaseURL = OllamaDefaultBaseURL
+	}
+	if cfg.OllamaNumCtx <= 0 {
+		cfg.OllamaNumCtx = OllamaDefaultNumCtx
+	}
+	cfg.DocsDir = strings.TrimSpace(cfg.DocsDir)
+	if cfg.DocsDir == "" {
+		cfg.DocsDir = DefaultDocsDir
+	}
+	cfg.DocsDir = filepath.ToSlash(filepath.Clean(cfg.DocsDir))
+	if len(cfg.ExtractionSteps) == 0 {
+		cfg.ExtractionSteps = DefaultExtractionSteps
+	}
+	if cfg.SystemPrompt == "" {
+		cfg.SystemPrompt = DefaultSystemPrompt
+	}
+	if cfg.ModuleSynthesisPrompt == "" {
+		cfg.ModuleSynthesisPrompt = DefaultModuleSynthesisPrompt
+	}
+	if cfg.ArchitecturePrompt == "" {
+		cfg.ArchitecturePrompt = DefaultArchitecturePrompt
+	}
+	if cfg.QuickstartPrompt == "" {
+		cfg.QuickstartPrompt = DefaultQuickstartPrompt
+	}
+	if cfg.FileFactConsolidationPrompt == "" {
+		cfg.FileFactConsolidationPrompt = DefaultFileFactConsolidationPrompt
+	}
 }
 
 func loadBaseConfig(repoRoot string) (*Config, error) {
@@ -39,10 +70,7 @@ func loadBaseConfig(repoRoot string) (*Config, error) {
 }
 
 func resolveModelID(cfgVal, flagVal string) string {
-	modelID := OllamaDefaultModelID
-	if cfgVal != "" {
-		modelID = cfgVal
-	}
+	modelID := cfgVal
 	if envVal := os.Getenv(CodeReducerModelIDEnvKey); envVal != "" {
 		modelID = envVal
 	}
@@ -53,32 +81,33 @@ func resolveModelID(cfgVal, flagVal string) string {
 }
 
 func resolveBaseURL(cfgVal string) string {
-	baseURL := OllamaDefaultBaseURL
-	if cfgVal != "" {
-		baseURL = cfgVal
-	}
 	if envVal := os.Getenv(OllamaBaseURLEnvKey); envVal != "" {
-		baseURL = envVal
+		return envVal
 	}
-	return baseURL
+	return cfgVal
+}
+
+func parsePositiveInt(val, errMsg string) (int, error) {
+	n, err := strconv.Atoi(val)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s: %s", errMsg, val)
+	}
+	return n, nil
 }
 
 func resolveNumCtx(cfgVal int, flagVal string) (int, error) {
-	numCtx := OllamaDefaultNumCtx
-	if cfgVal > 0 {
-		numCtx = cfgVal
-	}
+	numCtx := cfgVal
 	if envVal := os.Getenv(OllamaNumCtxEnvKey); envVal != "" {
-		n, err := strconv.Atoi(envVal)
-		if err != nil || n <= 0 {
-			return 0, fmt.Errorf("invalid value for %s: %s", OllamaNumCtxEnvKey, envVal)
+		n, err := parsePositiveInt(envVal, "invalid value for "+OllamaNumCtxEnvKey)
+		if err != nil {
+			return 0, err
 		}
 		numCtx = n
 	}
 	if flagVal != "" {
-		n, err := strconv.Atoi(flagVal)
-		if err != nil || n <= 0 {
-			return 0, fmt.Errorf("invalid value for num-ctx flag: %s", flagVal)
+		n, err := parsePositiveInt(flagVal, "invalid value for num-ctx flag")
+		if err != nil {
+			return 0, err
 		}
 		numCtx = n
 	}
@@ -92,27 +121,16 @@ func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	ApplyDefaults(cfg)
 
 	numCtx, err := resolveNumCtx(cfg.OllamaNumCtx, numCtxFlag)
 	if err != nil {
 		return nil, err
 	}
 
-	resolvedSteps := cfg.ExtractionSteps
-	if len(resolvedSteps) == 0 {
-		resolvedSteps = DefaultExtractionSteps
-	}
-
-	return &Config{
-		Ignore:                      deduplicate(cfg.Ignore),
-		ExtractionSteps:             resolvedSteps,
-		ModelID:                     resolveModelID(cfg.ModelID, modelIDFlag),
-		OllamaBaseURL:               resolveBaseURL(cfg.OllamaBaseURL),
-		OllamaNumCtx:                numCtx,
-		DocsDir:                     resolveString(cfg.DocsDir, DefaultDocsDir),
-		SystemPrompt:                resolveString(cfg.SystemPrompt, DefaultSystemPrompt),
-		ModuleSynthesisPrompt:       resolveString(cfg.ModuleSynthesisPrompt, DefaultModuleSynthesisPrompt),
-		ArchitecturePrompt:          resolveString(cfg.ArchitecturePrompt, DefaultArchitecturePrompt),
-		FileFactConsolidationPrompt: resolveString(cfg.FileFactConsolidationPrompt, DefaultFileFactConsolidationPrompt),
-	}, nil
+	cfg.Ignore = deduplicate(cfg.Ignore)
+	cfg.ModelID = resolveModelID(cfg.ModelID, modelIDFlag)
+	cfg.OllamaBaseURL = resolveBaseURL(cfg.OllamaBaseURL)
+	cfg.OllamaNumCtx = numCtx
+	return cfg, nil
 }

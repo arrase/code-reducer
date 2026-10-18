@@ -108,4 +108,16 @@ func TestDetermineAndPropagateAffected(t *testing.T) {
 	if propagated["cmd"] {
 		t.Errorf("expected cmd not to be affected after propagation")
 	}
+
+	// Deleted file in a removed subdirectory should propagate to existing ancestors in tree
+	deletedSubdirChanges := []FileChange{
+		{Path: "internal/removed/old.go", Status: StatusDeleted},
+	}
+	affectedDeleted := propagateAffected(tree, determineAffected(tree, tempDir, "docs", cache, deletedSubdirChanges))
+	if !affectedDeleted["internal"] || !affectedDeleted["."] {
+		t.Errorf("expected internal and root to be affected when a child subdirectory is deleted, got %v", affectedDeleted)
+	}
+	if affectedDeleted["internal/removed"] {
+		t.Errorf("did not expect non-existent directory internal/removed in propagated map")
+	}
 }

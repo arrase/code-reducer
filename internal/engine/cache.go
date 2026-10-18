@@ -18,7 +18,10 @@ type FileCacheEntry struct {
 	Facts  string `json:"facts"`
 }
 
-const currentCacheVersion = 1
+const (
+	currentCacheVersion = 1
+	metadataFileName    = ".metadata.json"
+)
 
 type MetadataCache struct {
 	Version   int                       `json:"version"`
@@ -27,13 +30,23 @@ type MetadataCache struct {
 	Modules   map[string]string         `json:"modules"`
 }
 
-func computeStepsHash(steps []config.ExtractionStep) string {
-	data, err := json.Marshal(steps)
-	if err != nil {
-		return ""
+func computeStepsHash(cfg *config.Config) string {
+	h := sha256.New()
+	writeField := func(s string) {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
 	}
-	h := sha256.Sum256(data)
-	return hex.EncodeToString(h[:])
+	writeField(cfg.ModelID)
+	writeField(cfg.SystemPrompt)
+	writeField(cfg.ModuleSynthesisPrompt)
+	writeField(cfg.ArchitecturePrompt)
+	writeField(cfg.QuickstartPrompt)
+	writeField(cfg.FileFactConsolidationPrompt)
+	for _, step := range cfg.ExtractionSteps {
+		writeField(step.Name)
+		writeField(step.Prompt)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func newEmptyCache() *MetadataCache {
@@ -51,11 +64,11 @@ func loadMetadataCache(repoRoot, docsDir string) (*MetadataCache, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return newEmptyCache(), nil
 		}
-		return newEmptyCache(), fmt.Errorf("failed to read metadata cache: %w", err)
+		return nil, fmt.Errorf("failed to read metadata cache: %w", err)
 	}
 	var cache MetadataCache
 	if err := json.Unmarshal(data, &cache); err != nil {
-		return newEmptyCache(), fmt.Errorf("failed to unmarshal metadata cache: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal metadata cache: %w", err)
 	}
 	if cache.Version != currentCacheVersion {
 		// Incompatible version: return a clean cache
@@ -72,9 +85,7 @@ func loadMetadataCache(repoRoot, docsDir string) (*MetadataCache, error) {
 
 // IsInitialized checks if the metadata cache file exists.
 func IsInitialized(repoRoot, docsDir string) bool {
-	metadataPath := filepath.Join(docsDir, metadataFileName)
-	_, err := tools.ReadFileSafely(repoRoot, metadataPath)
-	return err == nil
+	return tools.FileExistsSafely(repoRoot, filepath.Join(docsDir, metadataFileName))
 }
 
 func saveMetadataCache(repoRoot, docsDir string, cache *MetadataCache) error {

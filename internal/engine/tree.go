@@ -1,12 +1,11 @@
 package engine
 
 import (
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/arrase/code-reducer/internal/security"
+	"github.com/arrase/code-reducer/internal/tools"
 )
 
 type ChangeStatus string
@@ -24,13 +23,10 @@ type FileChange struct {
 
 func propagateAffected(node *DirNode, affectedDirs map[string]bool) map[string]bool {
 	newAffected := make(map[string]bool)
-	for k, v := range affectedDirs {
-		newAffected[k] = v
-	}
 
 	var propagate func(*DirNode) bool
 	propagate = func(n *DirNode) bool {
-		isAffected := newAffected[n.Path]
+		isAffected := affectedDirs[n.Path]
 		for _, child := range n.Children {
 			if propagate(child) {
 				isAffected = true
@@ -57,14 +53,7 @@ func isNodeAffected(n *DirNode, changedFiles map[string]bool, repoRoot, docsDir 
 	}
 
 	modulePath := filepath.Join(docsDir, "modules", toSafeMarkdownFilename(n.Path))
-	absModulePath, err := security.SafeResolve(repoRoot, modulePath)
-	if err == nil {
-		if _, err := os.Stat(absModulePath); os.IsNotExist(err) {
-			return true
-		}
-	}
-
-	return false
+	return !tools.FileExistsSafely(repoRoot, modulePath)
 }
 
 func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataCache, filteredChanges []FileChange) map[string]bool {
@@ -73,7 +62,12 @@ func determineAffected(node *DirNode, repoRoot, docsDir string, cache *MetadataC
 	for _, c := range filteredChanges {
 		changedFiles[c.Path] = true
 		if c.Status == StatusDeleted {
-			affectedDirs[path.Dir(c.Path)] = true
+			for d := path.Dir(c.Path); ; d = path.Dir(d) {
+				affectedDirs[d] = true
+				if d == "." {
+					break
+				}
+			}
 		}
 	}
 

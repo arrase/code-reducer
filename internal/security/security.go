@@ -1,6 +1,7 @@
 package security
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,13 @@ import (
 const (
 	LockFileName    = ".code-reducer.lock"
 	defaultFilePerm = 0644
+)
+
+var (
+	// ErrPathTraversal is returned when a path resolves outside the repository root.
+	ErrPathTraversal = errors.New("security violation: path traversal detected")
+	// ErrLockHeld is returned when another code-reducer process holds the file lock.
+	ErrLockHeld = errors.New("lock is already held by another process")
 )
 
 // SafeResolve cleans the input path and ensures it lies strictly inside the repository.
@@ -42,7 +50,7 @@ func SafeResolve(repoRoot, inputPath string) (string, error) {
 		if parent == current {
 			break
 		}
-		nonExistentSuffix = append([]string{filepath.Base(current)}, nonExistentSuffix...)
+		nonExistentSuffix = append(nonExistentSuffix, filepath.Base(current))
 		current = parent
 	}
 
@@ -53,8 +61,10 @@ func SafeResolve(repoRoot, inputPath string) (string, error) {
 	}
 
 	// Rebuild the resolved full path
-	parts := append([]string{resolvedAncestor}, nonExistentSuffix...)
-	resolvedPath := filepath.Join(parts...)
+	resolvedPath := resolvedAncestor
+	for i := len(nonExistentSuffix) - 1; i >= 0; i-- {
+		resolvedPath = filepath.Join(resolvedPath, nonExistentSuffix[i])
+	}
 
 	// Verify that resolvedPath is inside resolvedRoot
 	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
@@ -82,8 +92,7 @@ func (l *SimpleLock) Unlock() error {
 	}
 	l.closed = true
 
-	var err error
-	err = l.file.Close()
+	err := l.file.Close()
 	if removeErr := os.Remove(l.lockPath); removeErr != nil && !os.IsNotExist(removeErr) {
 		if err == nil {
 			err = removeErr
@@ -109,16 +118,9 @@ func AcquireLock(repoRoot string) (*SimpleLock, error) {
 	}
 
 	if _, err := f.Write([]byte(fmt.Sprintf("%d\n", os.Getpid()))); err != nil {
-		errClose := f.Close()
-		errRemove := os.Remove(lockPath)
-		var errMsg string
-		if errClose != nil {
-			errMsg += fmt.Sprintf(", close failed: %v", errClose)
-		}
-		if errRemove != nil {
-			errMsg += fmt.Sprintf(", remove failed: %v", errRemove)
-		}
-		return nil, fmt.Errorf("failed to write pid to lockfile%s: %w", errMsg, err)
+		_ = f.Close()
+		_ = os.Remove(lockPath)
+		return nil, fmt.Errorf("failed to write pid to lockfile: %w", err)
 	}
 
 	return &SimpleLock{lockPath: lockPath, file: f}, nil
