@@ -1,73 +1,60 @@
-# Module: `cmd`
+# cmd Package Architecture
 
-## Module Overview
-The `cmd` module serves as the command-line interface (CLI) orchestration layer. It manages the lifecycle of project documentation generation by coordinating user input, configuration persistence, git repository validation, and the execution of the underlying documentation engine.
+## Module Responsibility
+
+The `cmd` package implements the CLI entry point for a documentation agent that writes and maintains project wikis. It orchestrates the documentation engine across three operational modes: **init** (first-time documentation build), **setup** (interactive configuration wizard), and **update** (incremental wiki regeneration). All commands are registered as `*cobra.Command` instances and share a common execution path through `executeCommand`, which dispatches to the engine based on the requested `engine.RunMode`.
 
 ## Data Flow
-1.  **Input Acquisition**: CLI arguments are parsed via `RootCmd`. User-provided flags (`--model-id`, `--num-ctx`) and interactive input (`os.Stdin`) are captured.
-2.  **Environment Validation**: The module verifies the presence of a git repository and determines the current working directory via `os.Getwd`.
-3.  **State Assessment**: The module checks for existing configuration files and determines if the project is in an initialized state to validate the requested operation (`init` vs. `update`).
-4.  **Configuration Resolution**: Configuration is loaded from disk, merged with defaults, and optionally updated via an interactive setup flow.
-5.  **Execution Dispatch**: The validated configuration and mode are passed to the `engine` package to perform documentation generation or incremental updates.
-6.  **Output Stream**: Results, status updates, and errors are streamed to `stdout` and `stderr`.
 
-## Core Components
+```
+CLI Invocation
+    │
+    ▼
+RootCmd (root.go)
+    │
+    ├── ModeInit ──► initCmd ──► executeCommand(ModeInit) ──► engine.Run(ModeInit)
+    │
+    ├── ModeUpdate ──► updateCmd ──► executeCommand(ModeUpdate) ──► engine.Run(ModeUpdate)
+    │
+    └── ModeSetup ──► setupCmd ──► RunSetupFlow ──► config.SaveConfig
+```
 
-### Command Orchestration (`root.go`)
-The central logic for the CLI lifecycle is contained within this file.
+## Command Registration
 
-*   **`RootCmd`** (`*cobra.Command`): The entry point for the CLI application.
-*   **`executeCommand(mode engine.Mode) error`**: The primary controller. It performs the following sequence:
-    *   Resolves the working directory.
-    *   Verifies the git repository status.
-    *   Triggers `checkAndRunSetup` if configuration is missing and `os.Stdin` is a TTY.
-    *   Resolves the final configuration.
-    *   Validates that the current project state matches the requested `engine.Mode`.
-    *   Dispatches execution to `runEngine`.
-*   **`checkAndRunSetup(repoRoot string) error`**: Evaluates if `RunSetupFlow` is required based on the existence of configuration files and terminal availability.
-*   **`checkInitStatus(repoRoot, docsDir string, mode engine.Mode) error`**: Enforces state transition rules:
-    *   `ModeInit` is prohibited if the project is already initialized.
-    *   `ModeUpdate` is prohibited if the project is not yet initialized.
-*   **`runEngine(repoRoot string, cfg *config.Config, mode engine.Mode) error`**: Orchestrates engine execution with signal handling for `os.Interrupt` and `syscall.SIGTERM`.
+### init.go
 
-### Command Definitions (`init.go`, `update.go`)
-These files act as thin wrappers that map CLI subcommands to specific engine modes.
+The `init` command is registered at package scope via a global `*cobra.Command` variable. On execution, it delegates to `executeCommand` with `engine.ModeInit`. The engine mode triggers a repository scan and generates the first set of wiki markdown pages. No public API surface is exposed from this file; all identifiers are unexported.
 
-*   **`init` subcommand**: Dispatches `engine.ModeInit` to trigger the initial scanning of the repository and generation of wiki markdown files.
-*   **`update` subcommand**: Dispatches `engine.ModeUpdate` to perform incremental updates by comparing current file states against the last documented git commit.
+### root.go
 
-### Configuration Lifecycle (`setup.go`)
-Handles the interactive provisioning of project settings.
+The root command (`RootCmd`) serves as the CLI application's top-level entry point. It is initialized once and never modified after creation. The root command binds two persistent flags (`modelIDFlag`, `numCtxFlag`) and provides the following unexported functions:
 
-*   **`RunSetupFlow(repoRoot string) error`**: Manages a stateful, interactive session to collect:
-    *   LLM Model ID.
-    *   Ollama Base URL.
-    *   Ollama Context Size.
-    *   File/directory ignore patterns.
-    *   Documentation directory paths.
-*   **Persistence**: Finalized settings are consolidated into a `config.Config` object and written to disk via `config.SaveConfig`.
+- **`init()`** — Initializes the root command and registers all subcommands.
+- **`executeCommand(mode engine.RunMode)`** — Central dispatch function. Accepts a `engine.RunMode` and returns `error`. Aggregates errors from `os.Getwd()`, `tools.VerifyGitRepo`, `checkAndRunSetup`, `config.ResolveConfig`, `checkInitStatus`, and `runEngine`.
+- **`checkAndRunSetup(repoRoot string)`** — Returns `error` when the configuration file is missing and stdin is not a terminal.
+- **`checkInitStatus(repoRoot, docsDir string, mode engine.RunMode)`** — Returns `error` when the requested init/update mode conflicts with the project's initialization state.
+- **`runEngine(repoRoot string, cfg *config.Config, mode engine.RunMode)`** — Wraps engine errors with `fmt.Errorf("documentation run failed: %w", err)`.
 
-## State and Side Effects
+### setup.go
 
-### Mutable State
-*   **Global Flags**: `modelIDFlag` and `numCtxFlag` are modified during the `init()` phase and persist for the lifetime of the process.
-*   **Command State**: `RootCmd` state is modified via `.SetArgs()` and `.Execute()` during testing.
+The `setup` command (`setupCmd`) implements an interactive CLI setup wizard. It generates or updates a `.code-reducer.yaml` configuration file by collecting the following values from the user:
 
-### External I/O
-*   **Filesystem**:
-    *   Directory/file creation via `os.MkdirAll` and `os.WriteFile`.
-    *   Configuration persistence via `config.SaveConfig` and `config.LoadConfig`.
-    *   Git verification via `tools.VerifyGitRepo`.
-    *   State check via `engine.IsInitialized`.
-*   **Standard Streams**:
-    *   `os.Stdin`: Used for interactive parameter collection.
-    *   `os.Stdout`: Used for status messages and engine events.
-    *   `os.Stderr`: Used for error reporting.
+1. LLM Model ID
+2. Ollama Base URL
+3. Ollama Context Size (numeric validation with default fallback)
+4. Ignore patterns (comma-separated list; supports "clear"/"none" to reset)
+5. Documentation directory
 
-### Error Handling
-*   **Propagation**: Errors are passed up the call stack via return values.
-*   **Wrapping**: `os.Getwd` and `runner.Run` errors are wrapped with context using `%w`.
-*   **Swallowed Errors**: 
-    *   `config.LoadConfig` errors are swallowed in `RunSetupFlow` (defaults are returned instead).
-    *   `strconv.Atoi` errors in `promptContextSize` are swallowed (default values are returned instead).
-    *   `RootCmd.Execute()` return values are swallowed in `cmd_test.go`.
+The flow loads any existing configuration from the current working directory (falling back to an empty `config.Config{}` if the load fails), applies defaults, prompts sequentially, and persists the result via `config.SaveConfig`.
+
+### update.go
+
+The `update` command (`updateCmd`) performs incremental documentation updates. It identifies files modified since the last documented commit using cached SHA-256 hashes and regenerates the corresponding wiki pages. The operation is tied to the last documented commit as the baseline. No direct I/O is performed in this file; all logic is delegated to `internal/engine` via `executeCommand(engine.ModeUpdate)`.
+
+## Error Propagation
+
+All functions in `cmd` return `error` type. Errors propagate up the call chain via return values. No panics or crashes are present. The cobra framework displays returned errors to the user and exits with a non-zero status code. Errors from `executeCommand` are returned directly to the cobra command framework via `RunE`.
+
+## State and Concurrency
+
+No synchronization mechanisms are present. Global variables (`initCmd`, `setupCmd`, `updateCmd`) are declared at package scope and initialized once; they are never modified after initialization. No mutexes, locks, atomic types, or async patterns are used.

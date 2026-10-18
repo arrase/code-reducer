@@ -21,17 +21,33 @@ const (
 	configFilePerm = 0600
 
 	// DefaultSystemPrompt is the default system instructions for the LLM.
-	DefaultSystemPrompt = "You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.\n" +
-		"DEFENSIVE RULES: 1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 3. Do NOT name standard library packages unless explicitly stated in the source text. 4. Only report facts you are 100% sure about.\n"
+	DefaultSystemPrompt = "You are Code-Reducer, a technical code analyzer and documentation writer. Follow instructions strictly with maximum technical conciseness.\n" +
+		"Rules:\n" +
+		"1. Extract and report ONLY verifiable facts explicitly present in the provided source code.\n" +
+		"2. Do NOT invent behaviors, speculate on unshown code, or guess downstream consequences.\n" +
+		"3. Do NOT copy source code blocks or write conversational filler.\n"
 
 	// DefaultModuleSynthesisPrompt is the default prompt for folder summaries.
-	DefaultModuleSynthesisPrompt = "Task: Write a technical documentation page for a code module based on the provided list of its internal components.\nRule 1: Group related functions and classes under appropriate Markdown headings.\nRule 2: Explain the responsibility of the module and the data flow.\nRule 3: Keep it highly technical and dense."
+	DefaultModuleSynthesisPrompt = "Task: Write a technical documentation page for a code module based on the provided list of its internal components.\n" +
+		"Rule 1: Group related functions and types under appropriate Markdown headings.\n" +
+		"Rule 2: Explain the responsibility of the module and its internal data flow.\n" +
+		"Rule 3: Keep it highly technical, concise, and free of source code blocks."
 
-	// DefaultArchitecturePrompt is the default prompt for architecture synthesis.
-	DefaultArchitecturePrompt = "Task: Write a global architecture or quickstart document based on the module summaries.\nRule 1: Explain the system boundaries and how the modules interact.\nRule 2: Provide a dense, developer-friendly overview."
+	// DefaultArchitecturePrompt is the default prompt for global architecture synthesis.
+	DefaultArchitecturePrompt = "Task: Write the global architecture document (architecture.md) based on the module summaries.\n" +
+		"Rule 1: Focus exclusively on the global architecture vision, system boundaries, end-to-end data flow, and module interactions.\n" +
+		"Rule 2: Keep it concise, technical, and developer-friendly."
+
+	// DefaultQuickstartPrompt is the default prompt for developer quickstart synthesis.
+	DefaultQuickstartPrompt = "Task: Write the developer quickstart guide (quickstart.md) based on the module summaries.\n" +
+		"Rule 1: Focus exclusively on prerequisites, build/installation steps, available CLI commands and flags, configuration (.code-reducer.yaml and environment variables), and package structure.\n" +
+		"Rule 2: Keep it concise, actionable, and strictly factual."
 
 	// DefaultFileFactConsolidationPrompt is the default prompt for consolidation.
-	DefaultFileFactConsolidationPrompt = "You are a specialized code documentation assistant.\nConsolidate, deduplicate and merge the following facts extracted from different chunks of the same file into a single, cohesive summary."
+	DefaultFileFactConsolidationPrompt = "Task: Consolidate and deduplicate facts extracted from different chunks of the same file into a single, concise summary.\n" +
+		"Rule 1: Merge duplicate items and preserve only unique, verifiable facts.\n" +
+		"Rule 2: Keep bullet points to 1 line each; do NOT copy source code blocks or add long explanations.\n" +
+		"Rule 3: If all inputs are 'None', output solely 'None'."
 )
 
 // ExtractionStep represents a single fact-extraction phase for files.
@@ -49,6 +65,7 @@ type Config struct {
 	SystemPrompt                string           `yaml:"system_prompt"`
 	ModuleSynthesisPrompt       string           `yaml:"module_synthesis_prompt"`
 	ArchitecturePrompt          string           `yaml:"architecture_prompt"`
+	QuickstartPrompt            string           `yaml:"quickstart_prompt"`
 	FileFactConsolidationPrompt string           `yaml:"file_fact_consolidation_prompt"`
 	ExtractionSteps             []ExtractionStep `yaml:"extraction_steps"`
 	Ignore                      []string         `yaml:"ignore"`
@@ -58,18 +75,18 @@ type Config struct {
 var DefaultExtractionSteps = []ExtractionStep{
 	{
 		Name:   "API_SIGNATURES",
-		Prompt: "Task: Extract the public API surface.\nOutput: A strict Markdown list of all exported or public elements (classes, functions, methods, types). Include parameters and return types. Do not explain internal execution logic.",
+		Prompt: "Task: Extract the public API surface.\nOutput: Markdown bullet list of exported/public types, functions, and methods, strictly 1 line per signature with parameters and return types. Do NOT explain internal logic or copy code blocks. If none exist, output solely 'None'.",
 	},
 	{
 		Name:   "BUSINESS_LOGIC",
-		Prompt: "Task: Extract the core purpose and domain rules.\nOutput: Explain the primary domain problem this code solves. List the high-level algorithm steps. Ignore syntax, standard library usage, and basic implementation details.",
+		Prompt: "Task: Extract the core purpose and domain rules.\nOutput: Maximum 5 concise bullet points describing the primary domain problem and high-level logic. Ignore syntax and boilerplate. Do NOT copy code blocks. If none exist, output solely 'None'.",
 	},
 	{
 		Name:   "STATE_AND_CONCURRENCY",
-		Prompt: "Task: Identify mutable state and thread safety.\nOutput: List global variables, shared states, or class-level properties that are modified. Identify synchronization mechanisms (locks, mutexes, async/await, atomic types). If entirely stateless, output exactly: 'No mutable state'.",
+		Prompt: "Task: Identify mutable state and thread safety.\nOutput: Concise bullet list (1 line per item) of modified package/global state, struct fields, or synchronization mechanisms (locks, mutexes, channels, atomics). Do NOT copy code blocks. If stateless, output solely 'None'.",
 	},
 	{
 		Name:   "ERRORS_AND_SIDE_EFFECTS",
-		Prompt: "Task: Analyze external I/O and error propagation.\nOutput: Detail interactions with external systems (network, disk, databases, APIs). Explain how errors are propagated (exceptions, error return codes, crash/panic). If no I/O exists, state 'No external side effects'.",
+		Prompt: "Task: Analyze external I/O and error propagation.\nOutput: Concise bullet list (1 line per item) of external system interactions (filesystem, network, subprocesses, environment) and error handling patterns. Do NOT copy code blocks. If none exist, output solely 'None'.",
 	},
 }

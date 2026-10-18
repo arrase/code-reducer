@@ -15,9 +15,11 @@ func TestChunkTextWithOverlap(t *testing.T) {
 	})
 
 	t.Run("invalid overlapRunes", func(t *testing.T) {
-		_, err := chunkTextWithOverlap("test", 10, 10)
-		if err == nil {
+		if _, err := chunkTextWithOverlap("test", 10, 10); err == nil {
 			t.Fatal("expected error for overlapRunes >= maxRunes")
+		}
+		if _, err := chunkTextWithOverlap("test", 10, -1); err == nil {
+			t.Fatal("expected error for overlapRunes < 0")
 		}
 	})
 
@@ -59,6 +61,48 @@ func TestChunkTextWithOverlap(t *testing.T) {
 			t.Errorf("expected chunk 2 to be 'efg', got '%s'", chunks[2])
 		}
 	})
+
+	t.Run("chunking splits at last newline in tail window", func(t *testing.T) {
+		text := "line1\nline2\nline3\n"
+		chunks, err := chunkTextWithOverlap(text, 14, 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(chunks) != 2 {
+			t.Fatalf("expected 2 chunks, got %d: %q", len(chunks), chunks)
+		}
+		if chunks[0] != "line1\nline2\n" {
+			t.Errorf("expected chunk 0 to end after newline 'line1\\nline2\\n', got %q", chunks[0])
+		}
+		if chunks[1] != "2\nline3\n" {
+			t.Errorf("expected chunk 1 to preserve overlap '2\\nline3\\n', got %q", chunks[1])
+		}
+	})
+}
+
+func TestStripOuterMarkdownFence(t *testing.T) {
+	t.Run("strips single outer markdown fence", func(t *testing.T) {
+		input := "```markdown\n# Title\nBody\n```"
+		got := stripOuterMarkdownFence(input)
+		if got != "# Title\nBody" {
+			t.Errorf("expected '# Title\\nBody', got %q", got)
+		}
+	})
+
+	t.Run("preserves document with multiple code blocks", func(t *testing.T) {
+		input := "```go\nfunc a() {}\n```\n\nSome text\n\n```go\nfunc b() {}\n```"
+		got := stripOuterMarkdownFence(input)
+		if got != input {
+			t.Errorf("expected multiple code blocks to remain intact, got %q", got)
+		}
+	})
+
+	t.Run("leaves plain text untouched", func(t *testing.T) {
+		input := "# Just Markdown\nSome content"
+		if got := stripOuterMarkdownFence(input); got != input {
+			t.Errorf("expected %q, got %q", input, got)
+		}
+	})
 }
 
 func TestReduceItems(t *testing.T) {
@@ -79,6 +123,9 @@ func TestReduceItems(t *testing.T) {
 		if !strings.Contains(res, item) {
 			t.Errorf("expected result to contain %s, got %s", item, res)
 		}
+	}
+	if !strings.Contains(res, "Summarize and consolidate the key technical facts from this partial batch without repeating boilerplate headers") {
+		t.Errorf("expected intermediate partial batch instruction in result, got %s", res)
 	}
 }
 
@@ -113,14 +160,15 @@ func TestCountRunes(t *testing.T) {
 
 func TestCalculateFileLimit(t *testing.T) {
 	// Below floor
-	limit1 := calculateFileLimit(100)
-	if limit1 <= 0 {
-		t.Fatalf("expected positive limit, got %d", limit1)
+	limit1 := calculateFileLimit(100, "system prompt")
+	if limit1 != defaultChunkOverlap*2 {
+		t.Fatalf("expected floor %d, got %d", defaultChunkOverlap*2, limit1)
 	}
 
-	// Above floor
-	limit2 := calculateFileLimit(8192)
-	if limit2 <= limit1 {
-		t.Fatalf("expected limit2 > limit1, got %d <= %d", limit2, limit1)
+	// Above floor, subtracting system prompt length
+	limit2 := calculateFileLimit(8192, "1234567890")
+	expected := 8192*maxCharsMultiplier - 10
+	if limit2 != expected {
+		t.Fatalf("expected %d, got %d", expected, limit2)
 	}
 }

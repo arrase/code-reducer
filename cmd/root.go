@@ -34,7 +34,7 @@ func init() {
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
 }
 
-func executeCommand(mode engine.Mode) error {
+func executeCommand(mode engine.RunMode) error {
 	repoRoot, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("failed to get current working directory: %w", err)
@@ -61,53 +61,34 @@ func executeCommand(mode engine.Mode) error {
 }
 
 func checkAndRunSetup(repoRoot string) error {
-	needsSetup := !config.ConfigExists(repoRoot)
-	isTTY := isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
-
-	if needsSetup {
-		if !isTTY {
-			return fmt.Errorf("configuration file %s does not exist in the current directory. Please run 'code-reducer setup' to configure the application", config.ConfigFileName)
-		}
-
-		if err := RunSetupFlow(repoRoot); err != nil {
-			return err
-		}
+	if config.ConfigExists(repoRoot) {
+		return nil
 	}
-	return nil
+	isTTY := isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
+	if !isTTY {
+		return fmt.Errorf("configuration file %s does not exist in the current directory. Please run 'code-reducer setup' to configure the application", config.ConfigFileName)
+	}
+	return RunSetupFlow(repoRoot)
 }
 
-func checkInitStatus(repoRoot, docsDir string, mode engine.Mode) error {
+func checkInitStatus(repoRoot, docsDir string, mode engine.RunMode) error {
 	hasInit := engine.IsInitialized(repoRoot, docsDir)
 
-	if mode == engine.ModeInit {
-		if hasInit {
-			return fmt.Errorf("the project has already been initialized. Please use 'code-reducer update' to refresh documentation")
-		}
-	} else if mode == engine.ModeUpdate {
-		if !hasInit {
-			return fmt.Errorf("the project has not been initialized yet. Please run 'code-reducer init' first")
-		}
+	if mode == engine.ModeInit && hasInit {
+		return fmt.Errorf("the project has already been initialized. Please use 'code-reducer update' to refresh documentation")
+	}
+	if mode == engine.ModeUpdate && !hasInit {
+		return fmt.Errorf("the project has not been initialized yet. Please run 'code-reducer init' first")
 	}
 
 	return nil
 }
 
-func runEngine(repoRoot string, cfg *config.Config, mode engine.Mode) error {
+func runEngine(repoRoot string, cfg *config.Config, mode engine.RunMode) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	runner := engine.NewRunner(cfg)
-	err := runner.Run(ctx, repoRoot, mode, func(ev engine.Event) {
-		if ev.Type == engine.EventStatus {
-			fmt.Println(ev.Message)
-		} else if ev.Type == engine.EventError {
-			fmt.Fprintf(os.Stderr, "Error: %s\n", ev.Message)
-		} else {
-			fmt.Println(ev.Message)
-		}
-	})
-
-	if err != nil {
+	if err := engine.Run(ctx, repoRoot, cfg, mode, func(msg string) { fmt.Println(msg) }); err != nil {
 		return fmt.Errorf("documentation run failed: %w", err)
 	}
 

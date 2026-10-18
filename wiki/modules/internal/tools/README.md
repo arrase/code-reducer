@@ -1,153 +1,87 @@
-# Module: `internal/tools` — Repository Analysis Utilities
+# Internal Tools Module
 
-## Responsibility & Data Flow
+## Module Responsibility
 
-The `internal/tools` package provides two complementary capabilities for analyzing a code repository's structure: (1) safe file I/O operations with TOCTOU protection and atomic writes, and (2) Git command abstraction for process execution. All functions operate against a local filesystem only; no network calls, database interactions, or external API invocations occur.
+This module provides safe filesystem operations and repository verification utilities for source code management workflows. It operates on a repository root (`repoRoot`) and resolves virtual paths through a security layer to prevent path traversal attacks. All operations are disk I/O only—no network, database, or external API calls.
 
-The module's entry point is the `repoRoot` string passed to every public function. Data flows from caller → `internal/tools` package functions → OS subsystems (POSIX file system for I/O operations, git binary via subprocess execution). No mutable state exists within any function scope; all operations are stateless and idempotent with respect to repository content.
+**Data Flow:**
+
+```
+caller → virtualPath → security.SafeResolve → filesystem path → os.* operations
+```
+
+All public functions accept a `repoRoot` parameter and resolve virtual paths before accessing the filesystem. Errors are propagated as return values; no panics occur.
 
 ---
 
-## File Operations (`file_tools.go`)
+## File Tools (`file_tools.go`)
 
-### Atomic Write — `WriteFileAtomic`
+### Safe File Access
 
-```go
-func WriteFileAtomic(targetPath string, data []byte, perm os.FileMode) error
-```
+**`FileExistsSafely(repoRoot string, virtualPath string) bool`**
 
-Writes binary data to `targetPath` using a temp-file + rename pattern that prevents partial or corrupt state if interrupted. The directory is created with mode `0755`. Returns an error on any failure; returns `nil` only after the final rename succeeds.
+Checks whether a file exists at the resolved filesystem path. Swallows `os.Stat` errors and returns `false` on any failure.
 
-**Sequence:**
-1. Create temporary file in same directory as target (ensures atomic rename semantics)
-2. Write data to temp file, sync before close for crash safety
-3. Close and flush via defer block with cleanup gated by success flag
-4. Apply `perm` mode via `os.Chmod`
-5. Atomic rename from temp path into final location
+**`ReadFileSafely(repoRoot string, virtualPath string) ([]byte, error)`**
 
-Errors at any step are wrapped; deferred cleanup runs on failure paths to prevent partial temp file leakage. No panic/recover anywhere in this function.
+Reads file contents from the resolved filesystem path. Returns the file data and an error. Swallows `os.Open` errors.
 
-### Safe Read — `ReadFileSafely`
+**`RemoveFileSafely(repoRoot string, virtualPath string) error`**
 
-```go
-func ReadFileSafely(repoRoot string, virtualPath string) ([]byte, error)
-```
+Removes a file at the resolved filesystem path. Ignores `os.IsNotExist` errors (file may already be absent). Propagates all other errors.
 
-Resolves the virtual path against `repoRoot`, then reads via `os.ReadFile`. Wraps any read failure with context ("failed to read file content"). The path resolution error from `security.SafeResolve` propagates unwrapped.
+### Atomic File Writes
 
-### Safe Write — `WriteFileSafely`
+**`WriteFileAtomic(targetPath string, data []byte, perm os.FileMode) error`**
 
-```go
-func WriteFileSafely(repoRoot string, virtualPath string, content []byte) error
-```
+Writes data to `targetPath` atomically: writes to a temporary file first, then renames to the target path. Wraps all sub-errors with `fmt.Errorf("failed to %s: %w", ...)`.
 
-Delegates to both `ReadFileSafely` (for path resolution) and `WriteFileAtomic`. Unwrapped `security.SafeResolve` error propagates through. Otherwise defers to `WriteFileAtomic`'s return value.
+**`WriteFileSafely(repoRoot string, virtualPath string, content []byte) error`**
 
-### Gitignore Integration (`file_tools.go`)
+Writes content to the resolved filesystem path. Uses atomic write semantics.
 
-#### Lockfile Recording — `EnsureGitignoreHasLockfile`
+### Gitignore Integration
 
-```go
-func EnsureGitignoreHasLockfile(repoRoot string) error
-```
+**`EnsureGitignoreHasLockfile(repoRoot string) error`**
 
-Ensures `.gitignore` contains a line matching `security.LockFileName`. Reads the existing file, appends the lock entry if absent (adding a newline before it when needed), and writes back atomically. Returns an error on read/write failures. Read errors from `.gitignore` (except `os.IsNotExist`) are wrapped with "error reading .gitignore". A non-existent `.gitignore` falls through to the write path, which will fail if the directory does not exist; no special handling for that intermediate state.
+Ensures `.code-reducer.lock` is included in `.gitignore` to prevent it from being committed.
 
-#### Loading — `LoadGitignore`
+**`LoadGitignore(repoRoot string) ([]string, error)`**
 
-```go
-func LoadGitignore(repoRoot string) ([]string, error)
-```
+Loads `.gitignore` patterns from the repository root. Returns the parsed patterns and an error.
 
-Reads `.gitignore` from `repoRoot`, strips comments (`#`) and blank lines, returns remaining patterns as `[]string`. Returns `nil, nil` when no `.gitignore` exists (treated as success). Any other read failure propagates unwrapped. Scanner errors appended via `scanner.Err()` at end — if a scan error occurs mid-stream but lines have already been populated, the partial result still gets returned to the caller.
+**`ShouldIgnoreFile(relPath string, gitIgnore *ignore.GitIgnore) bool`**
 
-#### Path Filtering — `ShouldIgnoreFile`
+Determines whether a relative path matches any loaded gitignore patterns. Uses `ignore.CompileIgnoreLines` for pattern parsing (in-memory, no external I/O).
 
-```go
-func ShouldIgnoreFile(relPath string, gitIgnore *ignore.GitIgnore) bool
-```
+### Global State
 
-Returns `true` when the given relative path should be ignored: matches via the provided GitIgnore object (if non-nil), contains a dot-prefixed component, or ends with `.egg-info`. No I/O; returns only boolean values. No error path.
-
-#### Discovery — `DiscoverCodeFiles`
-
-```go
-func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error)
-```
-
-Recursively walks `repoRoot` to collect relative file paths that pass ignore filtering. Skips directories whose names start with `.`, end with `.egg-info`, or match the compiled GitIgnore rules. Returns a list of valid relative paths and any walk error. Walk errors are wrapped with context (path + "error walking"). Relative-path computation failures are also wrapped. Directory entries matching ignore rules return `filepath.SkipDir`. Non-matching files append to the slice.
-
-**Walk sequence:**
-1. Iterate via `filepath.WalkDir` from `repoRoot`
-2. For each directory entry: skip if name starts with `.`, ends with `.egg-info`, or matches compiled GitIgnore patterns
-3. For each file entry: run both ignore-checks (compiled rules + dot-prefixed / `.egg-info` suffix), collect those that pass
-
----
-
-## Git Integration (`git_tools.go`)
-
-### Command Execution — `RunGit`
-
-```go
-func RunGit(repoRoot string, args ...string) (string, error)
-```
-
-Executes a git command in the specified repo directory with `--no-pager`. Returns trimmed stdout and any error.
-
-**Sequence:**
-1. Construct invocation: `git --no-pager <args>` in `repoRoot`
-2. Spawn child process via `exec.Command("git", ...)` — subprocess runs in `repoRoot`
-3. Capture stdout into `bytes.Buffer`, stderr separately buffered
-4. If `cmd.Run()` succeeds: trim whitespace from captured stdout, return as string result
-5. If `cmd.Run()` fails: trim whitespace from captured stderr, wrap with `fmt.Errorf("git command failed: %v, stderr: %s", err, trimmedErr)`
-
-The original error from `exec.Cmd` (e.g., `*exec.Error`, non-zero exit status) is embedded as `%v`; stderr text appended. No panic occurs on failure.
-
-### Repository Validation — `VerifyGitRepo`
-
-```go
-func VerifyGitRepo(repoRoot string) error
-```
-
-Checks that `git` is available and that `repoRoot` is inside a git working tree. Invokes `git rev-parse --is-inside-work-tree`. If the returned error is non-nil, wraps with: `fmt.Errorf("not a git repository (or any of the parent directories): %w", err)`. Uses `%w` for wrapError-compatible wrapping (recoverable by unwrappers).
-
----
-
-## Error Propagation Patterns
-
-### Disk I/O — File Operations
-
-All functions interact exclusively with the local filesystem via standard OS calls (`os.ReadFile`, `os.CreateTemp`, `os.MkdirAll`, `os.Rename`, `os.Chmod`, `os.Open`). No network, database, or external API interactions exist.
-
-| Function | I/O Type | External System |
+| Variable | Type | Mutability |
 |---|---|---|
-| `ReadFileSafely` | Disk read (`os.ReadFile`) | Local filesystem — target path resolved through `security.SafeResolve` before reading |
-| `WriteFileAtomic` | Disk write (create temp → sync → chmod → rename) | Local filesystem — writes to a `.tmp.*` intermediate file then renames into place |
-| `WriteFileSafely` | Disk read + disk write | Delegates path resolution and atomic write; no additional I/O beyond what the two sub-functions perform |
-| `EnsureGitignoreHasLockfile` | Disk read (`os.ReadFile`) + disk write (`WriteFileAtomic`) | Reads `.gitignore`, appends lockfile pattern, writes back atomically |
-| `LoadGitignore` | Disk read (`os.Open` + `bufio.Scanner`) | Reads `.gitignore`; returns `nil, nil` when file does not exist (no error) |
-| `DiscoverCodeFiles` | Disk walk (`filepath.WalkDir`) | Recursively walks the repository root; skips directories matching ignore rules or dot-prefixed names |
+| `skippedFileNames` | `map[string]bool` | Immutable after init |
+| `skippedExtensions` | `map[string]bool` | Immutable after init |
+| `skippedTestSuffixes` | `[]string` | Immutable after init |
 
-### Process I/O — Git Operations
-
-The only external interaction is subprocess execution against the installed `git` binary. Stdout captured to `bytes.Buffer`, stderr separately buffered. `cmd.Run()` executes the command and returns the exit error.
-
-| Function | System | Mechanism |
-|---|---|---|
-| `RunGit` | External process (git) | `exec.Command("git", ...)` via `os/exec` — spawns child git subprocess in `repoRoot`. Stdout captured to `bytes.Buffer`, stderr separately buffered. `cmd.Run()` executes the command and returns the exit error. |
-| `VerifyGitRepo` | External process (git) | `RunGit(repoRoot, "rev-parse", "--is-inside-work-tree")` — delegates to `RunGit` for execution; wraps non-nil return value with repository classification error |
+These maps are initialized once and never modified. They define the multi-layer file filtering rules applied during file discovery.
 
 ---
 
-## Concurrency & State
+## Git Tools (`git_tools.go`)
 
-No mutable state exists within any function scope. All operations are stateless and idempotent with respect to repository content. No goroutine spawning or concurrent access patterns observed in this module.
+### Repository Verification
 
----
+**`VerifyGitRepo(repoRoot string) error`**
 
-## Notable Observations
+Verifies whether `repoRoot` resides inside a git repository by executing `git rev-parse --is-inside-work-tree` in the specified directory.
 
-- **TOCTOU mitigation**: `WriteFileAtomic` uses a temp file + rename pattern, which avoids race conditions on the target path during writes
-- **Sync before close**: `tmpFile.Sync()` is called before `Close()`, ensuring data reaches stable storage before the handle is released — relevant for crash safety but adds latency per write
-- **Deferred cleanup in WriteFileAtomic**: On any error, `tmpFile.Close()` and `os.Remove(tmpName)` run via defer. This prevents partial temp file leakage on failure paths. The flag `success` gates whether to trigger cleanup
-- **No panic/recover anywhere** — all errors are returned as typed values. No `panic`, no bare recovery blocks observed in this module or its tests
+**Process Execution Details:**
+
+- Spawns `git` as a child process via `exec.Command("git", "--no-pager", "rev-parse", "--is-inside-work-tree")`
+- Redirects child process stderr to a `bytes.Buffer` for capture
+- Sets child process working directory to `repoRoot`
+
+**Error Handling:**
+
+- If `cmd.Run()` returns an error, the function wraps it with `fmt.Errorf` and returns the wrapped error (including captured stderr content)
+- If `cmd.Run()` returns nil, returns nil (success)
+- No panics or swallowed errors

@@ -1,7 +1,7 @@
 package tools
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,19 +16,80 @@ const (
 	defaultFilePerm = 0644
 )
 
+var (
+	skippedFileNames = map[string]bool{
+		"go.sum":                   true,
+		"package-lock.json":        true,
+		"pnpm-lock.yaml":           true,
+		"mkdocs.yml":               true,
+		"mkdocs.yaml":              true,
+		"sonar-project.properties": true,
+		"LICENSE":                  true,
+		"Makefile":                 true,
+		"Dockerfile":               true,
+	}
+
+	skippedExtensions = map[string]bool{
+		".lock":  true,
+		".md":    true,
+		".txt":   true,
+		".svg":   true,
+		".png":   true,
+		".jpg":   true,
+		".jpeg":  true,
+		".gif":   true,
+		".ico":   true,
+		".pdf":   true,
+		".bin":   true,
+		".exe":   true,
+		".so":    true,
+		".dylib": true,
+		".dll":   true,
+		".wasm":  true,
+		".pyc":   true,
+	}
+
+	skippedTestSuffixes = []string{
+		"_test.go",
+		".test.js",
+		".test.ts",
+		".test.tsx",
+		".spec.js",
+		".spec.ts",
+		".spec.tsx",
+		"_test.py",
+	}
+)
+
+// FileExistsSafely resolves the virtual path inside the repository and checks if the file exists.
+func FileExistsSafely(repoRoot, virtualPath string) bool {
+	safePath, err := security.SafeResolve(repoRoot, virtualPath)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(safePath)
+	return err == nil
+}
+
+// RemoveFileSafely resolves the virtual path inside the repository and removes the file, ignoring if it does not exist.
+func RemoveFileSafely(repoRoot, virtualPath string) error {
+	safePath, err := security.SafeResolve(repoRoot, virtualPath)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(safePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // ReadFileSafely resolves the virtual path inside the repository and reads the file content.
 func ReadFileSafely(repoRoot, virtualPath string) ([]byte, error) {
 	safePath, err := security.SafeResolve(repoRoot, virtualPath)
 	if err != nil {
 		return nil, err
 	}
-
-	content, err := os.ReadFile(safePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file content: %w", err)
-	}
-
-	return content, nil
+	return os.ReadFile(safePath)
 }
 
 // WriteFileAtomic writes data to a file atomically by first writing to a temporary file
@@ -115,26 +176,23 @@ func EnsureGitignoreHasLockfile(repoRoot string) error {
 
 // LoadGitignore reads the .gitignore file from repoRoot and returns its active ignore patterns.
 func LoadGitignore(repoRoot string) ([]string, error) {
-	gitignorePath := filepath.Join(repoRoot, ".gitignore")
-	file, err := os.Open(gitignorePath)
+	data, err := ReadFileSafely(repoRoot, ".gitignore")
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil // No .gitignore file is not an error
+			return nil, nil
 		}
 		return nil, err
 	}
-	defer file.Close()
 
 	var patterns []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		patterns = append(patterns, line)
 	}
-	return patterns, scanner.Err()
+	return patterns, nil
 }
 
 // ShouldIgnoreFile checks if a file (specified by relative path) is ignored.
@@ -142,7 +200,7 @@ func ShouldIgnoreFile(relPath string, gitIgnore *ignore.GitIgnore) bool {
 	slashRelPath := filepath.ToSlash(relPath)
 
 	// 1. Check user-defined ignores (config + gitignore)
-	if gitIgnore != nil && gitIgnore.MatchesPath(slashRelPath) {
+	if gitIgnore.MatchesPath(slashRelPath) {
 		return true
 	}
 
@@ -155,6 +213,33 @@ func ShouldIgnoreFile(relPath string, gitIgnore *ignore.GitIgnore) bool {
 	}
 
 	return false
+}
+
+func shouldSkipCodeFile(name string) bool {
+	if skippedFileNames[name] || skippedExtensions[strings.ToLower(filepath.Ext(name))] {
+		return true
+	}
+	if strings.HasPrefix(name, "test_") && strings.HasSuffix(name, ".py") {
+		return true
+	}
+	for _, suffix := range skippedTestSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBinaryFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	var buf [512]byte
+	n, _ := f.Read(buf[:])
+	return bytes.IndexByte(buf[:n], 0) != -1
 }
 
 // DiscoverCodeFiles recursively walks the codebase to find high-signal source files.
@@ -180,14 +265,13 @@ func DiscoverCodeFiles(repoRoot string, ignores []string) ([]string, error) {
 		slashRel := filepath.ToSlash(rel)
 
 		if d.IsDir() {
-			name := d.Name()
-			if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".egg-info") || (gitIgnore != nil && gitIgnore.MatchesPath(slashRel)) {
+			if ShouldIgnoreFile(slashRel, gitIgnore) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 
-		if ShouldIgnoreFile(slashRel, gitIgnore) {
+		if !d.Type().IsRegular() || ShouldIgnoreFile(slashRel, gitIgnore) || shouldSkipCodeFile(d.Name()) || isBinaryFile(path) {
 			return nil
 		}
 

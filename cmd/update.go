@@ -7,13 +7,10 @@ import (
 
 var updateCmd = &cobra.Command{
 	Use:   "update",
-	Short: "Update project documentation incrementally",
+	Short: "Incrementally update documentation for modified files using cached SHA-256 hashes.",
 	Long:  `Scan changed files since the last documented commit and update the wiki pages.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := executeCommand(engine.ModeUpdate); err != nil {
-			return err
-		}
-		return nil
+		return executeCommand(engine.ModeUpdate)
 	},
 }
 

@@ -4,16 +4,19 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/arrase/code-reducer/internal/config"
 )
 
 type mockLLMCaller struct {
-	numCtx int
+	numCtx      int
+	userPrompts []string
 }
 
-func (m *mockLLMCaller) CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error) {
+func (m *mockLLMCaller) CallLLM(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	m.userPrompts = append(m.userPrompts, userPrompt)
 	return "Mocked LLM summary response", nil
 }
 
@@ -55,7 +58,7 @@ func TestSynthesizeNode(t *testing.T) {
 		cache:               cache,
 		affectedDirs:        affectedDirs,
 		precalculatedHashes: hashes,
-		logEvent:            func(t EventType, msg string) {},
+		onStatus:            func(string) {},
 	}
 
 	// 1. Empty node
@@ -93,5 +96,121 @@ func TestSynthesizeNode(t *testing.T) {
 	}
 	if res == "" {
 		t.Fatalf("expected non-empty synthesis result")
+	}
+	if !IsInitialized(repoRoot, docsDir) {
+		t.Fatalf("expected metadata cache to be saved incrementally")
+	}
+}
+
+func TestExtractFileFactsMultiChunkKVCacheOrder(t *testing.T) {
+	repoRoot := t.TempDir()
+	sampleFile := "large.go"
+	content := strings.Repeat("func partA() {}\n", 60) + strings.Repeat("func partB() {}\n", 60)
+	if err := os.WriteFile(filepath.Join(repoRoot, sampleFile), []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write sample file: %v", err)
+	}
+
+	mock := &mockLLMCaller{numCtx: 500}
+	cfg := &config.Config{
+		SystemPrompt:    "sys",
+		ExtractionSteps: config.DefaultExtractionSteps,
+	}
+	p := &pipelineState{
+		client:              mock,
+		repoRoot:            repoRoot,
+		cfg:                 cfg,
+		cache:               newEmptyCache(),
+		precalculatedHashes: map[string]string{sampleFile: "hash"},
+		onStatus:            func(string) {},
+	}
+
+	_, err := extractFileFacts(context.Background(), p, sampleFile, []string{sampleFile})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	numSteps := len(cfg.ExtractionSteps)
+	if len(mock.userPrompts) < numSteps*2 {
+		t.Fatalf("expected at least %d prompts for multi-chunk extraction, got %d", numSteps*2, len(mock.userPrompts))
+	}
+
+	// Verify all 4 extraction steps for chunk 0 run consecutively with the exact same code prefix
+	prefixEnd := strings.Index(mock.userPrompts[0], "\n---\nTask (")
+	if prefixEnd == -1 {
+		t.Fatalf("unexpected prompt format: %s", mock.userPrompts[0])
+	}
+	chunk0Prefix := mock.userPrompts[0][:prefixEnd]
+	for i := 1; i < numSteps; i++ {
+		if !strings.HasPrefix(mock.userPrompts[i], chunk0Prefix) {
+			t.Errorf("step %d did not share chunk 0 prefix for Ollama KV cache reuse", i)
+		}
+	}
+}
+
+type scriptedLLMCaller struct {
+	numCtx    int
+	responses []string
+	calls     int
+}
+
+func (s *scriptedLLMCaller) CallLLM(_ context.Context, _, _ string) (string, error) {
+	idx := s.calls
+	s.calls++
+	if idx < len(s.responses) {
+		return s.responses[idx], nil
+	}
+	return "None", nil
+}
+
+func (s *scriptedLLMCaller) NumCtx() int {
+	return s.numCtx
+}
+
+func TestExtractFileFactsNoneShortCircuit(t *testing.T) {
+	repoRoot := t.TempDir()
+	sampleFile := "stateless.go"
+	content := strings.Repeat("func helper() {}\n", 60) + strings.Repeat("func helper2() {}\n", 60)
+	if err := os.WriteFile(filepath.Join(repoRoot, sampleFile), []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write sample file: %v", err)
+	}
+
+	cfg := &config.Config{
+		SystemPrompt: "sys",
+		ExtractionSteps: []config.ExtractionStep{
+			{Name: "API_SIGNATURES", Prompt: "extract api"},
+			{Name: "STATE_AND_CONCURRENCY", Prompt: "extract state"},
+		},
+	}
+
+	// 2 chunks x 2 steps = 4 extraction calls:
+	// Chunk 0: API_SIGNATURES returns "- func Helper()", STATE_AND_CONCURRENCY returns "None."
+	// Chunk 1: API_SIGNATURES returns "- None", STATE_AND_CONCURRENCY returns "None"
+	// Neither step should trigger a consolidation LLM call (total calls must be 4, not 5 or 6).
+	caller := &scriptedLLMCaller{
+		numCtx:    500,
+		responses: []string{"- func Helper()", "None.", "- None", "None"},
+	}
+
+	p := &pipelineState{
+		client:              caller,
+		repoRoot:            repoRoot,
+		cfg:                 cfg,
+		cache:               newEmptyCache(),
+		precalculatedHashes: map[string]string{sampleFile: "hash"},
+		onStatus:            func(string) {},
+	}
+
+	facts, err := extractFileFacts(context.Background(), p, sampleFile, []string{sampleFile})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if caller.calls != 4 {
+		t.Fatalf("expected exactly 4 extraction LLM calls (0 consolidation calls), got %d", caller.calls)
+	}
+	if strings.Contains(facts, "STATE_AND_CONCURRENCY") || strings.Contains(facts, "None") {
+		t.Errorf("expected None step to be omitted from facts, got:\n%s", facts)
+	}
+	if !strings.Contains(facts, "#### [API_SIGNATURES]\n- func Helper()") {
+		t.Errorf("expected API_SIGNATURES fact to be preserved, got:\n%s", facts)
 	}
 }

@@ -32,47 +32,10 @@ func init() {
 
 func loadInitialSetupConfig(repoRoot string) *config.Config {
 	cfg, err := config.LoadConfig(repoRoot)
-	if err != nil || cfg == nil {
-		return &config.Config{
-			ModelID:                     config.OllamaDefaultModelID,
-			OllamaBaseURL:               config.OllamaDefaultBaseURL,
-			OllamaNumCtx:                config.OllamaDefaultNumCtx,
-			DocsDir:                     config.DefaultDocsDir,
-			ExtractionSteps:             config.DefaultExtractionSteps,
-			SystemPrompt:                config.DefaultSystemPrompt,
-			ModuleSynthesisPrompt:       config.DefaultModuleSynthesisPrompt,
-			ArchitecturePrompt:          config.DefaultArchitecturePrompt,
-			FileFactConsolidationPrompt: config.DefaultFileFactConsolidationPrompt,
-		}
+	if err != nil {
+		cfg = &config.Config{}
 	}
-
-	if cfg.ModelID == "" {
-		cfg.ModelID = config.OllamaDefaultModelID
-	}
-	if cfg.OllamaBaseURL == "" {
-		cfg.OllamaBaseURL = config.OllamaDefaultBaseURL
-	}
-	if cfg.OllamaNumCtx <= 0 {
-		cfg.OllamaNumCtx = config.OllamaDefaultNumCtx
-	}
-	if cfg.DocsDir == "" {
-		cfg.DocsDir = config.DefaultDocsDir
-	}
-	if len(cfg.ExtractionSteps) == 0 {
-		cfg.ExtractionSteps = config.DefaultExtractionSteps
-	}
-	if cfg.SystemPrompt == "" {
-		cfg.SystemPrompt = config.DefaultSystemPrompt
-	}
-	if cfg.ModuleSynthesisPrompt == "" {
-		cfg.ModuleSynthesisPrompt = config.DefaultModuleSynthesisPrompt
-	}
-	if cfg.ArchitecturePrompt == "" {
-		cfg.ArchitecturePrompt = config.DefaultArchitecturePrompt
-	}
-	if cfg.FileFactConsolidationPrompt == "" {
-		cfg.FileFactConsolidationPrompt = config.DefaultFileFactConsolidationPrompt
-	}
+	config.ApplyDefaults(cfg)
 	return cfg
 }
 
@@ -88,20 +51,11 @@ func promptContextSize(reader *bufio.Reader, defaultVal int) (int, error) {
 }
 
 func promptIgnores(reader *bufio.Reader, defaultIgnores []string) ([]string, error) {
-	userInputIgnores, ignoresModified, err := promptStringList(reader, "Enter directories, files, or patterns to ignore (comma-separated)", defaultIgnores)
+	ignores, err := promptStringList(reader, "Enter directories, files, or patterns to ignore (comma-separated)", defaultIgnores)
 	if err != nil {
 		return nil, fmt.Errorf("error reading ignores: %w", err)
 	}
-	if !ignoresModified {
-		if defaultIgnores != nil {
-			return defaultIgnores, nil
-		}
-		return []string{}, nil
-	}
-	if len(userInputIgnores) > 0 {
-		return userInputIgnores, nil
-	}
-	return []string{}, nil
+	return ignores, nil
 }
 
 // RunSetupFlow guides the user through setting up the configuration file.
@@ -139,64 +93,37 @@ func runSetupFlowWithReader(reader *bufio.Reader, repoRoot string) error {
 		return fmt.Errorf("error reading docs dir: %w", err)
 	}
 
-	newCfg := &config.Config{
-		ModelID:                     modelInput,
-		OllamaBaseURL:               urlInput,
-		OllamaNumCtx:                numCtx,
-		DocsDir:                     docsDirInput,
-		ExtractionSteps:             current.ExtractionSteps,
-		Ignore:                      ignores,
-		SystemPrompt:                current.SystemPrompt,
-		ModuleSynthesisPrompt:       current.ModuleSynthesisPrompt,
-		ArchitecturePrompt:          current.ArchitecturePrompt,
-		FileFactConsolidationPrompt: current.FileFactConsolidationPrompt,
-	}
+	current.ModelID = modelInput
+	current.OllamaBaseURL = urlInput
+	current.OllamaNumCtx = numCtx
+	current.DocsDir = docsDirInput
+	current.Ignore = ignores
 
-	err = config.SaveConfig(repoRoot, newCfg)
-	if err != nil {
+	if err := config.SaveConfig(repoRoot, current); err != nil {
 		return fmt.Errorf("error saving configuration: %w", err)
 	}
 	fmt.Printf("Configuration successfully saved to local %s file.\n", config.ConfigFileName)
 	return nil
 }
 
-func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) ([]string, bool, error) {
-	var result []string
-	existingStr := ""
-	if len(existingList) > 0 {
-		existingStr = strings.Join(existingList, ", ")
-	}
-
-	if existingStr == "" {
-		fmt.Printf("%s: ", promptMsg)
-	} else {
-		fmt.Printf("%s [%s]: ", promptMsg, existingStr)
-	}
-
-	input, err := reader.ReadString('\n')
+func promptStringList(reader *bufio.Reader, promptMsg string, existingList []string) ([]string, error) {
+	input, err := promptString(reader, promptMsg, strings.Join(existingList, ", "))
 	if err != nil {
-		return nil, false, err
-	}
-
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return existingList, false, nil
+		return nil, err
 	}
 
 	lowerInput := strings.ToLower(input)
-	if lowerInput == "clear" || lowerInput == "none" {
-		return []string{}, true, nil
+	if input == "" || lowerInput == "clear" || lowerInput == "none" {
+		return []string{}, nil
 	}
 
-	parts := strings.Split(input, ",")
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
+	var result []string
+	for _, part := range strings.Split(input, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
 			result = append(result, trimmed)
 		}
 	}
-
-	return result, true, nil
+	return result, nil
 }
 
 func promptString(reader *bufio.Reader, promptMsg, existingVal string) (string, error) {

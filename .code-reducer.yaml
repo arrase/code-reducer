@@ -1,4 +1,4 @@
-model_id: gemma4:26b-a4b-it-qat
+model_id: ornith:9b
 ollama_base_url: http://localhost:11434
 ollama_num_ctx: 20000
 docs_dir: wiki
@@ -47,6 +47,9 @@ ignore:
   - go.mod
   - screenshots
   - examples
-  - docs
+  - gh-pages
   - LICENSE
   - AGENTS.md
+  - mkdocs.yml
+  - sonar-project.properties
+

@@ -8,6 +8,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
+)
+
+const (
+	defaultHTTPTimeout = 10 * time.Minute
+	maxErrorBodyBytes  = 1024
 )
 
 type Message struct {
@@ -16,7 +22,7 @@ type Message struct {
 }
 
 type llmCaller interface {
-	CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error)
+	CallLLM(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 	NumCtx() int
 }
 
@@ -24,14 +30,16 @@ type llmClient struct {
 	modelID    string
 	baseURL    string
 	numCtx     int
+	onStatus   StatusFunc
 	httpClient *http.Client
 }
 
-func newLLMClient(modelID, baseURL string, numCtx int) *llmClient {
+func newLLMClient(modelID, baseURL string, numCtx int, onStatus StatusFunc) *llmClient {
 	return &llmClient{
 		modelID:    modelID,
 		baseURL:    baseURL,
 		numCtx:     numCtx,
+		onStatus:   onStatus,
 		httpClient: &http.Client{Timeout: defaultHTTPTimeout},
 	}
 }
@@ -45,53 +53,49 @@ type ollamaRequest struct {
 	Model    string         `json:"model"`
 	Messages []Message      `json:"messages"`
 	Stream   bool           `json:"stream"`
-	Format   string         `json:"format,omitempty"`
 	Options  *ollamaOptions `json:"options,omitempty"`
 }
 
 type ollamaOptions struct {
-	NumCtx int `json:"num_ctx,omitempty"`
+	NumCtx      int     `json:"num_ctx,omitempty"`
+	Temperature float64 `json:"temperature"`
 }
 
 type ollamaResponse struct {
-	Message Message `json:"message"`
+	Message    Message `json:"message"`
+	DoneReason string  `json:"done_reason"`
 }
 
-// prepareOllamaRequest creates and serializes the HTTP request for the Ollama api/chat endpoint.
-func (c *llmClient) prepareOllamaRequest(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (*http.Request, error) {
-	url := strings.TrimSuffix(c.baseURL, "/") + "/api/chat"
-
+// prepareOllamaRequest serializes the payload for the Ollama api/chat endpoint.
+func (c *llmClient) prepareOllamaRequest(systemPrompt, userPrompt string) ([]byte, error) {
 	reqBody := ollamaRequest{
-		Model:    c.modelID,
-		Messages: append([]Message{{Role: "system", Content: systemPrompt}}, messages...),
-		Stream:   false,
-		Options:  &ollamaOptions{NumCtx: c.numCtx},
+		Model: c.modelID,
+		Messages: []Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Stream: false,
+		Options: &ollamaOptions{
+			NumCtx:      c.numCtx,
+			Temperature: 0.1,
+		},
 	}
-	if jsonFormat {
-		reqBody.Format = "json"
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	return req, nil
+	return json.Marshal(reqBody)
 }
 
 // CallLLM invokes the LLM via HTTP failing fast without retries.
-func (c *llmClient) CallLLM(ctx context.Context, systemPrompt string, messages []Message, jsonFormat bool) (string, error) {
+func (c *llmClient) CallLLM(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	bodyBytes, err := c.prepareOllamaRequest(systemPrompt, userPrompt)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
 
-	req, err := c.prepareOllamaRequest(ctx, systemPrompt, messages, jsonFormat)
+	url := strings.TrimSuffix(c.baseURL, "/") + "/api/chat"
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", err
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -108,6 +112,9 @@ func (c *llmClient) CallLLM(ctx context.Context, systemPrompt string, messages [
 		var result ollamaResponse
 		if err := json.Unmarshal(respData, &result); err != nil {
 			return "", fmt.Errorf("failed to parse response: %w", err)
+		}
+		if result.DoneReason == "length" {
+			c.onStatus("Warning: LLM response was truncated due to context length limit (done_reason: length)")
 		}
 		return result.Message.Content, nil
 	}

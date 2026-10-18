@@ -1,57 +1,83 @@
-# Code-Reducer Technical Overview
+# Quickstart
 
-## System Architecture
+## Prerequisites
 
-Code-Reducer is a command-line orchestration tool that transforms source code into structured documentation using a Map-Reduce synthesis pattern. The system operates within a local boundary, interacting with the local filesystem and local Large Language Models (LLMs) via the `api/chat` protocol.
+- **Ollama** — default LLM backend. Default base URL is `http://localhost:11434` and default model is `ornith:9b`. Override via `OLLAMA_BASE_URL` or `CODE_REDUCER_MODEL_ID` environment variables.
+- **Git** — the tool verifies the working directory is inside a git repo on first run.
+- **Go** toolchain — the project is a Go module.
 
-### Module Interaction & Data Flow
+## Installation
 
-The system architecture is composed of three primary internal layers and external configuration files:
+```bash
+git clone <repo-url>
+cd <repo>
+go build -o code-reducer ./cmd
+```
 
-#### 1. Orchestration Layer (`cmd`)
-Acts as the entry point and lifecycle controller.
-*   **Validation**: Performs environment checks (git repository existence and working directory identification).
-*   **State Management**: Evaluates `engine.IsInitialized` to determine if the operation is a full `init` or an incremental `update`.
-*   **Dispatch**: Validates the environment and passes the `config.Config` to the `engine` package.
+Place the binary in your project root or a PATH directory.
 
-#### 2. Configuration Layer (`internal/config`)
-Manages hierarchical parameter resolution with the following precedence: 
-`CLI flags` $\rightarrow$ `Environment variables` $\rightarrow$ `.code-reducer.yaml` $\rightarrow$ `System defaults`.
-*   **Key Parameters**: `ModelID`, `OllamaBaseURL`, `OllamaNumCtx`, and `DocsDir`.
-*   **Extraction Steps**: Defines `ExtractionStep` objects mapping specific phases of the synthesis pipeline to prompt templates.
+## CLI Commands
 
-#### 3. Map-Reduce Engine (`internal/engine`)
-The core computational component responsible for hierarchical content reduction.
-*   **Discovery & Mapping**: Files are mapped into a `DirNode` tree structure.
-*   **Change Detection**: Uses `MetadataCache` to compare current file SHA256 fingerprints against previous states. Changes propagate "Affected" status up the `DirNode` tree.
-*   **Hierarchical Synthesis**:
-    *   **Leaf Processing**: Uses `Chunking` for segments exceeding the context window (using a `0.75` `contextWindowAllocRatio`).
-    *   **Recursion**: If a segment is oversized, recursive reduction is applied. Recursion terminates if the output size is $\ge$ 95% of the input.
-    *   **Aggregation**: Summaries are aggregated from file-level $\rightarrow$ module-level $\rightarrow$ directory-level.
+| Command | Purpose |
+|---------|---------|
+| `setup` | Interactive wizard that writes `.code-reducer.yaml` (model ID, base URL, context size, ignore patterns, docs directory). |
+| `init` | First-time documentation build — scans the repo and generates the initial wiki pages. |
+| `update` | Incremental regeneration — detects files changed since the last documented commit and rewrites affected wiki pages. |
 
-### External Integration
+Persistent flags (`--model-id`, `--num-ctx`) are available on the root command and override config-file values.
 
-*   **Documentation Rendering**: `mkdocs.yml` facilitates the deployment of the generated wiki, pulling frontend assets from `cdn.jsdelivr.net` and `cdnjs.cloudflare.com`.
-*   **Static Analysis**: `sonar-project.properties` manages the exclusion of test files and dependencies during analysis and consumes `coverage.out` reports.
+## Configuration
 
----
+Configuration is resolved in priority order: **CLI flag → environment variable → `.code-reducer.yaml` file**.
 
-## Quickstart Reference
+### Environment Variables
 
-### Execution Modes
+| Variable | Default | Purpose |
+|---|---|---|
+| `CODE_REDUCER_MODEL_ID` | `ornith:9b` | LLM model identifier |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API endpoint |
+| `OLLAMA_NUM_CTX` | `8192` | Context window size |
 
-| Mode | Command | Purpose |
-| :--- | :--- | :--- |
-| **Initialization** | `init` | Performs a full repository scan and generates initial Markdown documentation. |
-| **Incremental** | `update` | Analyzes only files where SHA256 fingerprints have changed relative to the `MetadataCache`. |
+### CLI Flags
 
-### Configuration Requirements
+| Flag | Purpose |
+|---|---|
+| `--model-id` | Override LLM model ID |
+| `--num-ctx` | Override context window size |
 
-To function, the environment must provide:
-1.  **Ollama Endpoint**: A running local LLM instance accessible via the configured `OllamaBaseURL`.
-2.  **Valid Model**: A `ModelID` configured in the `Config` struct.
-3.  **Context Window**: An integer `OllamaNumCtx` greater than zero.
+### Config File
 
-### Data Persistence
-*   **Documentation**: Synthesized Markdown files are written to the path defined in `DocsDir`.
-*   **State**: `MetadataCache` (JSON) is maintained in the `docsDir` to enable incremental updates.
+`.code-reducer.yaml` (mode `0600`) is created on first run. It stores resolved configuration including model ID, base URL, context size, and custom prompts.
+
+## Package Structure
+
+```
+.
+├── cmd/              # CLI entry point (init, setup, update)
+├── internal/
+│   ├── config/       # Configuration loading, resolution, persistence
+│   ├── engine/       # Documentation synthesis pipeline
+│   ├── security/     # Path traversal prevention, process locking
+│   └── tools/        # Safe filesystem and git utilities
+└── wiki/             # Generated documentation output (default)
+```
+
+## Key Files
+
+| File | Purpose |
+|---|---|
+| `.code-reducer.yaml` | Persisted configuration |
+| `.metadata.json` | Engine cache (file hashes, module mappings) |
+| `.code-reducer.lock` | Process lock file (auto-added to `.gitignore`) |
+| `AGENTS.md` | Agent guidelines (updated on init) |
+| `architecture.md` | Global architecture document |
+| `quickstart.md` | Developer quickstart guide |
+| `modules/<path>.md` | Per-module summaries |
+
+## Error Handling
+
+- **Lock contention**: `ErrLockHeld` returned if another process holds the lock.
+- **Path traversal**: `ErrPathTraversal` returned if input path escapes repo root.
+- **LLM failures**: Propagated as wrapped errors.
+- **File read failures**: Swallowed and logged via status callback.
+- **Git operations**: Errors wrapped and returned (no panics).

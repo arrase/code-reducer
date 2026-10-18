@@ -10,10 +10,7 @@ var initCmd = &cobra.Command{
 	Short: "Initialize project documentation",
 	Long:  `Scan the repository and build the initial set of wiki markdown pages.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := executeCommand(engine.ModeInit); err != nil {
-			return err
-		}
-		return nil
+		return executeCommand(engine.ModeInit)
 	},
 }
 
