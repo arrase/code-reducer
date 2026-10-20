@@ -11,11 +11,13 @@ import (
 )
 
 type mockLLMCaller struct {
-	numCtx      int
-	userPrompts []string
+	numCtx        int
+	systemPrompts []string
+	userPrompts   []string
 }
 
 func (m *mockLLMCaller) CallLLM(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	m.systemPrompts = append(m.systemPrompts, systemPrompt)
 	m.userPrompts = append(m.userPrompts, userPrompt)
 	return "Mocked LLM summary response", nil
 }
@@ -99,6 +101,62 @@ func TestSynthesizeNode(t *testing.T) {
 	}
 	if !IsInitialized(repoRoot, docsDir) {
 		t.Fatalf("expected metadata cache to be saved incrementally")
+	}
+
+	// Verify provenance header is written to disk while cache.Modules stores clean summary
+	rootDocBytes, err := os.ReadFile(filepath.Join(repoRoot, docsDir, "modules", "README.md"))
+	if err != nil {
+		t.Fatalf("failed to read root module doc: %v", err)
+	}
+	wantHeader := "> **Module:** `.` | **Source Files:** `main.go`\n\nMocked LLM summary response"
+	if string(rootDocBytes) != wantHeader {
+		t.Errorf("expected module doc with provenance header %q, got %q", wantHeader, string(rootDocBytes))
+	}
+	if cache.Modules["."] != "Mocked LLM summary response" {
+		t.Errorf("expected cache.Modules[\".\"] to hold clean summary without provenance header, got %q", cache.Modules["."])
+	}
+}
+
+func TestLanguageInstructionWiring(t *testing.T) {
+	repoRoot := t.TempDir()
+	sampleFile := "main.go"
+	if err := os.WriteFile(filepath.Join(repoRoot, sampleFile), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatalf("failed to write sample file: %v", err)
+	}
+
+	mock := &mockLLMCaller{numCtx: 2048}
+	cfg := &config.Config{
+		DocsDir:               "docs",
+		Language:              "Spanish",
+		SystemPrompt:          config.DefaultSystemPrompt,
+		ModuleSynthesisPrompt: config.DefaultModuleSynthesisPrompt,
+		ExtractionSteps: []config.ExtractionStep{
+			{Name: "API_SIGNATURES", Prompt: "extract api"},
+		},
+	}
+
+	p := &pipelineState{
+		client:              mock,
+		repoRoot:            repoRoot,
+		cfg:                 cfg,
+		cache:               newEmptyCache(),
+		affectedDirs:        map[string]bool{".": true},
+		precalculatedHashes: map[string]string{sampleFile: "hash1"},
+		onStatus:            func(string) {},
+	}
+
+	rootNode := &DirNode{Path: ".", Files: []string{sampleFile}, Children: make(map[string]*DirNode)}
+	if _, err := synthesizeNode(context.Background(), p, rootNode); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(mock.systemPrompts) < 2 {
+		t.Fatalf("expected at least 2 LLM calls (extraction + synthesis), got %d", len(mock.systemPrompts))
+	}
+	for i, sp := range mock.systemPrompts {
+		if !strings.Contains(sp, "Write all documentation prose, headings, and table descriptions in Spanish.") {
+			t.Errorf("call %d system prompt missing Spanish language instruction:\n%s", i, sp)
+		}
 	}
 }
 

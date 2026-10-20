@@ -72,7 +72,7 @@ chmod +x code-reducer
 
 ## Quick Start Step-by-Step Walkthrough
 
-Follow these three steps to document a repository using Code-Reducer:
+Follow these four steps to document and query a repository using Code-Reducer:
 
 ### Step 1: Run Configuration Setup (`setup`)
 
@@ -82,17 +82,17 @@ Navigate to your target repository root and run the setup wizard:
 code-reducer setup
 ```
 
-The wizard will prompt you for model parameters, context limits, and ignored patterns, generating a `.code-reducer.yaml` configuration file.
+The wizard will prompt you for model parameters, context limits, ignored patterns, documentation folder, and output language, generating a `.code-reducer.yaml` configuration file.
 
 ### Step 2: Initialize Documentation (`init`)
 
-Perform the initial repository scan and Map-Reduce synthesis:
+Perform the initial repository scan, Map-Reduce synthesis, and deterministic wiki finalization:
 
 ```bash
 code-reducer init
 ```
 
-Code-Reducer will scan source files, build module briefings under `wiki/modules/`, write system blueprints (`wiki/architecture.md`, `wiki/quickstart.md`), create the metadata cache (`wiki/.metadata.json`), and generate `AGENTS.md`.
+Code-Reducer will scan source files, build module briefings under `wiki/modules/`, write system blueprints (`wiki/architecture.md`, `wiki/quickstart.md`), generate the navigation index (`wiki/index.md`), create the metadata cache (`wiki/.metadata.json`), and update `AGENTS.md`.
 
 ### Step 3: Keep Docs Updated (`update`)
 
@@ -102,4 +102,17 @@ Whenever files are added, modified, or deleted in your repository, run:
 code-reducer update
 ```
 
-Code-Reducer will calculate file SHA256 hashes, compare them against `.metadata.json`, and incrementally rebuild only changed files and impacted parent modules.
+Code-Reducer will calculate file SHA256 hashes, compare extracted facts against `.metadata.json`, short-circuit unchanged modules or global docs, and incrementally rebuild only impacted pages.
+
+### Step 4: Search & Read Documentation (`search` & `read`)
+
+Query the generated wiki sections from the terminal using BM25 search and section reading:
+
+```bash
+# Search sections ranked by BM25 with optional source-path boosting
+code-reducer search "authentication flow" --path internal/auth --limit 5
+
+# Read a full page or a specific heading section returned by search
+code-reducer read architecture.md
+code-reducer read modules/internal/engine/README.md#synthesis-pipeline
+```

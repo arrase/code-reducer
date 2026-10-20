@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,7 +14,11 @@ import (
 	"github.com/arrase/code-reducer/internal/tools"
 )
 
-const agentsFileName = "AGENTS.md"
+const (
+	agentsFileName   = "AGENTS.md"
+	agentsBlockStart = "<!-- CODE-REDUCER:START -->"
+	agentsBlockEnd   = "<!-- CODE-REDUCER:END -->"
+)
 
 // RunMode represents the operation mode of the documentation pipeline.
 type RunMode string
@@ -84,14 +89,34 @@ func (o *orchestrator) generateDoc(ctx context.Context, repoRoot, relPath, sysPr
 }
 
 func buildProjectContextItems(rootSum string, tree *DirNode, cache *MetadataCache) []string {
+	nodesByPath := collectTreeNodes(tree)
 	var allDirs []string
-	for d := range collectTreeDirs(tree) {
+	for d := range nodesByPath {
 		allDirs = append(allDirs, d)
 	}
 	sort.Strings(allDirs)
 
+	var mapBuilder strings.Builder
+	mapBuilder.WriteString("## Project Directories & Module Documentation Map\n")
+	mapBuilder.WriteString(strings.Join(allDirs, ", ") + "\n")
+	for _, dirPath := range allDirs {
+		if cache.Modules[dirPath] == "" {
+			continue
+		}
+		node := nodesByPath[dirPath]
+		docPath := filepath.ToSlash(filepath.Join("modules", toSafeMarkdownFilename(dirPath)))
+		files := make([]string, len(node.Files))
+		copy(files, node.Files)
+		sort.Strings(files)
+		if len(files) > 0 {
+			mapBuilder.WriteString(fmt.Sprintf("- `%s` -> `%s` (files: %s)\n", dirPath, docPath, strings.Join(files, ", ")))
+		} else {
+			mapBuilder.WriteString(fmt.Sprintf("- `%s` -> `%s`\n", dirPath, docPath))
+		}
+	}
+
 	items := []string{
-		fmt.Sprintf("## Project Directories\n%s", strings.Join(allDirs, ", ")),
+		strings.TrimSpace(mapBuilder.String()),
 		fmt.Sprintf("## Root Module Summary\n%s", rootSum),
 	}
 
@@ -112,18 +137,19 @@ func buildProjectContextItems(rootSum string, tree *DirNode, cache *MetadataCach
 
 func (o *orchestrator) GenerateStandardDocs(ctx context.Context, repoRoot, docsDir, rootSum string, tree *DirNode, cache *MetadataCache, cfg *config.Config, onStatus StatusFunc) error {
 	contextItems := buildProjectContextItems(rootSum, tree, cache)
+	langInstr := config.LanguageInstruction(cfg.Language)
 
 	onStatus("Step 3: Global Architecture Synthesis...")
 	archPath := filepath.Join(docsDir, "architecture.md")
 	archHeader := fmt.Sprintf("Write the global architecture overview (%s) based on the project context.", archPath)
-	if err := o.generateDoc(ctx, repoRoot, archPath, cfg.SystemPrompt+"\n"+cfg.ArchitecturePrompt, archHeader, contextItems, onStatus); err != nil {
+	if err := o.generateDoc(ctx, repoRoot, archPath, cfg.SystemPrompt+"\n"+cfg.ArchitecturePrompt+langInstr, archHeader, contextItems, onStatus); err != nil {
 		return err
 	}
 
 	onStatus("Step 4: Generating Quickstart...")
 	qsPath := filepath.Join(docsDir, "quickstart.md")
 	qsHeader := fmt.Sprintf("Write the %s page based on the project context.", qsPath)
-	return o.generateDoc(ctx, repoRoot, qsPath, cfg.SystemPrompt+"\n"+cfg.QuickstartPrompt, qsHeader, contextItems, onStatus)
+	return o.generateDoc(ctx, repoRoot, qsPath, cfg.SystemPrompt+"\n"+cfg.QuickstartPrompt+langInstr, qsHeader, contextItems, onStatus)
 }
 
 func setupPipeline(repoRoot string, cfg *config.Config) (string, []string, *MetadataCache, error) {
@@ -166,39 +192,42 @@ func hashCodeFiles(repoRoot string, codeFiles []string, onStatus StatusFunc) ([]
 	return validFiles, currentHashes
 }
 
-func collectTreeDirs(tree *DirNode) map[string]bool {
-	dirs := make(map[string]bool)
-	var walk func(n *DirNode)
-	walk = func(n *DirNode) {
-		dirs[n.Path] = true
-		for _, child := range n.Children {
-			walk(child)
-		}
-	}
-	walk(tree)
-	return dirs
-}
-
 func updateAgentGuidelines(repoRoot, docsDir string) error {
-	agentGuidelines := fmt.Sprintf(`# AI Agent Guidelines
+	block := fmt.Sprintf(`%s
+# AI Agent Guidelines
 
 This repository contains automatically generated documentation under the %s directory to help AI coding agents understand the system architecture, design patterns, and module structure:
 
 - **System Blueprint**: Refer to %s/architecture.md for a high-level system overview, module relationships, and boundary definitions.
-- **Developer Quickstart**: Refer to %s/quickstart.md for onboarding steps, coding patterns, and configuration settings.
+- **Developer Quickstart & Task Routing**: Refer to %s/quickstart.md for onboarding steps, task routing table, coding patterns, and configuration settings.
+- **Documentation Index**: Refer to %s/index.md for a navigable catalog of all system and module pages.
 - **Module Details**: Explore %s/modules/ for directory-level summaries and API descriptions of internal packages.
-
-`, docsDir, docsDir, docsDir, docsDir)
+- **CLI Search & Read**: Run `+"`"+`code-reducer search "<query>"`+"`"+` and `+"`"+`code-reducer read "<page#section>"`+"`"+` to query the documentation directly.
+%s`, agentsBlockStart, docsDir, docsDir, docsDir, docsDir, docsDir, agentsBlockEnd)
 
 	agentFileBytes, err := tools.ReadFileSafely(repoRoot, agentsFileName)
 	if err != nil {
-		if err := tools.WriteFileSafely(repoRoot, agentsFileName, []byte(agentGuidelines)); err != nil {
+		if err := tools.WriteFileSafely(repoRoot, agentsFileName, []byte(block+"\n")); err != nil {
 			return fmt.Errorf("failed to write %s: %w", agentsFileName, err)
 		}
 		return nil
 	}
 
 	content := string(agentFileBytes)
+	startIdx := strings.Index(content, agentsBlockStart)
+	endIdx := strings.Index(content, agentsBlockEnd)
+	if startIdx != -1 && endIdx != -1 && endIdx > startIdx {
+		endIdx += len(agentsBlockEnd)
+		newContent := content[:startIdx] + block + content[endIdx:]
+		if newContent == content {
+			return nil
+		}
+		if err := tools.WriteFileSafely(repoRoot, agentsFileName, []byte(newContent)); err != nil {
+			return fmt.Errorf("failed to update %s: %w", agentsFileName, err)
+		}
+		return nil
+	}
+
 	if strings.Contains(content, "AI Agent Guidelines") {
 		return nil
 	}
@@ -209,7 +238,7 @@ This repository contains automatically generated documentation under the %s dire
 	} else if strings.HasSuffix(content, "\n") {
 		separator = "\n"
 	}
-	newContent := content + separator + agentGuidelines
+	newContent := content + separator + block + "\n"
 	if err := tools.WriteFileSafely(repoRoot, agentsFileName, []byte(newContent)); err != nil {
 		return fmt.Errorf("failed to append to %s: %w", agentsFileName, err)
 	}
@@ -254,6 +283,10 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 	}
 
 	if err := o.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, tree, cache, cfg, onStatus); err != nil {
+		return err
+	}
+
+	if err := finalizeWiki(repoRoot, docsDir, tree, cache, onStatus); err != nil {
 		return err
 	}
 
@@ -342,6 +375,36 @@ func detectFileChanges(repoRoot string, ignores []string, cache *MetadataCache, 
 	return filteredChanges, currentHashes, validFiles, nil
 }
 
+func resolveEffectiveChanges(ctx context.Context, pState *pipelineState, tree *DirNode, changes []FileChange) ([]FileChange, bool, error) {
+	nodesByPath := collectTreeNodes(tree)
+	var effective []FileChange
+	structureChanged := false
+
+	for _, change := range changes {
+		if change.Status == StatusAdded || change.Status == StatusDeleted {
+			structureChanged = true
+		}
+		if change.Status == StatusModified {
+			if prevEntry, ok := pState.cache.Files[change.Path]; ok {
+				var siblingFiles []string
+				if dirNode := nodesByPath[path.Dir(change.Path)]; dirNode != nil {
+					siblingFiles = dirNode.Files
+				}
+				newFacts, err := extractFileFacts(ctx, pState, change.Path, siblingFiles)
+				if err != nil {
+					return nil, false, err
+				}
+				if newFacts == prevEntry.Facts {
+					pState.onStatus(fmt.Sprintf("➜ Unchanged facts for modified file, skipping module re-synthesis: %s", change.Path))
+					continue
+				}
+			}
+		}
+		effective = append(effective, change)
+	}
+	return effective, structureChanged, nil
+}
+
 func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *config.Config, onStatus StatusFunc) error {
 	onStatus("Starting Map-Reduce pipeline: update")
 
@@ -368,34 +431,64 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 	tree := buildTree(allowedCodeFiles)
 	pruneStaleCache(repoRoot, docsDir, cache, tree, currentFilesMap)
 
-	affectedDirs := propagateAffected(tree, determineAffected(tree, repoRoot, docsDir, cache, filteredChanges))
-
-	archPath := filepath.Join(docsDir, "architecture.md")
-	qsPath := filepath.Join(docsDir, "quickstart.md")
-	missingGlobalDocs := !tools.FileExistsSafely(repoRoot, archPath) || !tools.FileExistsSafely(repoRoot, qsPath)
-
-	if len(affectedDirs) == 0 && !missingGlobalDocs {
-		onStatus("No modifications detected. Documentation is up to date.")
-		return nil
-	}
-
-	onStatus(fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
 	pState := &pipelineState{
 		client:              o.client,
 		repoRoot:            repoRoot,
 		cfg:                 cfg,
 		cache:               cache,
-		affectedDirs:        affectedDirs,
 		precalculatedHashes: currentFilesMap,
 		onStatus:            onStatus,
 	}
 
+	effectiveChanges, structureChanged, err := resolveEffectiveChanges(ctx, pState, tree, filteredChanges)
+	if err != nil {
+		return err
+	}
+
+	affectedDirs := propagateAffected(tree, determineAffected(tree, repoRoot, docsDir, cache, effectiveChanges))
+	pState.affectedDirs = affectedDirs
+
+	archPath := filepath.Join(docsDir, "architecture.md")
+	qsPath := filepath.Join(docsDir, "quickstart.md")
+	indexPath := filepath.Join(docsDir, "index.md")
+	missingGlobalDocs := !tools.FileExistsSafely(repoRoot, archPath) ||
+		!tools.FileExistsSafely(repoRoot, qsPath) ||
+		!tools.FileExistsSafely(repoRoot, indexPath)
+
+	if len(affectedDirs) == 0 && !missingGlobalDocs {
+		teardownPipeline(repoRoot, docsDir, cache, onStatus, "No modifications detected. Documentation is up to date.")
+		return nil
+	}
+
+	prevRootSum := cache.Modules["."]
+	prevTopModules := make(map[string]string, len(tree.Children))
+	for name, child := range tree.Children {
+		prevTopModules[name] = cache.Modules[child.Path]
+	}
+
+	onStatus(fmt.Sprintf("Step 2: Hierarchical Tree-Merging (Map-Reduce)... (Affected modules: %d)", len(affectedDirs)))
 	rootSum, err := synthesizeNode(ctx, pState, tree)
 	if err != nil {
 		return err
 	}
 
-	if err := o.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, tree, cache, cfg, onStatus); err != nil {
+	topModulesChanged := false
+	for name, child := range tree.Children {
+		if cache.Modules[child.Path] != prevTopModules[name] {
+			topModulesChanged = true
+			break
+		}
+	}
+
+	if missingGlobalDocs || structureChanged || rootSum != prevRootSum || topModulesChanged {
+		if err := o.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, tree, cache, cfg, onStatus); err != nil {
+			return err
+		}
+	} else {
+		onStatus("➜ Skipping global docs regeneration (top-level summaries unchanged)")
+	}
+
+	if err := finalizeWiki(repoRoot, docsDir, tree, cache, onStatus); err != nil {
 		return err
 	}
 

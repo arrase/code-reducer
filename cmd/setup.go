@@ -93,10 +93,16 @@ func runSetupFlowWithReader(reader *bufio.Reader, repoRoot string) error {
 		return fmt.Errorf("error reading docs dir: %w", err)
 	}
 
+	languageInput, err := promptString(reader, "Enter Output Language (leave empty for default English)", current.Language)
+	if err != nil {
+		return fmt.Errorf("error reading language: %w", err)
+	}
+
 	current.ModelID = modelInput
 	current.OllamaBaseURL = urlInput
 	current.OllamaNumCtx = numCtx
 	current.DocsDir = docsDirInput
+	current.Language = languageInput
 	current.Ignore = ignores
 
 	if err := config.SaveConfig(repoRoot, current); err != nil {

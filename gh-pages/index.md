@@ -38,8 +38,8 @@ hide:
   </div>
   <div class="feature-card">
     <i class="fa-solid fa-sliders feature-icon" aria-hidden="true"></i>
-    <h3>Fully Customizable Prompting</h3>
-    <p>Tailor extraction steps, system prompts, module synthesis blueprints, and file fact consolidation rules directly via <code>.code-reducer.yaml</code>.</p>
+    <h3>Customizable &amp; Multilingual</h3>
+    <p>Tailor extraction steps, synthesis prompts, Mermaid diagram rules, and output language (<code>--language</code>) directly via <code>.code-reducer.yaml</code>.</p>
   </div>
   <div class="feature-card">
     <i class="fa-solid fa-lock feature-icon" aria-hidden="true"></i>
@@ -48,13 +48,13 @@ hide:
   </div>
   <div class="feature-card">
     <i class="fa-solid fa-bolt feature-icon" aria-hidden="true"></i>
-    <h3>Fast Incremental Updates</h3>
-    <p>Uses SHA256 file hashing against <code>.metadata.json</code> to only re-process changed files and propagate updates bottom-up through the module tree.</p>
+    <h3>Smart Incremental Updates</h3>
+    <p>Uses SHA256 file hashing, fact-diff short-circuiting, and top-level summary checks to skip redundant directory and global re-synthesis.</p>
   </div>
   <div class="feature-card">
-    <i class="fa-solid fa-rotate feature-icon" aria-hidden="true"></i>
-    <h3>Cache Invalidation</h3>
-    <p>Automatically tracks extraction pipeline schema changes via <code>steps_hash</code> to safely force full documentation regeneration when prompts evolve.</p>
+    <i class="fa-solid fa-magnifying-glass feature-icon" aria-hidden="true"></i>
+    <h3>BM25 Search &amp; Deterministic Wiki</h3>
+    <p>Built-in <code>search</code> and <code>read</code> CLI commands with source-path boosting, plus automatic Mermaid sanitization, link repair, and index generation.</p>
   </div>
 </div>
 
@@ -81,7 +81,7 @@ Explore the documentation guides below to learn more about Code-Reducer's design
       <span class="card-badge">Read →</span>
     </div>
     <h3>Architecture & Map-Reduce Engine</h3>
-    <p>Deep dive into node prefix trees (<code>DirNode</code>), dynamic file chunking, sub-batch reduction, and global synthesis phases.</p>
+    <p>Deep dive into <code>DirNode</code> prefix trees, context-budgeted chunking, deterministic wiki finalization, and pure-Go BM25 section search.</p>
   </a>
   <a href="map-reduce-caching/" class="feature-card">
     <div class="card-top">
@@ -89,7 +89,7 @@ Explore the documentation guides below to learn more about Code-Reducer's design
       <span class="card-badge">Read →</span>
     </div>
     <h3>Incremental Updates & Caching</h3>
-    <p>Learn how SHA256 state tracking, bottom-up change propagation, and <code>steps_hash</code> invalidation minimize LLM calls.</p>
+    <p>Learn how SHA256 state tracking, fact-level short-circuiting, bottom-up propagation, and <code>steps_hash</code> invalidation minimize LLM calls.</p>
   </a>
   <a href="security-concurrency/" class="feature-card">
     <div class="card-top">
@@ -105,7 +105,7 @@ Explore the documentation guides below to learn more about Code-Reducer's design
       <span class="card-badge">Read →</span>
     </div>
     <h3>Configuration & Prompts</h3>
-    <p>Complete reference for <code>.code-reducer.yaml</code>, environment variable overrides, ignore filters, and extraction pipelines.</p>
+    <p>Complete reference for <code>.code-reducer.yaml</code>, 4-tier config resolution, <code>language</code> &amp; <code>quickstart_prompt</code> settings, and extraction pipelines.</p>
   </a>
   <a href="cli-wizard/" class="feature-card">
     <div class="card-top">
@@ -113,7 +113,7 @@ Explore the documentation guides below to learn more about Code-Reducer's design
       <span class="card-badge">Read →</span>
     </div>
     <h3>CLI Commands & Setup Wizard</h3>
-    <p>Guide to <code>setup</code>, <code>init</code>, and <code>update</code> commands, interactive prompts, and terminal execution workflows.</p>
+    <p>Guide to <code>setup</code>, <code>init</code>, <code>update</code>, <code>search</code>, and <code>read</code> subcommands, persistent flags, and interactive setup flows.</p>
   </a>
   <a href="performance-vram/" class="feature-card">
     <div class="card-top">

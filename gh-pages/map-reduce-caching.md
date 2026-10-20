@@ -1,8 +1,8 @@
 # Incremental Updates & Map-Reduce Caching
 
-To avoid re-analyzing an entire codebase every time a minor file changes, **Code-Reducer** implements a lightweight, platform-independent caching engine backed by filesystem SHA256 content hashing and state propagation.
+To avoid re-analyzing an entire codebase every time a minor file changes, **Code-Reducer** implements a lightweight, platform-independent caching engine backed by filesystem SHA256 content hashing, **Smart Incremental Short-Circuiting**, and bottom-up state propagation.
 
-Running `code-reducer update` selectively re-processes only modified source files and affected directory modules, reducing execution time and LLM inference overhead by up to 95% on typical incremental updates.
+Running `code-reducer update` selectively re-processes only modified source files whose extracted facts actually change, and skips global documentation regeneration when top-level summaries and directory structure remain unchanged.
 
 ---
 
@@ -15,34 +15,40 @@ sequenceDiagram
     participant User
     participant CLI as update Command
     participant Cache as MetadataCache (.metadata.json)
-    participant Engine as Engine / DiscoverCodeFiles
+    participant Engine as Engine / Orchestrator
     participant LLM as Ollama Service
 
     User->>CLI: code-reducer update
     CLI->>Cache: loadMetadataCache()
-    CLI->>Engine: computeStepsHash(cfg.ExtractionSteps)
-    alt Steps Hash Mismatch
+    CLI->>Engine: computeStepsHash(cfg)
+    alt Configuration / Steps Hash Mismatch
         Engine->>Cache: Invalidate cache (Reset Files & Modules)
     end
     CLI->>Engine: Discover active source files & compute SHA256
     Engine->>Engine: State Classification (Added, Modified, Deleted)
+    Engine->>Engine: pruneStaleCache() (Clean orphaned cache & docs)
+    loop For Each Modified File (resolveEffectiveChanges)
+        Engine->>LLM: extractFileFacts()
+        Engine->>Cache: Update File SHA256 + Facts
+        alt newFacts == prevEntry.Facts
+            Engine->>Engine: Short-circuit! Exclude from effectiveChanges
+        end
+    end
     Engine->>Engine: determineAffected() + propagateAffected() bottom-up
-    alt No Affected Directories
+    alt No Affected Directories & Global Docs Exist
         Engine-->>User: "No modifications detected. Documentation is up to date."
-    else Affected Directories Exist
+    else Affected Directories or Missing Global Docs
+        Engine->>Engine: Snapshot prevRootSum & prevTopModules
         loop For Each Affected Directory Node
-            alt File Cache Hit
-                Engine->>Cache: Reuse cached facts string
-            else File Cache Miss
-                Engine->>LLM: Run Extract & Reduce File Facts
-                Engine->>Cache: Store SHA256 + Facts
-            end
-            Engine->>LLM: Synthesize Module README (wiki/modules/<module>.md)
-            Engine->>Cache: Store Module Summary
+            Engine->>LLM: Synthesize Module README (modules/<module>/README.md)
+            Engine->>Cache: Store Module Summary & Save Cache
         end
-        alt Root Node (.) Affected OR Global Docs Missing
-            Engine->>LLM: Generate wiki/architecture.md & wiki/quickstart.md
+        alt missingGlobalDocs OR structureChanged OR rootSumChanged OR topModulesChanged
+            Engine->>LLM: GenerateStandardDocs (architecture.md & quickstart.md)
+        else Top-Level Summaries & Structure Unchanged
+            Engine->>Engine: Short-circuit! Skip GenerateStandardDocs
         end
+        Engine->>Engine: finalizeWiki (Mermaid sanitizer, index.md, link validator)
         CLI->>Cache: saveMetadataCache()
         CLI-->>User: "Pipeline update completed successfully!"
     end
@@ -90,27 +96,70 @@ This guarantees identical behavior across operating systems (Linux, macOS, Windo
 
 ---
 
-## 📊 File State Classification
+## 📊 File State Classification & Stale Cache Pruning
 
 During `detectFileChanges`, active repository files discovered by `DiscoverCodeFiles` are compared against `cache.Files`:
 
 | Classification | Condition | Action Taken |
 | :--- | :--- | :--- |
-| **`Added`** | Present in workspace, missing from `cache.Files`. | Directory containing file marked **affected**. Full Map extraction triggered for file. |
-| **`Modified`** | Present in both workspace and cache, but current SHA256 $\neq$ cached SHA256. | Directory marked **affected**. Fact cache invalidated for file; full extraction re-run. |
-| **`Deleted`** | Present in `cache.Files`, missing from active workspace. | Immediate parent directory marked **affected**. Cache entry pruned from `cache.Files`. |
+| **`Added`** | Present in workspace, missing from `cache.Files`. | Sets `structureChanged = true`. Directory containing file marked **affected**. Full Map extraction triggered for file. |
+| **`Modified`** | Present in both workspace and cache, but current SHA256 $\neq$ cached SHA256. | Evaluates new facts via `resolveEffectiveChanges`. Directory marked **affected** only if extracted facts changed. |
+| **`Deleted`** | Present in `cache.Files`, missing from active workspace. | Sets `structureChanged = true`. Immediate parent directory marked **affected**. Pruned from `cache.Files` and orphaned module docs deleted via `pruneStaleCache`. |
+
+---
+
+## 🧠 Smart Incremental Update Short-Circuit
+
+Code-Reducer employs a two-stage short-circuit mechanism during `code-reducer update` to avoid unnecessary upward cascade re-synthesis and redundant global doc generation:
+
+### 1. Fact-Level Short-Circuit (`resolveEffectiveChanges`)
+When a file's SHA256 hash changes (`StatusModified`)—for instance, due to code formatting, comment edits, or internal implementation tweaks that do not alter the extracted facts—rebuilding its module documentation and every parent directory up to the root would waste LLM inference calls.
+
+Before propagating affected directories, `resolveEffectiveChanges` extracts the modified file's updated facts and compares them directly against the previously cached `Facts` string:
+
+```go
+if change.Status == StatusModified {
+    if prevEntry, ok := pState.cache.Files[change.Path]; ok {
+        var siblingFiles []string
+        if dirNode := nodesByPath[path.Dir(change.Path)]; dirNode != nil {
+            siblingFiles = dirNode.Files
+        }
+        newFacts, err := extractFileFacts(ctx, pState, change.Path, siblingFiles)
+        if err != nil {
+            return nil, false, err
+        }
+        if newFacts == prevEntry.Facts {
+            pState.onStatus(fmt.Sprintf("➜ Unchanged facts for modified file, skipping module re-synthesis: %s", change.Path))
+            continue
+        }
+    }
+}
+```
+
+If `newFacts == prevEntry.Facts`, the file's new SHA256 is saved in `cache.Files`, the change is omitted from `effectiveChanges`, and **zero module or parent directory re-synthesis calls are triggered** for that file.
+
+### 2. Global Documentation Short-Circuit (`GenerateStandardDocs` Skip)
+Because `architecture.md` and `quickstart.md` are synthesized from the project directory map, the root summary (`.`), and top-level child module summaries (`tree.Children`), `RunUpdate` snapshots those summaries prior to hierarchical reduction.
+
+After `synthesizeNode` finishes, Code-Reducer only runs `GenerateStandardDocs` if at least one of the following holds:
+- Any global doc (`architecture.md`, `quickstart.md`, or `index.md`) is missing on disk (`missingGlobalDocs`).
+- Files were added or deleted (`structureChanged`).
+- The root module summary changed (`rootSum != prevRootSum`).
+- Any top-level child module summary changed (`topModulesChanged`).
+
+Otherwise, it logs `"➜ Skipping global docs regeneration (top-level summaries unchanged)"` and jumps directly to `finalizeWiki`.
 
 ---
 
 ## 🌲 Bottom-Up Change Propagation
 
-When source files change deep inside a project subfolder, child module changes must reflect in parent module documentation. Code-Reducer achieves this through two-phase affect determination:
+When an effective change alters a file's extracted facts (or adds/deletes a file), child module changes must reflect in parent module documentation. Code-Reducer achieves this through two-phase affect determination:
 
 ### 1. Direct Affect Evaluation (`determineAffected`)
 A directory node `n` is directly marked **affected** if:
-- Any file in `n.Files` has a `Modified` or `Added` status.
+- Any file in `n.Files` is in `effectiveChanges` (`Added` or `Modified` with changed facts).
 - Any file associated with `n.Path` was `Deleted`.
-- The directory's module documentation file (`wiki/modules/<module>.md`) is physically missing on disk.
+- The directory's module documentation file (`<docs_dir>/modules/<module>/README.md`) is physically missing on disk.
 - The directory entry `cache.Modules[n.Path]` is missing.
 
 ### 2. Recursive Bottom-Up Propagation (`propagateAffected`)
@@ -141,35 +190,46 @@ func propagateAffected(node *DirNode, affectedDirs map[string]bool) map[string]b
 }
 ```
 
-If `internal/engine/chunking.go` changes:
+If `internal/engine/chunking.go` has modified facts:
 1. `internal/engine` is marked directly affected.
 2. Propagation marks `internal` affected.
 3. Propagation marks `.` (root) affected.
-4. Leaf nodes outside `internal` (e.g. `cmd/`) remain **unaffected** and reuse cached summaries.
+4. Sibling branches outside `internal` (e.g. `cmd/`) remain **unaffected** and reuse their cached summaries.
 
 ---
 
-## 🔄 Extraction Steps Cache Invalidation (`steps_hash`)
+## 🔄 Configuration & Prompt Cache Invalidation (`steps_hash`)
 
-If a developer customizes or updates the `extraction_steps` array in `.code-reducer.yaml` (e.g. adding a security analysis step or altering extraction prompts), existing cached facts become stale.
+If you change the LLM model, switch output languages, edit any synthesis prompt, or modify the `extraction_steps` pipeline in `.code-reducer.yaml`, previously cached facts and module summaries become stale.
 
-Code-Reducer tracks prompt evolution by computing a SHA256 digest of the serialized extraction steps array:
+Code-Reducer tracks full generation configuration evolution by computing a null-delimited SHA256 digest (`computeStepsHash`) covering `ModelID`, `Language`, all five synthesis/system prompts, and every `ExtractionStep`:
 
 ```go
-func computeStepsHash(steps []config.ExtractionStep) string {
-    data, err := json.Marshal(steps)
-    if err != nil {
-        return ""
+func computeStepsHash(cfg *config.Config) string {
+    h := sha256.New()
+    writeField := func(s string) {
+        h.Write([]byte(s))
+        h.Write([]byte{0})
     }
-    h := sha256.Sum256(data)
-    return hex.EncodeToString(h[:])
+    writeField(cfg.ModelID)
+    writeField(cfg.Language)
+    writeField(cfg.SystemPrompt)
+    writeField(cfg.ModuleSynthesisPrompt)
+    writeField(cfg.ArchitecturePrompt)
+    writeField(cfg.QuickstartPrompt)
+    writeField(cfg.FileFactConsolidationPrompt)
+    for _, step := range cfg.ExtractionSteps {
+        writeField(step.Name)
+        writeField(step.Prompt)
+    }
+    return hex.EncodeToString(h.Sum(nil))
 }
 ```
 
 During `code-reducer update`:
-1. `currentStepsHash` is calculated from active configuration.
+1. `currentStepsHash` is calculated from the resolved runtime configuration.
 2. If `cache.StepsHash != currentStepsHash`:
    - A warning event is logged: `"Warning: Extraction steps changed. Invalidating metadata cache to force full documentation regeneration."`
    - `cache.Files` and `cache.Modules` are cleared in memory.
    - `cache.StepsHash` is updated to `currentStepsHash`.
-3. All files and directories are marked affected, forcing a clean, safe rebuild of the entire documentation suite.
+3. All files and directories are marked affected, forcing a clean, deterministic rebuild of the entire documentation suite.

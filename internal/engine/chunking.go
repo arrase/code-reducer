@@ -73,7 +73,7 @@ func reduceWithLLM(
 
 func reduceInChunks(ctx context.Context, c llmCaller, nodePath string, items []string, cfg *config.Config, onStatus StatusFunc) (string, error) {
 	redCfg := reductionConfig{
-		sysPrompt: cfg.SystemPrompt + "\n" + cfg.ModuleSynthesisPrompt,
+		sysPrompt: cfg.SystemPrompt + "\n" + cfg.ModuleSynthesisPrompt + config.LanguageInstruction(cfg.Language),
 		buildPrompt: func(batch []string) string {
 			return fmt.Sprintf("Synthesize architecture for %s:\n%s", nodePath, strings.Join(batch, "\n\n"))
 		},
@@ -108,7 +108,7 @@ func reduceFileFacts(ctx context.Context, c llmCaller, filePath string, stepName
 		return validItems[0], nil
 	}
 	redCfg := reductionConfig{
-		sysPrompt: cfg.SystemPrompt + "\n" + cfg.FileFactConsolidationPrompt,
+		sysPrompt: cfg.SystemPrompt + "\n" + cfg.FileFactConsolidationPrompt + config.LanguageInstruction(cfg.Language),
 		buildPrompt: func(batch []string) string {
 			return fmt.Sprintf("Consolidate and deduplicate the extracted facts for %s regarding step '%s':\n%s", filePath, stepName, strings.Join(batch, "\n\n"))
 		},

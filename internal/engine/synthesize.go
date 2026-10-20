@@ -61,8 +61,9 @@ func extractFileFacts(ctx context.Context, p *pipelineState, f string, siblingFi
 		return "", nil
 	}
 
+	sysPrompt := p.cfg.SystemPrompt + config.LanguageInstruction(p.cfg.Language)
 	siblingList := strings.Join(siblingFiles, ", ")
-	overhead := maxExtractionOverhead(p.cfg.SystemPrompt, f, siblingList, p.cfg.ExtractionSteps)
+	overhead := maxExtractionOverhead(sysPrompt, f, siblingList, p.cfg.ExtractionSteps)
 	fileLimit := calculateFileLimit(p.client.NumCtx(), overhead)
 
 	contentStr := string(contentBytes)
@@ -85,7 +86,7 @@ func extractFileFacts(ctx context.Context, p *pipelineState, f string, siblingFi
 			p.onStatus(fmt.Sprintf("➜ Extracting file (Step %d/%d - %s)%s: %s", i+1, len(p.cfg.ExtractionSteps), step.Name, chunkMsg, f))
 
 			userPrompt := buildExtractionPrompt(f, siblingList, chunk, step)
-			res, err := p.client.CallLLM(ctx, p.cfg.SystemPrompt, userPrompt)
+			res, err := p.client.CallLLM(ctx, sysPrompt, userPrompt)
 			if err != nil {
 				return "", fmt.Errorf("LLM error extracting %s for %s: %w", step.Name, f, err)
 			}
@@ -152,6 +153,21 @@ func collectComponents(ctx context.Context, p *pipelineState, node *DirNode, sub
 	return append(components, subsystems...), nil
 }
 
+func formatModuleDocument(node *DirNode, summary string) string {
+	if len(node.Files) == 0 {
+		return fmt.Sprintf("> **Module:** `%s`\n\n%s", node.Path, summary)
+	}
+	names := make([]string, len(node.Files))
+	for i, f := range node.Files {
+		names[i] = path.Base(f)
+	}
+	sort.Strings(names)
+	for i, name := range names {
+		names[i] = "`" + name + "`"
+	}
+	return fmt.Sprintf("> **Module:** `%s` | **Source Files:** %s\n\n%s", node.Path, strings.Join(names, ", "), summary)
+}
+
 func synthesizeNode(ctx context.Context, p *pipelineState, node *DirNode) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -189,7 +205,8 @@ func synthesizeNode(ctx context.Context, p *pipelineState, node *DirNode) (strin
 	// Update module cache
 	p.cache.Modules[node.Path] = finalSum
 
-	if err := tools.WriteFileSafely(p.repoRoot, modulePath, []byte(finalSum)); err != nil {
+	docContent := formatModuleDocument(node, finalSum)
+	if err := tools.WriteFileSafely(p.repoRoot, modulePath, []byte(docContent)); err != nil {
 		return "", fmt.Errorf("failed to write module documentation for %s: %w", node.Path, err)
 	}
 

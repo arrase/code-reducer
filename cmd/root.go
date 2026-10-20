@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	modelIDFlag string
-	numCtxFlag  string
+	modelIDFlag  string
+	numCtxFlag   string
+	languageFlag string
 )
 
 var RootCmd = &cobra.Command{
@@ -32,6 +33,7 @@ var RootCmd = &cobra.Command{
 func init() {
 	RootCmd.PersistentFlags().StringVar(&modelIDFlag, "model-id", "", "Specify LLM model ID")
 	RootCmd.PersistentFlags().StringVar(&numCtxFlag, "num-ctx", "", "Specify Ollama context window size")
+	RootCmd.PersistentFlags().StringVar(&languageFlag, "language", "", "Target language for generated documentation (e.g. English, Spanish, es, en)")
 }
 
 func executeCommand(mode engine.RunMode) error {
@@ -48,7 +50,7 @@ func executeCommand(mode engine.RunMode) error {
 		return err
 	}
 
-	cfg, err := config.ResolveConfig(repoRoot, modelIDFlag, numCtxFlag)
+	cfg, err := config.ResolveConfig(repoRoot, modelIDFlag, numCtxFlag, languageFlag)
 	if err != nil {
 		return err
 	}

@@ -6,43 +6,53 @@ docs_dir: "wiki"
 
 # System Prompt defines the AI persona
 system_prompt: |
-  You are Code-Reducer, an expert technical writer and Go code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
-  DEFENSIVE RULES: 
-  1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 
-  2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 
-  3. Do NOT name standard library packages unless explicitly stated in the source text. 
-  4. Only report facts you are 100% sure about.
+  You are Code-Reducer, a technical code analyzer and documentation writer. Follow instructions strictly with maximum technical conciseness.
+  Rules:
+  1. Extract and report ONLY verifiable facts explicitly present in the provided source code.
+  2. Do NOT invent behaviors, speculate on unshown code, or guess downstream consequences.
+  3. Do NOT copy source code blocks or write conversational filler.
 
 # Prompts for synthesized output
 module_synthesis_prompt: |
   Task: Write a technical documentation page for a code module based on the provided list of its internal components.
-  Rule 1: Group related functions and classes under appropriate Markdown headings.
-  Rule 2: Explain the responsibility of the module and the data flow.
-  Rule 3: Keep it highly technical and dense.
+  Rule 1: Group related functions and types under appropriate Markdown headings.
+  Rule 2: Explain the responsibility of the module and its internal data flow.
+  Rule 3: When the module has non-trivial internal data or control flow, include a fenced ```mermaid diagram (flowchart TD or sequenceDiagram, max 10 nodes) following strict Mermaid label safety: quote any node label containing parentheses, brackets, colons, or semicolons (e.g., A["parse(input)"]); never use lowercase 'end' as a flowchart node ID (use 'endNode' instead); do not use raw angle brackets <T> inside labels.
+  Rule 4: Keep it highly technical, concise, and free of source code blocks.
 
 architecture_prompt: |
-  Task: Write a global architecture or quickstart document based on the module summaries.
-  Rule 1: Explain the system boundaries and how the modules interact.
-  Rule 2: Provide a dense, developer-friendly overview.
+  Task: Write the global architecture document (architecture.md) based on the module summaries.
+  Rule 1: Focus exclusively on the global architecture vision, system boundaries, end-to-end data flow, and module interactions.
+  Rule 2: Include a grounded fenced ```mermaid architecture/data-flow diagram (flowchart TD or sequenceDiagram, max 10 nodes) following strict Mermaid label safety: quote any node label containing parentheses, brackets, colons, or semicolons (e.g., A["parse(input)"]); never use lowercase 'end' as a flowchart node ID (use 'endNode' instead); do not use raw angle brackets <T> inside labels.
+  Rule 3: Keep it concise, technical, and developer-friendly.
+
+quickstart_prompt: |
+  Task: Write the developer quickstart guide (quickstart.md) based on the module summaries.
+  Rule 1: Focus exclusively on prerequisites, build/installation steps, available CLI commands and flags, configuration (.code-reducer.yaml and environment variables), and package structure.
+  Rule 2: Include a Task Routing markdown table (| Goal / Task | Module Doc | Key Source Files |) that maps developer tasks ("I want to...") to the relative module documentation paths (modules/.../README.md) and source files provided in the project context.
+  Rule 3: Keep it concise, actionable, and strictly factual.
 
 file_fact_consolidation_prompt: |
-  You are a specialized code documentation assistant. Consolidate, deduplicate and merge the following facts extracted from different chunks of the same file into a single, cohesive summary.
+  Task: Consolidate and deduplicate facts extracted from different chunks of the same file into a single, concise summary.
+  Rule 1: Merge duplicate items and preserve only unique, verifiable facts.
+  Rule 2: Keep bullet points to 1 line each; do NOT copy source code blocks or add long explanations.
+  Rule 3: If all inputs are 'None', output solely 'None'.
 
 # Custom extraction steps during map phase
 extraction_steps:
   - name: "API_SIGNATURES"
     prompt: |
-      Task: Extract the public surface area of the file.
-      Output: A strict Markdown list of all exported structs, interfaces, and methods. For each, note the actual input and output types. Ignore internal logic.
+      Task: Extract the public API surface.
+      Output: Markdown bullet list of exported/public types, functions, and methods, strictly 1 line per signature with parameters and return types. Do NOT explain internal logic or copy code blocks. If none exist, output solely 'None'.
   - name: "BUSINESS_LOGIC"
     prompt: |
-      Task: Analyze the business logic and domain concepts.
-      Output: Explain what business rules or domain concepts this file solves. Describe the high-level algorithmic flow. Ignore implementation details.
+      Task: Extract the core purpose and domain rules.
+      Output: Maximum 5 concise bullet points describing the primary domain problem and high-level logic. Ignore syntax and boilerplate. Do NOT copy code blocks. If none exist, output solely 'None'.
   - name: "STATE_AND_CONCURRENCY"
     prompt: |
-      Task: Analyze state mutation and concurrency.
-      Output: List all mutable state (global variables, changing struct fields) and what concurrency mechanisms (e.g., sync.Mutex, channels) protect them. If none, state 'No mutable state'.
+      Task: Identify mutable state and thread safety.
+      Output: Concise bullet list (1 line per item) of modified package/global state, struct fields, or synchronization mechanisms (locks, mutexes, channels, atomics). Do NOT copy code blocks. If stateless, output solely 'None'.
   - name: "ERRORS_AND_SIDE_EFFECTS"
     prompt: |
-      Task: Analyze side effects and error handling.
-      Output: Detail how this code communicates with the outside world (I/O like network, disk, DB) and how it handles/returns errors (wrap, sentinel, panic).
+      Task: Analyze external I/O and error propagation.
+      Output: Concise bullet list (1 line per item) of external system interactions (filesystem, network, subprocesses, environment) and error handling patterns. Do NOT copy code blocks. If none exist, output solely 'None'.
