@@ -1,75 +1,90 @@
-# Architecture Overview
+# Architecture
 
-## System Boundaries
+## System Overview
 
-Code-Reducer is a CLI-driven documentation agent that automatically generates and maintains project wikis. It operates on a git repository root and produces markdown documentation in a configurable output directory (default: `wiki/`). The system has no network, database, or external API dependencies beyond an LLM backend (Ollama by default).
+Code-Reducer is a CLI documentation agent that synthesizes structured markdown from source code through a Map-Reduce pipeline. The system discovers code files, builds a hierarchical directory tree, computes SHA-256 hashes for change detection, and generates documentation hierarchically via tree-merging. A versioned metadata cache enables incremental regeneration without reprocessing unaffected modules.
 
-The system boundary is the repository root. All filesystem operations resolve virtual paths through a security layer that prevents path traversal, even when symlinks are involved. The tool runs as a single process with no async patterns, no global mutable state, and no synchronization mechanisms.
+## Module Boundaries
 
-## Module Interaction Map
+| Module | Responsibility |
+|--------|---------------|
+| `cmd` | CLI surface: registers cobra commands (`init`, `read`, `search`, `setup`, `update`) under shared `RootCmd` |
+| `internal/config` | Configuration loading/resolution/persistence with multi-source merge (defaults → YAML → env vars → CLI flags) |
+| `internal/engine` | Orchestrates LLM-based synthesis: file discovery, tree building, hash computation, hierarchical synthesis, finalization |
+| `internal/search` | BM25 full-text search over generated markdown sections with path-hint boosting |
+| `internal/security` | Path-traversal-safe resolution and atomic process locking via `O_EXCL` |
+| `internal/tools` | Safe filesystem I/O, git verification, markdown parsing (fence/heading extraction) |
 
+## End-to-End Data Flow
+
+```mermaid
+sequenceDiagram
+    participant CLI as CLI/Flags
+    participant Config as Config
+    participant Engine as Engine
+    participant LLM as LLM Client
+    participant Cache as Metadata Cache
+    participant Search as Search
+
+    CLI->>Config: ResolveConfig(repoRoot, flags)
+    Config->>Config: Merge priority order
+    Config-->>Engine: *Config
+
+    Engine->>Engine: Run(mode, cfg, onStatus)
+    Engine->>Engine: setupPipeline()
+    Engine->>LLM: newLLMClient(cfg)
+    Engine->>Engine: RunInit/RunUpdate
+    Engine->>Engine: synthesizeNode(node)
+    Engine->>LLM: CallLLM(sysPrompt, userPrompt)
+    LLM-->>Engine: response string
+    Engine->>Engine: chunkTextWithOverlap()
+    Engine->>Engine: consolidate facts
+    Engine->>Cache: saveMetadataCache()
+    Engine->>Engine: finalizeWiki()
+    Engine->>Search: generateWikiIndex()
+    Search-->>Engine: index.md
+    Engine-->>CLI: return error
 ```
-cmd/          ──► orchestrates CLI entry point, dispatches to engine
-internal/config/ ──► configuration persistence and resolution
-internal/engine/ ──► synthesis pipeline orchestration
-internal/security/ ──► path traversal prevention, process locking
-internal/tools/  ──► safe filesystem operations, git verification
-```
-
-All modules communicate via function parameters and return values. No shared mutable state exists between packages. The `cmd` package is the only entry point; all other packages are internal.
-
-## Operational Modes
-
-Three modes are exposed via the CLI:
-
-- **init** — first-time documentation build. Scans the repository, hashes all code files, synthesizes summaries hierarchically, generates `architecture.md` and `quickstart.md`, updates `AGENTS.md`, and persists the metadata cache.
-- **setup** — interactive configuration wizard. Collects LLM model ID, Ollama base URL, context size, ignore patterns, and docs directory from the user. Persists via `config.SaveConfig`.
-- **update** — incremental regeneration. Identifies files modified since the last documented commit using cached SHA-256 hashes and regenerates only affected modules.
 
 ## Configuration Resolution
 
-Configuration is resolved in priority order: CLI flag → environment variable → config file → system default. The config file is `.code-reducer.yaml` with `0600` permissions. Three environment variables are supported: `CODE_REDUCER_MODEL_ID`, `OLLAMA_BASE_URL`, `OLLAMA_NUM_CTX`.
-
-The config schema includes LLM settings, extraction step definitions, prompt templates, ignore patterns, and the docs directory. Extraction steps are a fixed list: `API_SIGNATURES`, `BUSINESS_LOGIC`, `STATE_AND_CONCURRENCY`, `ERRORS_AND_SIDE_EFFECTS`.
-
-## Security Primitives
-
-Two non-negotiable security primitives protect the system:
-
-1. **Path traversal prevention** — `SafeResolve(repoRoot, inputPath)` canonicalizes the repository root, resolves symlinks on the root and intermediate ancestors, walks up the input path to the first physically existing ancestor, rebuilds the full path, and verifies the result lies strictly inside the repository root via `filepath.Rel`. Returns `ErrPathTraversal` if containment fails.
-
-2. **Process-level locking** — `AcquireLock(repoRoot)` opens a lock file with `O_WRONLY|O_CREATE|O_EXCL` for atomicity, writes the process PID, and returns a `*SimpleLock` handle. `Unlock()` closes the file descriptor and removes the lock file. Uses `sync.Mutex` to protect the closed state.
+Configuration merges four sources in priority order: system defaults → YAML config file → environment variables → CLI flags. The `Config` struct holds LLM backend settings (Ollama model ID, base URL, context size), document directory paths, language overrides, system prompts, extraction step definitions, and ignore lists.
 
 ## Synthesis Pipeline
 
-The engine orchestrates a hierarchical synthesis pipeline:
+The orchestrator maintains pipeline state (LLM client, repo root, config, metadata cache, affected directories, precalculated hashes, status callback) set once per run. A custom lock from `security.AcquireLock` is acquired at pipeline start and released via `defer`.
 
-1. **Tree construction** — `buildTree` parses a file slice into a hierarchical `*DirNode` structure.
-2. **Change detection** — SHA-256 hashes are computed for all code files. The metadata cache stores per-file hashes with associated facts. On update, files modified since the last documented commit are identified. Ancestors are marked affected when a descendant is affected.
-3. **Hierarchical synthesis** — `synthesizeChildren` processes child directories recursively, synthesizing subsystem summaries before individual files. `synthesizeNode` reduces all components for a directory into a final summary, writes it to `modules/<path>.md`, and persists the cache.
-4. **Text reduction** — `reduceInChunks` splits oversized items with an 800-character overlap, batches remaining items, and reduces each batch. If total output reaches 95% of input, reduction stops and results are concatenated.
-5. **Fact extraction** — `extractFileFacts` invokes the LLM for each extraction step per chunk of a file. Strips outer markdown fences, filters "none" facts, and caches results keyed by file SHA-256.
+### Initialization and Update Modes
 
-## LLM Abstraction
+- **`ModeInit`**: Scans repository, builds initial wiki markdown pages
+- **`ModeUpdate`**: Scans for files modified since last documented commit
 
-The `llmCaller` interface abstracts LLM invocation with `CallLLM(ctx, systemPrompt, userPrompt) (string, error)` and `NumCtx() int`. The default implementation serializes requests to the Ollama `/api/chat` endpoint with a 10-minute timeout. On 200 OK, the full response body is read; on non-200, up to 1024 bytes of the error body are captured.
+Both modes discover code files, build directory trees, compute SHA-256 hashes, and compare against cached values to identify added/modified/deleted files.
 
-## Metadata Cache
+### Hierarchical Synthesis
 
-`MetadataCache` persists file state and configuration across engine runs. It stores a version, a `stepsHash` derived from model ID and all prompt templates, per-file SHA-256 hashes with associated facts, and module-to-path mappings. The cache is stored as `.metadata.json` in the docs directory. If the version is incompatible, it resets.
+`synthesizeNode()` recursively traverses the directory tree: child directories first, then individual files. File processing uses chunking with configurable overlap. Extraction results are cached by file hash to avoid redundant LLM invocations. Module summaries are persisted to the metadata cache and reused when downstream directories are unaffected.
+
+## LLM Communication
+
+`CallLLM()` sends JSON array of messages to Ollama `/api/chat` via HTTP POST with 10-minute timeout. Request includes model ID, system and user messages, options with `num_ctx` and fixed temperature 0.1. Response truncation detected when `done_reason` equals "length" triggers warning callback.
+
+## Finalization
+
+Deterministic post-processing: sanitizes Mermaid diagram blocks (degrades broken blocks to text fences), generates `index.md` navigation entrypoint linking to architecture, quickstart, and all documented modules. Relative module/doc links auto-repaired when unambiguous.
+
+## Search
+
+`SearchWiki` walks docs directory tree, parses `.md` files into sections (skipping fenced code blocks), scores sections via BM25 (k1=1.2, b=0.75), applies path-hint score boosts for matching module paths, extracts query-matched prose snippets truncated to 160 runes. Returns top `limit` results ranked by score.
+
+## Security Model
+
+All filesystem operations route through `security.SafeResolve` before touching the OS. Path resolution validates resolved paths remain within repository root after symlink evaluation. Lock acquisition uses atomic file creation with `O_EXCL` to prevent concurrent acquisition by multiple processes.
 
 ## Error Handling
 
-Errors propagate via return values. No panics or crashes are present. The cobra framework displays returned errors and exits with a non-zero status code. Specific cases: file read failures during extraction are swallowed and logged via `onStatus`; stale cleanup failures are silently ignored; lock acquisition and cache save failures are fatal.
+Fail-fast pattern: functions return immediately on error without recovery or retry. Errors wrapped with `fmt.Errorf("...: %w", err)` for context preservation. HTTP errors fail fast without retries, limiting response bodies to 1024 bytes. Context cancellation checked via `ctx.Err()` at start of `reduceItems` and after each batch.
 
-## Filesystem Safety
+## Concurrency
 
-All filesystem writes use atomic semantics: `WriteFileAtomic` writes to a temporary file first, then renames to the target path. `WriteFileSafely` uses atomic write semantics. `RemoveFileSafely` ignores `os.IsNotExist` errors. `tools.WriteFileAtomic` is used for config persistence.
-
-## Git Integration
-
-`VerifyGitRepo(repoRoot)` verifies the repository root resides inside a git repository by executing `git rev-parse --is-inside-work-tree`. `EnsureGitignoreHasLockfile` ensures `.code-reducer.lock` is included in `.gitignore`. `LoadGitignore` loads patterns for ignore pattern matching during file discovery.
-
-## State and Concurrency
-
-No synchronization mechanisms are present. Global variables (`initCmd`, `setupCmd`, `updateCmd`) are declared at package scope and initialized once; they are never modified after initialization. No mutexes, locks, atomic types, or async patterns are used.
+No synchronization primitives (locks, mutexes, channels, atomics) in `internal/config` or `internal/engine`. `internal/security.SimpleLock` uses `sync.Mutex` to protect `Unlock`. `internal/tools.NextHeadingAnchor` mutates `seenCounts` map without synchronization; callers manage concurrent access externally.

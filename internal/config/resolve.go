@@ -38,6 +38,7 @@ func ApplyDefaults(cfg *Config) {
 		cfg.DocsDir = DefaultDocsDir
 	}
 	cfg.DocsDir = filepath.ToSlash(filepath.Clean(cfg.DocsDir))
+	cfg.Language = strings.TrimSpace(cfg.Language)
 	if len(cfg.ExtractionSteps) == 0 {
 		cfg.ExtractionSteps = DefaultExtractionSteps
 	}
@@ -69,22 +70,15 @@ func loadBaseConfig(repoRoot string) (*Config, error) {
 	return cfg, nil
 }
 
-func resolveModelID(cfgVal, flagVal string) string {
-	modelID := cfgVal
-	if envVal := os.Getenv(CodeReducerModelIDEnvKey); envVal != "" {
-		modelID = envVal
+func resolveString(cfgVal, envKey, flagVal string) string {
+	val := cfgVal
+	if envVal := os.Getenv(envKey); envVal != "" {
+		val = envVal
 	}
 	if flagVal != "" {
-		modelID = flagVal
+		val = flagVal
 	}
-	return modelID
-}
-
-func resolveBaseURL(cfgVal string) string {
-	if envVal := os.Getenv(OllamaBaseURLEnvKey); envVal != "" {
-		return envVal
-	}
-	return cfgVal
+	return strings.TrimSpace(val)
 }
 
 func parsePositiveInt(val, errMsg string) (int, error) {
@@ -116,7 +110,7 @@ func resolveNumCtx(cfgVal int, flagVal string) (int, error) {
 
 // ResolveConfig merges CLI overrides, environment variables, YAML config, and system defaults.
 // It returns a fully resolved Config struct ready to be used by the pipeline runner and LLM client.
-func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string) (*Config, error) {
+func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag, languageFlag string) (*Config, error) {
 	cfg, err := loadBaseConfig(repoRoot)
 	if err != nil {
 		return nil, err
@@ -129,8 +123,9 @@ func ResolveConfig(repoRoot, modelIDFlag, numCtxFlag string) (*Config, error) {
 	}
 
 	cfg.Ignore = deduplicate(cfg.Ignore)
-	cfg.ModelID = resolveModelID(cfg.ModelID, modelIDFlag)
-	cfg.OllamaBaseURL = resolveBaseURL(cfg.OllamaBaseURL)
+	cfg.ModelID = resolveString(cfg.ModelID, CodeReducerModelIDEnvKey, modelIDFlag)
+	cfg.OllamaBaseURL = resolveString(cfg.OllamaBaseURL, OllamaBaseURLEnvKey, "")
 	cfg.OllamaNumCtx = numCtx
+	cfg.Language = resolveString(cfg.Language, CodeReducerLanguageEnvKey, languageFlag)
 	return cfg, nil
 }

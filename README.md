@@ -1,6 +1,6 @@
 # Code-Reducer
 
-**Code-Reducer** is a lightweight, high-performance command-line tool written in Go that automatically generates and maintains developer-friendly, comprehensive wikis for extensive repositories. 
+**Code-Reducer** is a lightweight, high-performance command-line tool written in Go that automatically generates, validates, and queries developer-friendly, comprehensive wikis for extensive repositories.
 
 Designed specifically for **local development and private LLMs**, Code-Reducer uses a custom **Hierarchical Map-Reduce Strategy** to analyze large codebases using small, local LLM models (e.g., 7B, 9B, or 26B parameters) via **Ollama** without exceeding context windows or degrading output quality.
 
@@ -8,12 +8,13 @@ Designed specifically for **local development and private LLMs**, Code-Reducer u
 
 ## 🚀 Key Strengths
 
-* **Hierarchical Map-Reduce Pipeline**: Breaks codebase synthesis into a structured Map-Reduce pipeline to document large directories recursively, staying strictly within local LLM context limits.
+* **Hierarchical Map-Reduce Pipeline**: Breaks codebase synthesis into a structured Map-Reduce pipeline to document large directories recursively, staying strictly within local LLM context limits (`numCtx * 2 - runeCount(promptOverhead)` characters).
 * **Optimized for Private & Local LLMs**: Built specifically to leverage Ollama (e.g., `ornith:9b` or `gemma4:26b`), eliminating expensive cloud API costs and keeping proprietary code local.
-* **Fully Customizable Prompting System**: Allows overriding default system prompts, synthesis rules, architecture blueprints, and file fact consolidation directly from YAML configuration.
+* **Smart Incremental Updates**: Uses a filesystem SHA-256 hash cache and fact-level comparison to skip module re-synthesis when code edits do not alter extracted technical facts, and skips global documentation regeneration when top-level module summaries and directory structure remain unchanged.
+* **Deterministic Wiki Finalizer (`finalizeWiki`)**: Automatically sanitizes and heuristically validates Mermaid diagrams (degrading unrecoverable blocks to `text` fences), generates `<docs_dir>/index.md`, stamps module provenance headers, and validates/auto-repairs internal Markdown links and GitHub heading anchors.
+* **Built-In Section-Level BM25 Search & Read**: Provides `code-reducer search` and `code-reducer read` commands for fast, zero-LLM-cost retrieval of documentation sections by keyword and source path hints.
+* **Multi-Language Documentation & Customizable Prompts**: Supports generating documentation prose in any target language (`--language` / `CODE_REDUCER_LANGUAGE`) while preserving code identifiers, and allows overriding all system, synthesis, quickstart, consolidation, and extraction prompts via `.code-reducer.yaml`.
 * **Enterprise-Grade Security Sandbox**: Features path traversal guards, atomic process locking, and TOCTOU symlink hijacking defenses for safe workspace operations.
-* **Fast Incremental Updates**: Uses a filesystem SHA256 hash cache to only re-document modified files, propagating changes upward to minimize LLM calls.
-* **Extraction Steps Cache Invalidation**: Automatically detects changes in your extraction steps pipeline and invalidates the cache to ensure documentation accuracy.
 
 ---
 
@@ -51,42 +52,68 @@ Incrementally update the wiki whenever code files change:
 ./code-reducer update
 ```
 
+### 5. Search and Read the Wiki
+Query ranked sections across the generated wiki and read specific pages or heading anchors:
+```bash
+./code-reducer search "context limit chunking" -p internal/engine -n 5
+./code-reducer read modules/internal/engine/README.md
+```
+
 ---
 
 ## 🛠️ CLI Command Reference
 
+### Global Persistent Flags
+Available across commands (`init`, `update`, `search`, `read`):
+* `--model-id <string>`: Override the LLM model ID (e.g., `--model-id gemma4:26b`).
+* `--num-ctx <int>`: Override the Ollama context window size in tokens (e.g., `--num-ctx 20000`).
+* `--language <string>`: Target language for generated documentation prose (e.g., `English`, `Spanish`, `es`, `en`).
+
 ### 1. `code-reducer setup`
-Runs an interactive setup flow in the current directory to generate the `.code-reducer.yaml` configuration file. If a `.code-reducer.yaml` file already exists, all configuration prompts will default to its existing values. You will be prompted for:
+Runs an interactive setup flow in the current directory to generate the `.code-reducer.yaml` configuration file. If a `.code-reducer.yaml` file already exists, all prompts default to its current values:
 * LLM Model ID (defaults to `ornith:9b`)
 * Ollama Base URL (defaults to `http://localhost:11434`)
 * Ollama Context Size (defaults to `8192`)
-* Custom files and directories to ignore (comma-separated)
+* Custom directories, files, or glob patterns to ignore (comma-separated; enter `clear` or `none` to reset)
 * Documentation output folder name (defaults to `wiki`)
+* Output Language (leave empty for default English)
 
 ### 2. `code-reducer init`
-Scans the repository, builds the hierarchical tree, and generates the initial set of wiki markdown pages:
-* Generates a metadata cache in `<docs_dir>/.metadata.json` containing the baseline metadata file summaries.
-* Automatically generates (or appends to) an `AGENTS.md` file in the repository root to guide other AI development agents on how to find and use the generated wiki documentation.
-* *Note: This command will implicitly launch the interactive setup wizard if the `.code-reducer.yaml` file is missing.*
-* *Note: This command will fail if the project has already been initialized.*
+Scans the repository, builds the hierarchical directory tree, and generates the initial set of wiki markdown pages:
+* Generates module pages under `<docs_dir>/modules/<module>/README.md` with provenance headers (`> **Module:** ... | **Source Files:** ...`).
+* Synthesizes global `<docs_dir>/architecture.md` and `<docs_dir>/quickstart.md` (including a developer Task Routing table).
+* Runs the deterministic finalizer to sanitize/validate Mermaid blocks, generate `<docs_dir>/index.md`, and validate/auto-repair internal links and heading anchors.
+* Persists the metadata cache in `<docs_dir>/.metadata.json`.
+* Creates or idempotently updates the `<!-- CODE-REDUCER:START --> ... <!-- CODE-REDUCER:END -->` block in `AGENTS.md` in the repository root.
+* *Note: Implicitly launches the interactive setup wizard if `.code-reducer.yaml` is missing in a TTY session. Fails if the project has already been initialized.*
 
 ### 3. `code-reducer update`
-Detects files modified, added, or deleted since the last documentation run and performs an incremental documentation refresh:
-* Computes SHA256 hashes of modified files and compares them with the `.metadata.json` cache to extract new technical facts only for files that actually changed.
-* Rebuilds only the directory-level module summaries (`wiki/modules/<module>/README.md`) that correspond to changed files.
-* Skips LLM calls for unchanged directories by reusing the cached summaries in `wiki/.metadata.json`.
-* Bottom-up propagation: If a file inside a subdirectory changes, the subdirectory is marked "affected" and this state propagates up to the parent directory, rebuilding parents and the root summaries.
-* Automatically syncs global files (`architecture.md` and `quickstart.md`) only if the root directory `.` is affected (i.e. top-level structural changes occurred) or if the files are physically missing.
-* Cache Invalidation: Automatically detects changes in your `extraction_steps` configuration and invalidates the entire cache, forcing a full regeneration to ensure documentation accuracy.
-* *Note: Like `init`, this command will implicitly launch the setup wizard if the configuration file is missing.*
+Detects files added, modified, or deleted since the last run and performs a smart incremental documentation refresh:
+* **Configuration & Prompt Hash Invalidation**: Compares `cache.StepsHash` against `computeStepsHash(cfg)` (which hashes `model_id`, `language`, all prompt templates, and all `extraction_steps`). Any change invalidates the cache and triggers a full rebuild.
+* **Fact-Level Short-Circuit**: Re-extracts facts for modified files and compares them with cached `Facts`. If the extracted facts are identical, only the file's SHA-256 hash is updated in `.metadata.json` and directory re-synthesis is skipped.
+* **Bottom-Up Propagation**: Rebuilds only directories affected by effective file changes (or missing module docs) and propagates affected status upward to parent directories.
+* **Global Docs Short-Circuit**: Skips regenerating `architecture.md` and `quickstart.md` if no files were added or deleted, all global docs exist on disk, and the root (`.`) and top-level child module summaries are unchanged.
+* **Finalization & Pruning**: Prunes deleted files and orphaned module docs, then runs `finalizeWiki` to refresh `<docs_dir>/index.md`, validate Mermaid blocks, and check internal links.
+
+### 4. `code-reducer search <query> [--path/-p <file>] [--limit/-n <N>]`
+Searches generated wiki markdown pages (`<docs_dir>/`, excluding `index.md` and hidden files) at ATX heading section granularity using weighted **BM25** ranking:
+* `--path`, `-p <path>` (repeatable / comma-separated): Boosts sections whose page path, module path, or provenance source files match the given path hint (`2.0x` score multiplier).
+* `--limit`, `-n <int>`: Maximum number of ranked results to return (defaults to `5`).
+* Outputs ranked `<page>#<anchor>` targets ready to pass directly to `code-reducer read`, along with the section heading, provenance source files, and a matching snippet.
+
+### 5. `code-reducer read <page[#section]>`
+Reads a full markdown documentation page or extracts a specific heading section from `<docs_dir>`:
+* Accepts targets with or without a leading `<docs_dir>/` prefix (e.g., `architecture.md`, `wiki/quickstart.md#task-routing`, or `modules/internal/engine/README.md#synthesis-pipeline`).
+* Enforces `security.SafeResolve` containment within `<docs_dir>`, rejecting path traversal (`..`), hidden files/directories, and non-`.md` files.
+* When `#<anchor>` is specified, extracts the matching ATX heading section up to the next heading of equal or higher level; if the anchor is not found, returns an error listing all available anchors on that page.
 
 ---
 
-## ⚙️ Configuration (`.code-reducer.yaml`)
+## ⚙️ Configuration (`.code-reducer.yaml` & Environment Variables)
 
-Code-Reducer stores configuration parameters in a `.code-reducer.yaml` file in the root of the repository.
+Code-Reducer stores configuration parameters in `.code-reducer.yaml` in the root of the repository (saved with `0600` permissions).
 
-### Example Configuration:
+### Example Configuration
 ```yaml
 # The model ID loaded into your local Ollama instance
 model_id: ornith:9b
@@ -94,53 +121,70 @@ model_id: ornith:9b
 # URL of the local or remote Ollama server
 ollama_base_url: http://localhost:11434
 
-# Custom context window size
+# Custom context window size in tokens
 ollama_num_ctx: 20000
 
 # Target directory to write generated markdown documentation
 docs_dir: wiki
 
-# System instructions injected to every LLM request
+# Optional target language for documentation prose (e.g. English, Spanish, es, en)
+language: ""
+
+# System instructions injected into every LLM request
 system_prompt: |
-    You are Code-Reducer, an expert technical writer and code analyzer. Your job is to strictly follow instructions. You do not yap, you do not write filler.
-    DEFENSIVE RULES: 1. Do NOT use absolute terms ('always', 'never', 'zero') unless explicitly proven. 2. Do NOT guess downstream consequences or invent unhandled paths. If an error is swallowed, just say it is swallowed. 3. Do NOT name standard library packages unless explicitly stated in the source text. 4. Only report facts you are 100% sure about.
+    You are Code-Reducer, a technical code analyzer and documentation writer. Follow instructions strictly with maximum technical conciseness.
+    Rules:
+    1. Extract and report ONLY verifiable facts explicitly present in the provided source code.
+    2. Do NOT invent behaviors, speculate on unshown code, or guess downstream consequences.
+    3. Do NOT copy source code blocks or write conversational filler.
 
 # Synthesis prompt for directory modules
 module_synthesis_prompt: |-
     Task: Write a technical documentation page for a code module based on the provided list of its internal components.
-    Rule 1: Group related functions and classes under appropriate Markdown headings.
-    Rule 2: Explain the responsibility of the module and the data flow.
-    Rule 3: Keep it highly technical and dense.
+    Rule 1: Group related functions and types under appropriate Markdown headings.
+    Rule 2: Explain the responsibility of the module and its internal data flow.
+    Rule 3: When the module has non-trivial internal data or control flow, include a fenced ```mermaid diagram (flowchart TD or sequenceDiagram, max 10 nodes) following strict Mermaid label safety: quote any node label containing parentheses, brackets, colons, or semicolons (e.g., A["parse(input)"]); never use lowercase 'end' as a flowchart node ID (use 'endNode' instead); do not use raw angle brackets <T> inside labels.
+    Rule 4: Keep it highly technical, concise, and free of source code blocks.
 
-# Synthesis prompt for the global architecture overview
+# Synthesis prompt for the global architecture overview (architecture.md)
 architecture_prompt: |-
-    Task: Write a global architecture or quickstart document based on the module summaries.
-    Rule 1: Explain the system boundaries and how the modules interact.
-    Rule 2: Provide a dense, developer-friendly overview.
+    Task: Write the global architecture document (architecture.md) based on the module summaries.
+    Rule 1: Focus exclusively on the global architecture vision, system boundaries, end-to-end data flow, and module interactions.
+    Rule 2: Include a grounded fenced ```mermaid architecture/data-flow diagram (flowchart TD or sequenceDiagram, max 10 nodes) following strict Mermaid label safety: quote any node label containing parentheses, brackets, colons, or semicolons (e.g., A["parse(input)"]); never use lowercase 'end' as a flowchart node ID (use 'endNode' instead); do not use raw angle brackets <T> inside labels.
+    Rule 3: Keep it concise, technical, and developer-friendly.
+
+# Synthesis prompt for the developer quickstart guide (quickstart.md)
+quickstart_prompt: |-
+    Task: Write the developer quickstart guide (quickstart.md) based on the module summaries.
+    Rule 1: Focus exclusively on prerequisites, build/installation steps, available CLI commands and flags, configuration (.code-reducer.yaml and environment variables), and package structure.
+    Rule 2: Include a Task Routing markdown table (| Goal / Task | Module Doc | Key Source Files |) that maps developer tasks ("I want to...") to the relative module documentation paths (modules/.../README.md) and source files provided in the project context.
+    Rule 3: Keep it concise, actionable, and strictly factual.
 
 # Prompt used to consolidate chunks of the same file
 file_fact_consolidation_prompt: |-
-    You are a specialized code documentation assistant.
-    Consolidate, deduplicate and merge the following facts extracted from different chunks of the same file into a single, cohesive summary.
+    Task: Consolidate and deduplicate facts extracted from different chunks of the same file into a single, concise summary.
+    Rule 1: Merge duplicate items and preserve only unique, verifiable facts.
+    Rule 2: Keep bullet points to 1 line each; do NOT copy source code blocks or add long explanations.
+    Rule 3: If all inputs are 'None', output solely 'None'.
 
 # Customize the LLM extraction pipeline steps
 extraction_steps:
     - name: API_SIGNATURES
       prompt: |-
         Task: Extract the public API surface.
-        Output: A strict Markdown list of all exported or public elements (classes, functions, methods, types). Include parameters and return types. Do not explain internal execution logic.
+        Output: Markdown bullet list of exported/public types, functions, and methods, strictly 1 line per signature with parameters and return types. Do NOT explain internal logic or copy code blocks. If none exist, output solely 'None'.
     - name: BUSINESS_LOGIC
       prompt: |-
         Task: Extract the core purpose and domain rules.
-        Output: Explain the primary domain problem this code solves. List the high-level algorithm steps. Ignore syntax, standard library usage, and basic implementation details.
+        Output: Maximum 5 concise bullet points describing the primary domain problem and high-level logic. Ignore syntax and boilerplate. Do NOT copy code blocks. If none exist, output solely 'None'.
     - name: STATE_AND_CONCURRENCY
       prompt: |-
         Task: Identify mutable state and thread safety.
-        Output: List global variables, shared states, or class-level properties that are modified. Identify synchronization mechanisms (locks, mutexes, async/await, atomic types). If entirely stateless, output exactly: 'No mutable state'.
+        Output: Concise bullet list (1 line per item) of modified package/global state, struct fields, or synchronization mechanisms (locks, mutexes, channels, atomics). Do NOT copy code blocks. If stateless, output solely 'None'.
     - name: ERRORS_AND_SIDE_EFFECTS
       prompt: |-
         Task: Analyze external I/O and error propagation.
-        Output: Detail interactions with external systems (network, disk, databases, APIs). Explain how errors are propagated (exceptions, error return codes, crash/panic). If no I/O exists, state 'No external side effects'.
+        Output: Concise bullet list (1 line per item) of external system interactions (filesystem, network, subprocesses, environment) and error handling patterns. Do NOT copy code blocks. If none exist, output solely 'None'.
 
 # Directory paths, files, or glob patterns to ignore during scanning
 ignore:
@@ -152,23 +196,30 @@ ignore:
   - examples
 ```
 
-### Precedence Order
-Code-Reducer implements a four-tier configuration resolution chain:
+### Configuration Fields & 4-Tier Precedence Order
+Code-Reducer resolves configuration values through a strict 4-tier hierarchy:
 
-```
-[1. CLI Overrides] ──► [2. Environment Variables] ──► [3. YAML Config File] ──► [4. System Defaults]
+```text
+[1. CLI Flags] ──► [2. Environment Variables] ──► [3. .code-reducer.yaml] ──► [4. Built-in Defaults]
 ```
 
-1. **CLI Flags**: Command-line arguments like `--model-id` and `--num-ctx` take absolute priority.
-2. **Environment Variables**: Overrides config file values:
-   * `CODE_REDUCER_MODEL_ID` overrides `model_id`
-   * `OLLAMA_BASE_URL` overrides `ollama_base_url`
-   * `OLLAMA_NUM_CTX` overrides `ollama_num_ctx`
-3. **YAML File (`.code-reducer.yaml`)**: Read from the repository root.
-4. **Defaults**: Hardcoded fallbacks if no other configuration exists.
+| Field (`.code-reducer.yaml`) | CLI Flag | Environment Variable | Built-in Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `model_id` | `--model-id` | `CODE_REDUCER_MODEL_ID` | `ornith:9b` | Ollama model identifier used for extraction and synthesis. |
+| `ollama_base_url` | — | `OLLAMA_BASE_URL` | `http://localhost:11434` | Base URL of the local or remote Ollama HTTP server. |
+| `ollama_num_ctx` | `--num-ctx` | `OLLAMA_NUM_CTX` | `8192` | Context window size (`num_ctx`) passed to Ollama requests (must be a positive integer). |
+| `docs_dir` | — | — | `wiki` | Output directory (relative to repository root) for generated wiki pages and `.metadata.json`. |
+| `language` | `--language` | `CODE_REDUCER_LANGUAGE` | `""` (English) | Target prose language. Appends a `LanguageInstruction` to system prompts so prose, headings, and tables are written in the chosen language while keeping code identifiers, paths, CLI flags, env vars, and Mermaid keywords intact. |
+| `system_prompt` | — | — | `DefaultSystemPrompt` | Base system instructions prepended to every LLM call. |
+| `module_synthesis_prompt` | — | — | `DefaultModuleSynthesisPrompt` | System instructions for synthesizing directory-level module documentation (`modules/<dir>/README.md`). |
+| `architecture_prompt` | — | — | `DefaultArchitecturePrompt` | System instructions for synthesizing `<docs_dir>/architecture.md`. |
+| `quickstart_prompt` | — | — | `DefaultQuickstartPrompt` | System instructions for synthesizing `<docs_dir>/quickstart.md` with a Task Routing table. |
+| `file_fact_consolidation_prompt` | — | — | `DefaultFileFactConsolidationPrompt` | System instructions for deduplicating facts across chunks of a multi-chunk source file. |
+| `extraction_steps` | — | — | `DefaultExtractionSteps` (4 steps) | Ordered list of `{name, prompt}` extraction passes executed on each source file chunk. |
+| `ignore` | — | — | `[]` | Deduplicated list of files, directories, or gitignore glob patterns excluded from scanning (merged with `.gitignore` and `docs_dir`). |
 
 ### Multi-language & Infrastructure Support
-Code-Reducer can be configured to document not only software codebases but also Infrastructure-as-Code (IaC) or cloud topology. You can inspect an example config tailored for Terraform project analysis in [examples/terraform/.code-reducer.yaml](examples/terraform/.code-reducer.yaml).
+Code-Reducer can be configured to document software codebases as well as Infrastructure-as-Code (IaC) or cloud topology. See an example configuration tailored for Terraform project analysis in [examples/terraform/.code-reducer.yaml](examples/terraform/.code-reducer.yaml).
 
 ---
 
@@ -177,99 +228,118 @@ Code-Reducer can be configured to document not only software codebases but also 
 ### 1. Hierarchical Map-Reduce Engine
 
 ```mermaid
-graph TD
-    A[Code Discovery & Filtering] --> B[Build Hierarchical Tree]
-    B --> C[Map: File-level API Extraction]
-    C --> D[Reduce: Batch Synthesis - Context Size Budgeted]
-    D --> E[Directory Module Summary .md]
-    E --> F[Hierarchical Subsystem Synthesis]
-    F --> G[Root Level Reduction]
-    G --> H[Global Docs: architecture.md & quickstart.md]
+flowchart TD
+    A["Code Discovery & Filtering"] --> B["Build Hierarchical Tree & SHA-256 Hashes"]
+    B --> C["Map: File-Level Fact Extraction (Chunked)"]
+    C --> D["Smart Incremental Diff (Fact Comparison)"]
+    D --> E["Reduce: Bottom-Up Module Synthesis"]
+    E --> F["Global Synthesis: architecture.md & quickstart.md"]
+    F --> G["Deterministic Finalizer: Mermaid, index.md & Links"]
+    G --> H["AGENTS.md Sync & Metadata Cache Persistence"]
 ```
 
-#### Tree Structure Construction
-Code-Reducer groups scanned files into a logical directory hierarchy using a node prefix tree (`DirNode` containing children, files, and path values).
+#### Tree Structure Construction & Provenance Headers
+Code-Reducer groups discovered source files into a logical directory hierarchy (`DirNode` tree). When synthesizing each directory node into `<docs_dir>/modules/<module>/README.md`, `formatModuleDocument` prepends a deterministic provenance blockquote header listing the module path and sorted source filenames:
+```markdown
+> **Module:** `internal/engine` | **Source Files:** `cache.go`, `chunking.go`, `finalize.go`, `llm.go`, `orchestrator.go`, `synthesize.go`, `tree.go`
+```
 
-#### State Tracking & Change Propagation (`RunUpdate`)
-In `update` mode, the engine dynamically determines which directory nodes are "affected" to avoid full-repository rebuilds. A directory is marked "affected" if:
-* A file in its immediate files list has changed (detected via hash comparison).
-* Its corresponding wiki module summary is missing from `wiki/modules/`.
-* Its cached entry is missing from `.metadata.json` (as part of `MetadataCache.Modules`).
-* **Propagation**: If a child directory is affected, the status propagates recursively upwards to the parent directory. This triggers a bottom-up rebuild of parent and root summaries.
+#### Comprehensive Cache Hash (`computeStepsHash`)
+The metadata cache (`<docs_dir>/.metadata.json`) stores a `steps_hash` SHA-256 digest computed by `computeStepsHash(cfg)` over:
+* `ModelID` and `Language`
+* `SystemPrompt`, `ModuleSynthesisPrompt`, `ArchitecturePrompt`, `QuickstartPrompt`, and `FileFactConsolidationPrompt`
+* Every `ExtractionStep`'s `Name` and `Prompt`
 
-#### Cache Invalidation on Extraction Steps Change
-The metadata cache contains a `steps_hash` field representing the SHA256 of the configuration's `extraction_steps` array. During the `update` pipeline, the engine calculates the hash of the current extraction steps. If it differs from `cache.StepsHash`, it clears file facts and module caches, forcing a full regeneration. This ensures that when extraction requirements change, the entire documentation is safely updated.
+If any of these settings or prompts change between runs, `RunUpdate` automatically invalidates all cached file facts and module summaries and performs a full regeneration.
 
-#### The Map Phase (Dynamic Chunking with Overlap)
-For every code file in an affected directory, the engine calculates the `SHA256` of its contents:
-* **Cache Hit**: Reuses the stored facts string from the cache.
-* **Cache Miss**: Analyzes the file using the configurable `extraction_steps` pipeline.
-* **Llm Context-Based File Limits**: Large files are split into overlapping fragments. The engine calculates a dynamic truncation limit: it allocates 75% of `NumCtx` (typically assuming ~4 characters per token) to the file content, reserving the remaining 25% for prompts and output context. An overlap margin (defaults to 800 characters) is used to prevent context blindness at boundaries.
-* Isolated inference is run on each chunk for each extraction step.
+#### Context Budgeting (`calculateFileLimit`) & The Map Phase
+To stay strictly within local LLM context windows without truncating source files or intermediate summaries, both file extraction and batch reduction budget characters using `calculateFileLimit(numCtx, promptOverhead)`:
+* **Character Budget Formula**: `limit = numCtx * 2 - runeCount(promptOverhead)` (`maxCharsMultiplier = 2`), with a floor of `defaultChunkOverlap * 2` (`1600` runes).
+* **Dynamic Overlapping Chunks**: For file extraction, `maxExtractionOverhead` measures the rune count of the system prompt plus the largest extraction step wrapper (including target file path and sibling directory file list). Files exceeding `fileLimit` runes are split via `chunkTextWithOverlap` on newline boundaries (searching the last 25% of the window) with an overlap of `800` runes (clamped to `fileLimit / 4`).
+* **Multi-Step Fact Extraction**: Each chunk is evaluated sequentially across all configured `extraction_steps`. Outer markdown fences are stripped (`stripOuterMarkdownFence`), `"None"`/`"N/A"` responses are filtered out (`isNoneFact`), and multi-chunk facts for a given step are consolidated via `reduceFileFacts`.
 
-#### The Reduce Phase (Hierarchical Consolidation & Truncation Safety)
-To prevent massive folders from blowing out Ollama's context window, Code-Reducer applies a recursive bottom-up consolidation strategy grouped in dynamically sized batches (capped at `NumCtx * 3` characters):
-* **File-Level Reduce**: If a single file was split into multiple chunks during the Map phase, their extracted facts are consolidated into a unified briefing via `reduceFileFacts`.
-* **Directory-Level Reduce**: File briefings and child directory summaries are grouped into batches.
-  * If a directory's components fit into a single batch, they are joined and sent to the LLM with the `module_synthesis_prompt` to yield a unified directory summary.
-  * If they exceed the limit, they are split into sub-batches, reduced independently, and recursively merged.
-  * **Dynamic Multi-Layer Map-Reduce**: In `reduceItems`, if a single item exceeds the character limit, it is automatically chunked into smaller pieces to create a deeper reduction layer. This preserves all information without truncation. To avoid infinite map-reduce loops (e.g. if the LLM refuses to condense text), the engine compares input and output payload sizes and gracefully halts recursion without losing context or exceeding buffer limits.
+#### The Reduce Phase (Hierarchical Consolidation & Loop Prevention)
+* **Dynamic Batching (`reduceWithLLM` & `reduceItems`)**: Component briefings (file facts and child subsystem summaries) are grouped into batches up to `maxChars = numCtx * 2 - runeCount(promptOverhead)` runes.
+* **Oversized Item Expansion**: Any single item exceeding `maxChars` is split via `expandOversizedItems` into `maxChars / 2` chunks with `maxChars / 10` overlap before batching.
+* **Multi-Layer Reduction & Loop Guard**: When multiple batches are required, each batch is summarized with `partialBatchInstruction` and recursively reduced. If an LLM pass fails to condense the intermediate text (output rune count is `>= 95%` of input rune count), `reduceItems` halts recursion and concatenates the intermediate summaries to guarantee termination.
 
-#### Global Synthesis Phase
-After reducing the root directory (`.`), the final summary is sent to the LLM to generate:
-1. **System Blueprint**: `wiki/architecture.md` (High-level architecture, module boundaries, external integrations).
-2. **Developer Quickstart**: `wiki/quickstart.md` (Onboarding guide, configuration guidelines).
-3. **AI Agent Guidelines**: During the initial initialization (`init`), the pipeline writes guidelines to `AGENTS.md` (or appends to it) to help other incoming agentic developers find and utilize the generated documentation.
+#### Smart Incremental `update` Short-Circuit
+During `code-reducer update`, the orchestrator minimizes redundant LLM calls at two levels:
+1. **File Fact Short-Circuit (`resolveEffectiveChanges`)**: When a tracked file's SHA-256 hash changes (`StatusModified`), Code-Reducer immediately extracts its new `Facts` and compares them against the previously cached `Facts`. If `newFacts == prevEntry.Facts` (e.g., formatting changes, comments, or internal edits that do not change extracted facts), the file's new SHA-256 is saved in `.metadata.json`, the file is excluded from effective changes, and neither its directory nor its parent modules are re-synthesized.
+2. **Global Docs Short-Circuit**: After bottom-up tree synthesis completes, `GenerateStandardDocs` (`architecture.md` and `quickstart.md`) is executed **only** if at least one of the following holds:
+   * Any of `architecture.md`, `quickstart.md`, or `index.md` is missing from `<docs_dir>`.
+   * Repository file structure changed (`StatusAdded` or `StatusDeleted` files).
+   * The root module summary (`cache.Modules["."]`) or any top-level child directory summary (`tree.Children`) changed compared to its pre-update cached value.
+   Otherwise, global documentation regeneration is skipped entirely.
+3. **Stale Cache & Orphan Pruning (`pruneStaleCache`)**: Deleted files and removed directories are pruned from `.metadata.json`, and any orphaned `<docs_dir>/modules/.../README.md` files and empty module subdirectories are removed from disk.
+
+#### Enriched Project Context & Task Routing in `quickstart.md`
+When generating `architecture.md` and `quickstart.md`, `buildProjectContextItems` supplies the LLM with a structured, grounded context payload:
+1. **`## Project Directories & Module Documentation Map`**: Lists every directory in the repository and maps each documented module path to its relative wiki path (`modules/<dir>/README.md`) and sorted source files.
+2. **`## Root Module Summary`**: The synthesized root (`.`) summary.
+3. **`### Top-Level Submodule: <path>`**: The synthesized summaries for all immediate child directories of the repository root.
+
+Guided by `DefaultQuickstartPrompt`, `quickstart.md` uses this map to generate a grounded **Task Routing** markdown table (`| Goal / Task | Module Doc | Key Source Files |`) that maps concrete developer goals (`"I want to..."`) to exact module documentation pages and source files.
+
+#### Deterministic Finalizer (`finalizeWiki`)
+At the end of every `init` and `update` run (when work is performed), `finalizeWiki` executes three deterministic post-processing passes across all markdown files in `<docs_dir>`:
+1. **Mermaid Diagram Sanitization & Validation (`sanitizeAndValidateMermaid`)**:
+   * Inspects all fenced ```` ```mermaid ```` blocks.
+   * For `flowchart` and `graph` diagrams, automatically repairs common small-LLM syntax mistakes line-by-line:
+     * Renames reserved lowercase `end` node identifiers to `endNode` in node definitions (`end[...]` -> `endNode[...]`) and arrow edges (`--> end` / `end -->`).
+     * Preserves compound node shapes (`(((...)))`, `((...))`, `([...])`, `[(...)]`, `[[...]]`, `{{...}}`, `[...]`, `(...)`, `{...}`) and quotes unquoted labels containing special characters (`():;<>`), converting `;` to `,`, `<`/`>` to `&lt;`/`&gt;`, and inner `"` to `'`.
+   * Runs `heuristicMermaidError` to verify diagram type headers (`flowchart`, `graph`, `sequenceDiagram`, `stateDiagram`, `stateDiagram-v2`, `classDiagram`, `erDiagram`, `gantt`, `pie`, `gitGraph`, `mindmap`, `timeline`, `journey`, `C4Context`, `xychart-beta`), non-empty body lines, balanced quotes/brackets, and absence of unquoted special characters or `end` node IDs.
+   * Any unclosed or invalid Mermaid block is gracefully degraded to a ```` ```text ```` code fence preceded by `<!-- code-reducer: mermaid parse failed (<reason>) -->` so broken diagrams never break Markdown renderers.
+2. **Deterministic Navigation Index (`generateWikiIndex`)**:
+   * Generates `<docs_dir>/index.md` linking to `architecture.md`, `quickstart.md`, and every documented module in sorted order, complete with a truncated 140-rune summary description (`extractSummaryDescription`) and source file count/list (`formatNodeFiles`).
+3. **Internal Link & Heading Anchor Validation with Auto-Repair (`validateMarkdownLinks`)**:
+   * Parses all inline Markdown links outside code fences and inline code spans, stripping any previous `<!-- code-reducer: broken internal link ... -->` stamps first.
+   * Resolves relative file paths safely within the repository. If a relative link target does not exist at the written path, `tryAutoRepairLink` checks unambiguous candidate paths under `<docs_dir>/modules/` and `<docs_dir>/` (including `<dir>/README.md`) and rewrites the relative link in place.
+   * Validates `#anchor` fragments on target `.md` files against GitHub-style heading slugs (`extractHeadingAnchors`, ignoring `L<num>` line anchors).
+   * Stamps any remaining broken links, non-portable root-absolute links (`/path`), or missing heading anchors with a `<!-- code-reducer: broken internal link [...] ... -->` HTML comment immediately above the line.
+
+#### Idempotent `AGENTS.md` Synchronization (`updateAgentGuidelines`)
+During `code-reducer init`, Code-Reducer creates `AGENTS.md` or updates the delimited block bounded by `<!-- CODE-REDUCER:START -->` and `<!-- CODE-REDUCER:END -->` in place (preserving any surrounding custom instructions). The block directs AI coding agents to `<docs_dir>/architecture.md`, `<docs_dir>/quickstart.md`, `<docs_dir>/index.md`, `<docs_dir>/modules/`, and the `code-reducer search` and `code-reducer read` CLI commands.
 
 ---
 
-### 2. Security & Concurrency Sandbox
+### 2. Section-Level BM25 Search & Read (`internal/search`)
 
-The codebase enforces security when accessing local system paths and handling file writing operations.
+* **Section Indexing (`parseMarkdownSections`)**: Splits each markdown file in `<docs_dir>` (excluding `index.md` and dot-prefixed files) into sections at `#` and `##` headings (falling back to `###` if a page has no `##` headings). Extracts module path and source file list from each page's `> **Module:** ... | **Source Files:** ...` provenance header.
+* **CamelCase-Aware Tokenization (`tokenize`)**: Splits words on non-alphanumeric boundaries and decomposes CamelCase and acronym compounds (e.g., `SafeResolve` -> `saferesolve`, `safe`, `resolve`; `HTMLParser` -> `htmlparser`, `html`, `parser`).
+* **Weighted BM25 Scoring (`scoreAndRankSections`)**: Scores sections using BM25 (`k1 = 1.2`, `b = 0.75`) with field weights:
+  * **Title / Page + Heading tokens**: weight `3.0`
+  * **Provenance Module + Source File tokens**: weight `2.0`
+  * **Section Body tokens**: weight `1.0`
+  * Applies a multi-term coordination boost (`1 + 0.25 * (matchedTerms - 1)`) when multiple query tokens match, and a `2.0x` path-hint boost when `--path/-p` matches the section's page path, module path, or source files.
+* **Section Extraction (`ReadWikiSection`)**: Resolves `<page>` or `<page>#<anchor>` inside `<docs_dir>` and returns either the entire markdown file or the slice of lines belonging to the target heading anchor.
 
-#### Path Traversal Guard (`SafeResolve`)
-Every filesystem operation targeting repository resources passes through `security.SafeResolve`.
-1. **Directory Traversal Detection**: It computes the absolute path of the repository root, joins it with the input path, cleans it, and obtains the relative path.
-2. **Sanity Check**: If the relative path starts with `..` or there is an error in resolving, it immediately returns a path traversal error, preventing any access to files outside the repository.
+---
+
+### 3. Security & Concurrency Sandbox
+
+The codebase enforces strict filesystem security and concurrency controls across all read, write, and search operations:
+
+#### Path Traversal Guard (`security.SafeResolve`)
+Every filesystem operation targeting repository resources passes through `security.SafeResolve`:
+1. Evaluates symlinks bottom-up on all existing ancestor directories before completing absolute path resolution (defending against TOCTOU symlink escapes).
+2. Verifies that the resolved path stays strictly inside the repository root boundary, returning `security.ErrPathTraversal` if it escapes via `..` or external symlinks.
 
 #### Atomic Process Locking (`security.AcquireLock`)
-To serialize execution across multiple terminal windows or background jobs, the command engine invokes `security.AcquireLock` before starting the process:
-1. **Atomic Lock Creation**: Opens `.code-reducer.lock` using the `os.O_WRONLY|os.O_CREATE|os.O_EXCL` flags. This guarantees that file creation is atomic at the OS level; if the lockfile already exists, the execution fails fast, preventing concurrent runs.
-2. **PID Recording**: Writes the current Process ID (PID) to the lockfile.
-3. **Git Isolation**: The runner automatically checks if `.code-reducer.lock` is ignored. If not, it safely appends it to the project's `.gitignore` file.
+To serialize pipeline runs across multiple terminals or background jobs, `engine.Run` acquires `.code-reducer.lock` before starting:
+1. Opens `.code-reducer.lock` atomically with `os.O_WRONLY|os.O_CREATE|os.O_EXCL` (`0600` permissions) and records the current PID.
+2. Automatically ensures `.code-reducer.lock` is present in the repository's `.gitignore` (`tools.EnsureGitignoreHasLockfile`).
 
-#### TOCTOU Symlink Hijacking & Safe File I/O
-1. **Safe Reading (`ReadFileSafely`)**: When reading files, the engine resolves the target path using `security.SafeResolve`. `SafeResolve` prevents directory traversal by evaluating symlinks bottom-up on all existing ancestor directories before completing absolute path resolution, and aborts if the path escapes the repository boundary.
-2. **Atomic Writing (`WriteFileSafely` & `SaveConfig`)**: To prevent data corruption, all file writes are performed atomically. The engine creates a temporary file in the target directory (`os.CreateTemp`), writes the contents, calls `Sync()` to flush to disk, closes the descriptor, sets the permissions, and atomically replaces the target file via `os.Rename`.
+#### Safe & Atomic File I/O (`ReadFileSafely`, `WriteFileSafely`, `SaveConfig`)
+All file writes create a temporary file in the target directory (`os.CreateTemp`), write the data, call `Sync()` to flush to disk, close the descriptor, set permissions, and atomically replace the target via `os.Rename`.
 
 ---
 
-### 3. File Discovery and Ignore Filters
+### 4. File Discovery, Ignore Filters, and LLM Client
 
-Repository scanning is executed using `filepath.WalkDir` coupled with multiple layers of evaluation:
-1. **Pruning Subtrees**: Directories that are dot-prefixed (such as `.git` or `.venv`), end in `.egg-info`, or match any ignore rules (from `.gitignore` or configuration) are skipped entirely using `filepath.SkipDir` during traversal, saving CPU cycles.
-2. **Ignore Matching Rules**: Ignores loaded from the project's `.gitignore` and specified in the YAML configuration are merged and compiled using a dedicated Gitignore library (`go-gitignore`), ensuring 100% compliance with standard Git semantic rules.
-
----
-
-### 4. Git CLI and Hash-Based Incremental Rebuilds
-
-Instead of relying on external Git diff parsing during runtime, Code-Reducer implements a robust Git verification step combined with a filesystem hash-based comparison engine:
-* **`RunGit` Wrapper**: Executes `git` commands with the `--no-pager` option. It isolates `stdout` and `stderr` into separate streams, ensuring that Git warnings don't corrupt the actual command output used by the application.
-* **Platform-Independent Change Detection**: The update engine discovers candidate source files on the filesystem, computes their `SHA256` hash, and compares them directly to the hashes persisted in the `.metadata.json` cache file.
-* **State Classification**: 
-  * **Added**: File is present in the workspace but missing from the cache.
-  * **Modified**: File is present in both, but its current SHA256 does not match the cached hash.
-  * **Deleted**: File exists in the cache but is missing from the workspace. Deleted files are automatically pruned from the cache.
-* **Caching & Metadata Cache (`.metadata.json`)**: The metadata cache maps file paths to their `SHA256` and generated list of facts, alongside a map of directory modules. During updates, the engine matches active files against the cache and garbage-collects cache entries for deleted files.
-
----
-
-### 5. LLM Client Contract & Transports
-
-* **HTTP Request Timeout**: Configured to `10 minutes` to handle complex summarizations.
-* **Ollama API Schema**: Communicates with the `/api/chat` POST endpoint.
-* **Fail-Fast Client**: The LLM client is strictly fail-fast and does not perform retry attempts or exponential backoffs when calling the Ollama service. Any failure immediately returns an error.
+* **File Discovery (`tools.DiscoverCodeFiles`)**: Walks the repository via `filepath.WalkDir`, pruning dot-prefixed directories (`.git`, `.venv`, etc.), `.egg-info` directories, `<docs_dir>`, and any path matching merged `.gitignore` and `.code-reducer.yaml` `ignore` patterns (compiled via `go-gitignore`). Skips binary/non-UTF-8 files and empty files.
+* **Git Verification (`tools.VerifyGitRepo` & `RunGit`)**: Executes `git --no-pager` commands with isolated `stdout` and `stderr` buffers to verify repository integrity cleanly.
+* **Fail-Fast Ollama Client (`internal/engine/llm.go`)**: Communicates with Ollama's `POST /api/chat` endpoint (`stream: false`, `options.num_ctx`) with a `10 minute` HTTP timeout and strict fail-fast error handling.
 
 ---
 
@@ -300,35 +370,40 @@ Step 2: Hierarchical Tree-Merging (Map-Reduce)...
 ➜ Extracting file (Step 4/4 - ERRORS_AND_SIDE_EFFECTS): cmd/init.go
 ➜ Extracting file (Step 1/4 - API_SIGNATURES): cmd/root.go
 ...
-➜ Synthesizing directory: cmd (4 total components)
-➜ LLM Synthesizing chunk for cmd (4 items)
+➜ Synthesizing directory: cmd (6 total components)
+➜ LLM Synthesizing chunk for cmd (6 items)
 ...
 ➜ Extracting file (Step 1/4 - API_SIGNATURES): internal/config/resolve.go
 ...
 ➜ Synthesizing directory: internal/config (3 total components)
 ➜ LLM Synthesizing chunk for internal/config (3 items)
 ...
-➜ Synthesizing directory: . (4 total components)
-➜ LLM Synthesizing chunk for . (4 items)
+➜ Synthesizing directory: . (2 total components)
+➜ LLM Synthesizing chunk for . (2 items)
 Step 3: Global Architecture Synthesis...
+➜ Generating wiki/architecture.md (4 items)...
 Step 4: Generating Quickstart...
+➜ Generating wiki/quickstart.md (4 items)...
+Finalizing Wiki: validating Mermaid diagrams, generating index, and checking links...
 Step 5: Updating AGENTS.md...
 Pipeline completed successfully!
 ```
 
 ### Generated Documentation
 
-You can inspect the actual documentation generated by Code-Reducer for this repository in the local [wiki/](wiki/) directory:
+You can inspect the documentation generated by Code-Reducer for this repository in the local [wiki/](wiki/) directory:
 
-* **System Blueprint**: [wiki/architecture.md](wiki/architecture.md) – A high-level architectural overview of the system, module relations, and boundaries.
-* **Developer Quickstart**: [wiki/quickstart.md](wiki/quickstart.md) – A quick onboarding guide with patterns, configuration rules, and setup steps.
-* **Module Documentation**: Detailed technical specifications located in the [wiki/modules/](wiki/modules/) subdirectory:
-  * [cmd/README.md](wiki/modules/cmd/README.md) – CLI commands (`root`, `setup`, `init`, `update`).
+* **Documentation Index**: `wiki/index.md` – Deterministic catalog linking to global overviews and all module pages with summary descriptions and file lists.
+* **System Blueprint**: [wiki/architecture.md](wiki/architecture.md) – High-level architectural overview, Mermaid data-flow diagram, module relationships, and system boundaries.
+* **Developer Quickstart**: [wiki/quickstart.md](wiki/quickstart.md) – Onboarding guide with prerequisites, CLI commands, configuration rules, and the **Task Routing** table.
+* **Module Documentation**: Detailed technical specifications located in [wiki/modules/](wiki/modules/):
+  * [cmd/README.md](wiki/modules/cmd/README.md) – CLI commands (`root`, `setup`, `init`, `update`, `search`, `read`).
   * [internal/README.md](wiki/modules/internal/README.md) – Synthesis of core application library packages.
-  * [internal/config/README.md](wiki/modules/internal/config/README.md) – Configuration engine and environment management details.
-  * [internal/engine/README.md](wiki/modules/internal/engine/README.md) – Core Map-Reduce execution pipeline and LLM client logic.
-  * [internal/security/README.md](wiki/modules/internal/security/README.md) – Path traversal checks and flock-based concurrency controls.
-  * [internal/tools/README.md](wiki/modules/internal/tools/README.md) – Helper utilities for Git integration and directory/binary discovery.
+  * [internal/config/README.md](wiki/modules/internal/config/README.md) – 4-tier configuration engine, prompt defaults, and language instructions.
+  * [internal/engine/README.md](wiki/modules/internal/engine/README.md) – Core Map-Reduce execution pipeline, smart incremental diffing, deterministic finalizer, and LLM client.
+  * `internal/search/README.md` – Section-level BM25 search engine and anchor-aware markdown reader.
+  * [internal/security/README.md](wiki/modules/internal/security/README.md) – Path traversal guards and atomic lockfile concurrency controls.
+  * [internal/tools/README.md](wiki/modules/internal/tools/README.md) – Safe file I/O, markdown heading/fence parsers, and Git/file discovery utilities.
 
 ---
 

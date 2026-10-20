@@ -37,6 +37,7 @@ func computeStepsHash(cfg *config.Config) string {
 		h.Write([]byte{0})
 	}
 	writeField(cfg.ModelID)
+	writeField(cfg.Language)
 	writeField(cfg.SystemPrompt)
 	writeField(cfg.ModuleSynthesisPrompt)
 	writeField(cfg.ArchitecturePrompt)

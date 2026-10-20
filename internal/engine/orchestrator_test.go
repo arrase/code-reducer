@@ -62,17 +62,46 @@ func TestUpdateAgentGuidelines(t *testing.T) {
 		t.Fatalf("failed to create agent guidelines: %v", err)
 	}
 
-	content, err := os.ReadFile(filepath.Join(tmp, agentsFileName))
+	contentBytes, err := os.ReadFile(filepath.Join(tmp, agentsFileName))
 	if err != nil {
 		t.Fatalf("failed to read agent guidelines: %v", err)
 	}
-	if len(content) == 0 {
-		t.Fatalf("expected non-empty guidelines")
+	content := string(contentBytes)
+	for _, want := range []string{
+		agentsBlockStart,
+		"# AI Agent Guidelines",
+		"docs/architecture.md",
+		"docs/quickstart.md",
+		"docs/index.md",
+		"docs/modules/",
+		`code-reducer search "<query>"`,
+		`code-reducer read "<page#section>"`,
+		agentsBlockEnd,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("expected AGENTS.md to contain %q, got:\n%s", want, content)
+		}
 	}
 
 	// Idempotent update
 	if err := updateAgentGuidelines(tmp, "docs"); err != nil {
 		t.Fatalf("failed second run: %v", err)
+	}
+
+	// In-place replacement when docsDir changes
+	if err := updateAgentGuidelines(tmp, "wiki"); err != nil {
+		t.Fatalf("failed in-place update: %v", err)
+	}
+	updatedBytes, err := os.ReadFile(filepath.Join(tmp, agentsFileName))
+	if err != nil {
+		t.Fatalf("failed to read updated agent guidelines: %v", err)
+	}
+	updated := string(updatedBytes)
+	if !strings.Contains(updated, "wiki/index.md") || strings.Contains(updated, "docs/index.md") {
+		t.Errorf("expected in-place replacement of docsDir to wiki, got:\n%s", updated)
+	}
+	if strings.Count(updated, agentsBlockStart) != 1 {
+		t.Errorf("expected exactly 1 start marker after in-place update, got:\n%s", updated)
 	}
 }
 
@@ -94,6 +123,10 @@ func TestOrchestratorRunInitAndUpdate(t *testing.T) {
 	o := &orchestrator{client: &mockLLMCaller{numCtx: 2048}}
 	if err := o.RunInit(context.Background(), repoRoot, cfg, func(string) {}); err != nil {
 		t.Fatalf("unexpected error running RunInit: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(repoRoot, "docs", "index.md")); err != nil {
+		t.Fatalf("expected docs/index.md to be created by finalizeWiki during RunInit, got error: %v", err)
 	}
 
 	if err := o.RunUpdate(context.Background(), repoRoot, cfg, func(string) {}); err != nil {
@@ -145,6 +178,12 @@ func TestComputeStepsHash(t *testing.T) {
 	modifiedModel.ModelID = "qwen:14b"
 	if computeStepsHash(&modifiedModel) == baseHash {
 		t.Errorf("expected hash to change when ModelID changes")
+	}
+
+	modifiedLang := *baseCfg
+	modifiedLang.Language = "Spanish"
+	if computeStepsHash(&modifiedLang) == baseHash {
+		t.Errorf("expected hash to change when Language changes")
 	}
 
 	modifiedPrompt := *baseCfg
@@ -235,5 +274,98 @@ func TestCallLLMDoneReasonLengthWarning(t *testing.T) {
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "done_reason: length") {
 		t.Fatalf("expected truncation warning, got %v", warnings)
+	}
+}
+
+func TestBuildProjectContextItems(t *testing.T) {
+	tree := buildTree([]string{
+		"main.go",
+		"internal/engine/orchestrator.go",
+		"internal/engine/synthesize.go",
+	})
+	cache := newEmptyCache()
+	cache.Modules["."] = "Root summary"
+	cache.Modules["internal/engine"] = "Engine summary"
+
+	items := buildProjectContextItems("Root summary", tree, cache)
+	if len(items) < 2 {
+		t.Fatalf("expected at least 2 context items, got %d", len(items))
+	}
+
+	item0 := items[0]
+	for _, want := range []string{
+		"## Project Directories & Module Documentation Map",
+		"- `.` -> `modules/README.md` (files: main.go)",
+		"- `internal/engine` -> `modules/internal/engine/README.md` (files: internal/engine/orchestrator.go, internal/engine/synthesize.go)",
+	} {
+		if !strings.Contains(item0, want) {
+			t.Errorf("expected item 0 to contain %q, got:\n%s", want, item0)
+		}
+	}
+	if strings.Contains(item0, "`modules/internal/README.md`") {
+		t.Errorf("did not expect empty module 'internal' to be listed in Module Documentation Map, got:\n%s", item0)
+	}
+}
+
+func TestRunUpdateIdenticalFactsShortCircuit(t *testing.T) {
+	repoRoot := t.TempDir()
+	file1 := "main.go"
+	if err := os.WriteFile(filepath.Join(repoRoot, file1), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	cfg := &config.Config{
+		DocsDir:            "docs",
+		SystemPrompt:       config.DefaultSystemPrompt,
+		ArchitecturePrompt: config.DefaultArchitecturePrompt,
+		QuickstartPrompt:   config.DefaultQuickstartPrompt,
+		ExtractionSteps: []config.ExtractionStep{
+			{Name: "API_SIGNATURES", Prompt: "extract api"},
+		},
+	}
+
+	mock := &mockLLMCaller{numCtx: 2048}
+	o := &orchestrator{client: mock}
+
+	if err := o.RunInit(context.Background(), repoRoot, cfg, func(string) {}); err != nil {
+		t.Fatalf("unexpected error running RunInit: %v", err)
+	}
+
+	cacheBefore, err := loadMetadataCache(repoRoot, "docs")
+	if err != nil {
+		t.Fatalf("failed to load metadata cache: %v", err)
+	}
+	oldSHA := cacheBefore.Files[file1].SHA256
+
+	// Modify file1 with a comment change; mockLLMCaller returns the exact same extracted fact string.
+	if err := os.WriteFile(filepath.Join(repoRoot, file1), []byte("package main\n\n// Added comment\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatalf("failed to update test file: %v", err)
+	}
+
+	mock.userPrompts = nil
+	var statuses []string
+	if err := o.RunUpdate(context.Background(), repoRoot, cfg, func(msg string) {
+		statuses = append(statuses, msg)
+	}); err != nil {
+		t.Fatalf("unexpected error running RunUpdate: %v", err)
+	}
+
+	// Only 1 LLM call (for extracting the 1 step on file1) should have been made; zero module/global synthesis calls!
+	if len(mock.userPrompts) != 1 {
+		t.Fatalf("expected exactly 1 extraction LLM call and 0 synthesis calls, got %d calls: %v", len(mock.userPrompts), mock.userPrompts)
+	}
+
+	lastStatus := statuses[len(statuses)-1]
+	if lastStatus != "No modifications detected. Documentation is up to date." {
+		t.Errorf("expected short-circuit status message, got %q", lastStatus)
+	}
+
+	cacheAfter, err := loadMetadataCache(repoRoot, "docs")
+	if err != nil {
+		t.Fatalf("failed to load metadata cache after update: %v", err)
+	}
+	newSHA := cacheAfter.Files[file1].SHA256
+	if newSHA == "" || newSHA == oldSHA {
+		t.Errorf("expected SHA256 in .metadata.json to be updated from %q, got %q", oldSHA, newSHA)
 	}
 }

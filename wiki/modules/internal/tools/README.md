@@ -1,87 +1,66 @@
-# Internal Tools Module
+> **Module:** `internal/tools` | **Source Files:** `file_tools.go`, `git_tools.go`, `markdown.go`
+
+# internal/tools
 
 ## Module Responsibility
 
-This module provides safe filesystem operations and repository verification utilities for source code management workflows. It operates on a repository root (`repoRoot`) and resolves virtual paths through a security layer to prevent path traversal attacks. All operations are disk I/O only—no network, database, or external API calls.
+The `internal/tools` module provides three capability domains: safe filesystem operations with path-traversal protection, git repository verification, and Markdown parsing for code-reducer documentation generation. All filesystem operations route through a security layer (`security.SafeResolve`) before touching the OS, ensuring virtual paths cannot escape the intended repository root.
 
-**Data Flow:**
+## File Operations
 
-```
-caller → virtualPath → security.SafeResolve → filesystem path → os.* operations
-```
+### Safe File I/O
 
-All public functions accept a `repoRoot` parameter and resolve virtual paths before accessing the filesystem. Errors are propagated as return values; no panics occur.
+The `FileExistsSafely`, `RemoveFileSafely`, `ReadFileSafely`, and `WriteFileSafely` functions resolve virtual paths through `security.SafeResolve` to prevent path traversal attacks. `WriteFileAtomic` implements the temp-file-plus-rename pattern using `os.CreateTemp`, `os.Rename`, and `os.Chmod` with deferred cleanup. `WriteFileSafely` applies a TOCTOU-safe write pattern. `RemoveFileSafely` treats `os.IsNotExist` as a non-error condition.
 
----
+### Gitignore Management
 
-## File Tools (`file_tools.go`)
+`LoadGitignore` reads active ignore patterns from the repository. `EnsureGitignoreHasLockfile` guarantees lockfile entries are present in `.gitignore`. `ShouldIgnoreFile` evaluates paths against compiled ignore patterns from `github.com/sabhiram/go-gitignore`.
 
-### Safe File Access
+### Code File Discovery
 
-**`FileExistsSafely(repoRoot string, virtualPath string) bool`**
+`DiscoverCodeFiles` recursively walks the codebase directory tree using `filepath.WalkDir`. It skips directories matching ignore patterns, binary/non-regular files, and files matching skip rules (specific filenames like `go.sum`, `LICENSE`, `Dockerfile`; extensions like `.lock`, `.md`, `.png`; test suffixes like `_test.go`, `.spec.ts`). Binary detection reads the first 512 bytes and checks for null bytes.
 
-Checks whether a file exists at the resolved filesystem path. Swallows `os.Stat` errors and returns `false` on any failure.
-
-**`ReadFileSafely(repoRoot string, virtualPath string) ([]byte, error)`**
-
-Reads file contents from the resolved filesystem path. Returns the file data and an error. Swallows `os.Open` errors.
-
-**`RemoveFileSafely(repoRoot string, virtualPath string) error`**
-
-Removes a file at the resolved filesystem path. Ignores `os.IsNotExist` errors (file may already be absent). Propagates all other errors.
-
-### Atomic File Writes
-
-**`WriteFileAtomic(targetPath string, data []byte, perm os.FileMode) error`**
-
-Writes data to `targetPath` atomically: writes to a temporary file first, then renames to the target path. Wraps all sub-errors with `fmt.Errorf("failed to %s: %w", ...)`.
-
-**`WriteFileSafely(repoRoot string, virtualPath string, content []byte) error`**
-
-Writes content to the resolved filesystem path. Uses atomic write semantics.
-
-### Gitignore Integration
-
-**`EnsureGitignoreHasLockfile(repoRoot string) error`**
-
-Ensures `.code-reducer.lock` is included in `.gitignore` to prevent it from being committed.
-
-**`LoadGitignore(repoRoot string) ([]string, error)`**
-
-Loads `.gitignore` patterns from the repository root. Returns the parsed patterns and an error.
-
-**`ShouldIgnoreFile(relPath string, gitIgnore *ignore.GitIgnore) bool`**
-
-Determines whether a relative path matches any loaded gitignore patterns. Uses `ignore.CompileIgnoreLines` for pattern parsing (in-memory, no external I/O).
-
-### Global State
-
-| Variable | Type | Mutability |
-|---|---|---|
-| `skippedFileNames` | `map[string]bool` | Immutable after init |
-| `skippedExtensions` | `map[string]bool` | Immutable after init |
-| `skippedTestSuffixes` | `[]string` | Immutable after init |
-
-These maps are initialized once and never modified. They define the multi-layer file filtering rules applied during file discovery.
-
----
-
-## Git Tools (`git_tools.go`)
+## Git Operations
 
 ### Repository Verification
 
-**`VerifyGitRepo(repoRoot string) error`**
+`VerifyGitRepo` executes `git --no-pager rev-parse --is-inside-work-tree` with the working directory set to `repoRoot`. Subprocess stderr is captured into a `bytes.Buffer` and included in error messages. Returns `nil` on success; wraps the original error with context and captured stderr on failure.
 
-Verifies whether `repoRoot` resides inside a git repository by executing `git rev-parse --is-inside-work-tree` in the specified directory.
+## Markdown Parsing
 
-**Process Execution Details:**
+### Code Block and Heading Parsing
 
-- Spawns `git` as a child process via `exec.Command("git", "--no-pager", "rev-parse", "--is-inside-work-tree")`
-- Redirects child process stderr to a `bytes.Buffer` for capture
-- Sets child process working directory to `repoRoot`
+`ParseFenceOpen` validates fenced code block openers (```` or ~~~~) by checking fence character, length, and info string. `IsFenceClose` matches the closing declaration against the opening declaration. `ParseATXHeading` extracts heading levels 1–6 and titles with whitespace handling. `SlugifyHeading` replaces spaces with hyphens and lowercases for GitHub-style anchors. `NextHeadingAnchor` resolves duplicate slugs by appending numeric suffixes (e.g., `section-1`, `section-2`). `TruncateRunes` limits rune count.
 
-**Error Handling:**
+### Concurrency Note
 
-- If `cmd.Run()` returns an error, the function wraps it with `fmt.Errorf` and returns the wrapped error (including captured stderr content)
-- If `cmd.Run()` returns nil, returns nil (success)
-- No panics or swallowed errors
+`NextHeadingAnchor` mutates the `seenCounts` map parameter without synchronization. Callers must manage concurrent access externally.
+
+## Internal Data Flow
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Security
+    participant FS
+    participant Gitignore
+    participant Git
+    participant Markdown
+
+    Caller->>Security: SafeResolve(virtualPath)
+    Security->>FS: os.Stat/Open/ReadFile
+    FS-->>Security: file info / bytes
+    Security-->>Caller: resolved result
+
+    Caller->>Gitignore: LoadGitignore(repoRoot)
+    Gitignore->>FS: Read .gitignore
+    FS-->>Gitignore: raw lines
+    Gitignore->>Gitignore: CompileIgnoreLines
+    Gitignore-->>Caller: compiled patterns
+
+    Caller->>Git: git --no-pager rev-parse
+    Git-->>Caller: is-inside-work-tree result
+
+    Caller->>Markdown: ParseFenceOpen/ParseATXHeading
+    Markdown-->>Caller: parsed structure
+```

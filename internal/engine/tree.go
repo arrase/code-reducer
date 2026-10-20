@@ -118,3 +118,30 @@ func buildTree(files []string) *DirNode {
 	}
 	return root
 }
+
+func collectTreeDirs(tree *DirNode) map[string]bool {
+	dirs := make(map[string]bool)
+	var walk func(n *DirNode)
+	walk = func(n *DirNode) {
+		dirs[n.Path] = true
+		for _, child := range n.Children {
+			walk(child)
+		}
+	}
+	walk(tree)
+	return dirs
+}
+
+func collectTreeNodes(tree *DirNode) map[string]*DirNode {
+	nodes := make(map[string]*DirNode)
+	var walk func(n *DirNode)
+	walk = func(n *DirNode) {
+		nodes[n.Path] = n
+		for _, child := range n.Children {
+			walk(child)
+		}
+	}
+	walk(tree)
+	return nodes
+}
+

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/arrase/code-reducer/internal/config"
@@ -15,8 +16,9 @@ func TestRootFlags(t *testing.T) {
 	// reset flags
 	modelIDFlag = ""
 	numCtxFlag = ""
+	languageFlag = ""
 
-	RootCmd.SetArgs([]string{"--model-id", "test-model", "--num-ctx", "4096", "help"}) // run something harmless like help
+	RootCmd.SetArgs([]string{"--model-id", "test-model", "--num-ctx", "4096", "--language", "Spanish", "help"}) // run something harmless like help
 	_ = RootCmd.Execute()
 
 	if modelIDFlag != "test-model" {
@@ -25,6 +27,10 @@ func TestRootFlags(t *testing.T) {
 
 	if numCtxFlag != "4096" {
 		t.Errorf("Expected numCtxFlag to be '4096', got '%s'", numCtxFlag)
+	}
+
+	if languageFlag != "Spanish" {
+		t.Errorf("Expected languageFlag to be 'Spanish', got '%s'", languageFlag)
 	}
 }
 
@@ -178,22 +184,104 @@ func TestLoadInitialSetupConfig(t *testing.T) {
 }
 
 func TestRunSetupFlow(t *testing.T) {
+	t.Run("default values", func(t *testing.T) {
+		tmp := t.TempDir()
+		input := "\n\n\n\n\n\n"
+		reader := bufio.NewReader(bytes.NewBufferString(input))
+		err := runSetupFlowWithReader(reader, tmp)
+		if err != nil {
+			t.Fatalf("unexpected error running setup flow: %v", err)
+		}
+
+		cfg, err := config.LoadConfig(tmp)
+		if err != nil {
+			t.Fatalf("expected config to be saved: %v", err)
+		}
+		if cfg.ModelID != config.OllamaDefaultModelID {
+			t.Errorf("expected default model ID, got %s", cfg.ModelID)
+		}
+		if cfg.Language != "" {
+			t.Errorf("expected empty default language, got %s", cfg.Language)
+		}
+		if cfg.QuickstartPrompt != config.DefaultQuickstartPrompt {
+			t.Errorf("expected default quickstart prompt, got %s", cfg.QuickstartPrompt)
+		}
+	})
+
+	t.Run("custom language", func(t *testing.T) {
+		tmp := t.TempDir()
+		input := "\n\n\n\n\nSpanish\n"
+		reader := bufio.NewReader(bytes.NewBufferString(input))
+		err := runSetupFlowWithReader(reader, tmp)
+		if err != nil {
+			t.Fatalf("unexpected error running setup flow: %v", err)
+		}
+
+		cfg, err := config.LoadConfig(tmp)
+		if err != nil {
+			t.Fatalf("expected config to be saved: %v", err)
+		}
+		if cfg.Language != "Spanish" {
+			t.Errorf("expected language Spanish, got %s", cfg.Language)
+		}
+	})
+}
+
+func TestSearchAndReadCmd(t *testing.T) {
 	tmp := t.TempDir()
-	input := "\n\n\n\n\n"
-	reader := bufio.NewReader(bytes.NewBufferString(input))
-	err := runSetupFlowWithReader(reader, tmp)
+	origDir, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("unexpected error running setup flow: %v", err)
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(origDir)
+		RootCmd.SetOut(nil)
+		RootCmd.SetErr(nil)
+	}()
+
+	modDir := filepath.Join(tmp, "wiki", "modules", "internal", "engine")
+	if err := os.MkdirAll(modDir, 0755); err != nil {
+		t.Fatalf("failed to mkdir: %v", err)
 	}
 
-	cfg, err := config.LoadConfig(tmp)
-	if err != nil {
-		t.Fatalf("expected config to be saved: %v", err)
+	docContent := "> **Module:** `internal/engine` | **Source Files:** `chunking.go`\n\n" +
+		"# internal/engine\n\n" +
+		"## Text Reduction\n\n" +
+		"Uses `chunkTextWithOverlap` to split large source files.\n\n" +
+		"## Cache Persistence\n\n" +
+		"Stores SHA-256 hashes in `.metadata.json`.\n"
+	if err := os.WriteFile(filepath.Join(modDir, "README.md"), []byte(docContent), 0644); err != nil {
+		t.Fatalf("failed to write doc: %v", err)
 	}
-	if cfg.ModelID != config.OllamaDefaultModelID {
-		t.Errorf("expected default model ID, got %s", cfg.ModelID)
+
+	var searchBuf bytes.Buffer
+	RootCmd.SetOut(&searchBuf)
+	RootCmd.SetArgs([]string{"search", "--path", "chunking.go", "--limit", "3", "chunkTextWithOverlap"})
+	if err := RootCmd.Execute(); err != nil {
+		t.Fatalf("search command failed: %v", err)
 	}
-	if cfg.QuickstartPrompt != config.DefaultQuickstartPrompt {
-		t.Errorf("expected default quickstart prompt, got %s", cfg.QuickstartPrompt)
+	searchOut := searchBuf.String()
+	if !strings.Contains(searchOut, "modules/internal/engine/README.md#text-reduction") {
+		t.Errorf("expected search output to contain target anchor, got:\n%s", searchOut)
+	}
+	if !strings.Contains(searchOut, "Heading: Text Reduction") {
+		t.Errorf("expected search output to contain heading, got:\n%s", searchOut)
+	}
+
+	var readBuf bytes.Buffer
+	RootCmd.SetOut(&readBuf)
+	RootCmd.SetArgs([]string{"read", "modules/internal/engine/README.md#text-reduction"})
+	if err := RootCmd.Execute(); err != nil {
+		t.Fatalf("read command failed: %v", err)
+	}
+	readOut := readBuf.String()
+	if !strings.HasPrefix(readOut, "## Text Reduction") || !strings.Contains(readOut, "chunkTextWithOverlap") {
+		t.Errorf("unexpected read output:\n%s", readOut)
+	}
+	if strings.Contains(readOut, "Cache Persistence") {
+		t.Errorf("expected read output to stop before next H2 section, got:\n%s", readOut)
 	}
 }

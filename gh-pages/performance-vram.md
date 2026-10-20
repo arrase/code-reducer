@@ -18,35 +18,36 @@ This low VRAM footprint enables developers to execute high-density Map-Reduce do
 
 ---
 
-## Context Window Budgeting Strategy
+## Context Window Budgeting Strategy (`calculateFileLimit`)
 
-To prevent context truncation, out-of-memory (OOM) errors, or prompt degradation during file processing, Code-Reducer implements an automated **75% / 25% Context Budgeting Rule**.
+To prevent context truncation, out-of-memory (OOM) errors, or prompt degradation across diverse tokenizers and programming languages, Code-Reducer implements a unified **Overhead-Aware Rune Budgeting Formula** across both Map and Reduce phases:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────┐
-│               Total Context Window (NumCtx)             │
+│        Total Rune Budget (NumCtx × 2 Runes)             │
 ├───────────────────────────────────┬─────────────────────┤
-│ 75% Source File Payload           │ 25% Prompt & Output │
-│ (~4 chars / token)                │ Reserve             │
+│ Source / Batch Payload Limit      │ Exact Prompt        │
+│ (Min Floor: 1,600 Runes)          │ Overhead Deduction  │
 └───────────────────────────────────┴─────────────────────┘
 ```
+
+$$\text{Limit} = \max\left(1600,\; \text{NumCtx} \times 2 - \text{runeCount}(\text{promptOverhead})\right)$$
 
 ### 1. Dynamic File Chunking (Map Stage)
 
 For source files that exceed available token budgets:
 
-1. **Character Ratio Calculation**: Code-Reducer assumes an average of ~4 characters per token.
-2. **Payload Limit**: Assigns 75% of `NumCtx` to file payload chunks. For an 8,192 token window, the chunk payload limit is:
-   $$\text{Limit} = 8192 \times 0.75 \times 4 = 24,576 \text{ characters}$$
-3. **Context Boundary Overlap**: Each chunk includes an **800-character overlap margin** relative to the preceding chunk, preserving variable definitions, scopes, and comment context across chunk boundaries.
+1. **Conservative Rune Multiplier (`maxCharsMultiplier = 2`)**: Code-Reducer budgets 2 UTF-8 runes per context token to leave ample room for dense code punctuation, multi-language tokens, and LLM completion output.
+2. **Exact Overhead Deduction**: Subtracts `maxExtractionOverhead` (the combined UTF-8 rune count of `system_prompt`, `LanguageInstruction`, the longest extraction step wrapper, target file path, and sibling directory file list) from `NumCtx * 2`, with a minimum floor of `1600` runes (`defaultChunkOverlap * 2`).
+3. **Newline-Aware Overlap (`defaultChunkOverlap = 800`)**: Each chunk includes an **800-rune overlap margin** (capped at `fileLimit / 4` for small limits) and automatically snaps chunk boundaries to newline characters within the final quarter of the chunk window, preserving function signatures and comment blocks across boundaries.
 
 ### 2. Batch Consolidation (Reduce Stage)
 
-During directory-level reduction:
+During file fact consolidation (`reduceFileFacts`), directory synthesis (`reduceInChunks`), and global document generation (`generateDoc`):
 
-- Component summaries are merged into dynamic batches capped at `NumCtx * 3` characters.
-- If a single batch exceeds the character limit, Code-Reducer splits it into sub-batches and applies multi-layer recursive reduction.
-- To prevent infinite reduction loops (e.g. if an LLM fails to compress input text), the engine tracks input vs output size reduction ratios and gracefully terminates recursion before memory limits are breached.
+- Component summaries are merged into dynamic batches capped by the same `calculateFileLimit(numCtx, promptOverhead)` formula via `reduceWithLLM`.
+- Any single component exceeding `maxChars` is pre-split by `expandOversizedItems` into `maxChars / 2` sub-chunks with `maxChars / 10` overlap.
+- If multiple batches exist, `reduceItems` recursively condenses intermediate batches and applies a **95% shrinkage guard**: if total output runes are $\ge 95\%$ of total input runes, recursion stops and intermediate summaries are concatenated directly.
 
 ---
 
