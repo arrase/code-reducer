@@ -1,60 +1,80 @@
-# cmd Package Architecture
+> **Module:** `cmd` | **Source Files:** `init.go`, `read.go`, `root.go`, `search.go`, `setup.go`, `update.go`
+
+# cmd Module — Technical Documentation
 
 ## Module Responsibility
 
-The `cmd` package implements the CLI entry point for a documentation agent that writes and maintains project wikis. It orchestrates the documentation engine across three operational modes: **init** (first-time documentation build), **setup** (interactive configuration wizard), and **update** (incremental wiki regeneration). All commands are registered as `*cobra.Command` instances and share a common execution path through `executeCommand`, which dispatches to the engine based on the requested `engine.RunMode`.
+The `cmd` package implements the CLI surface for the Code-Reducer documentation agent. It registers cobra commands (`init`, `read`, `search`, `setup`, `update`) under a shared `RootCmd` and delegates execution to a single `executeCommand` function parameterized by an `engine.RunMode`. The entry point requires a valid Git repository; if no configuration file exists and stdin is a terminal, an interactive setup flow runs automatically.
 
 ## Data Flow
 
-```
-CLI Invocation
-    │
-    ▼
-RootCmd (root.go)
-    │
-    ├── ModeInit ──► initCmd ──► executeCommand(ModeInit) ──► engine.Run(ModeInit)
-    │
-    ├── ModeUpdate ──► updateCmd ──► executeCommand(ModeUpdate) ──► engine.Run(ModeUpdate)
-    │
-    └── ModeSetup ──► setupCmd ──► RunSetupFlow ──► config.SaveConfig
+```mermaid
+flowchart TD
+    A["RootCmd (cobra.Command)"] --> B["init() registers sub-commands"]
+    B --> C["executeCommand(mode)"]
+    C --> D["engine.Run"]
+    D --> E["signal.NotifyContext"]
+    E --> F["engine.RunMode"]
+    F --> G["init / read / search / setup / update"]
+    G --> H["config.ResolveConfig"]
+    H --> I["config.SaveConfig"]
 ```
 
 ## Command Registration
 
-### init.go
+All commands are package-level `*cobra.Command` pointers initialized once in `init()` and never mutated afterward.
 
-The `init` command is registered at package scope via a global `*cobra.Command` variable. On execution, it delegates to `executeCommand` with `engine.ModeInit`. The engine mode triggers a repository scan and generates the first set of wiki markdown pages. No public API surface is exposed from this file; all identifiers are unexported.
+| Command | Purpose | Mode Constant |
+|---------|---------|---------------|
+| `init` | Initialize project documentation; scans repository and builds initial wiki markdown pages | `engine.ModeInit` |
+| `read` | Read documentation pages or specific heading sections from the generated wiki repository | — |
+| `search` | Search wiki markdown pages at section granularity using BM25 ranking | — |
+| `setup` | Interactive CLI setup; prompts for LLM Model ID, Ollama Base URL, Context Size, Ignore patterns, Documentation directory, Output Language | — |
+| `update` | Incremental documentation updates; scans for files modified since the last documented commit | `engine.ModeUpdate` |
 
-### root.go
+## Flag State
 
-The root command (`RootCmd`) serves as the CLI application's top-level entry point. It is initialized once and never modified after creation. The root command binds two persistent flags (`modelIDFlag`, `numCtxFlag`) and provides the following unexported functions:
+Package-level mutable state is set via cobra flag registration in `init()` and is not modified by downstream functions.
 
-- **`init()`** — Initializes the root command and registers all subcommands.
-- **`executeCommand(mode engine.RunMode)`** — Central dispatch function. Accepts a `engine.RunMode` and returns `error`. Aggregates errors from `os.Getwd()`, `tools.VerifyGitRepo`, `checkAndRunSetup`, `config.ResolveConfig`, `checkInitStatus`, and `runEngine`.
-- **`checkAndRunSetup(repoRoot string)`** — Returns `error` when the configuration file is missing and stdin is not a terminal.
-- **`checkInitStatus(repoRoot, docsDir string, mode engine.RunMode)`** — Returns `error` when the requested init/update mode conflicts with the project's initialization state.
-- **`runEngine(repoRoot string, cfg *config.Config, mode engine.RunMode)`** — Wraps engine errors with `fmt.Errorf("documentation run failed: %w", err)`.
+| Flag | Type | Registration |
+|------|------|--------------|
+| `modelIDFlag` | `string` | `StringVar` |
+| `numCtxFlag` | `int` | `IntVar` |
+| `languageFlag` | `string` | `StringVar` |
+| `searchPathHintsFlag` | `[]string` | `StringSliceVarP` |
+| `searchLimitFlag` | `int` | `IntVarP` |
 
-### setup.go
+## Configuration Resolution
 
-The `setup` command (`setupCmd`) implements an interactive CLI setup wizard. It generates or updates a `.code-reducer.yaml` configuration file by collecting the following values from the user:
+`config.ResolveConfig()` reads and validates configuration from the filesystem, resolving model ID, context size, and language flags. Errors are returned directly to the caller.
 
-1. LLM Model ID
-2. Ollama Base URL
-3. Ollama Context Size (numeric validation with default fallback)
-4. Ignore patterns (comma-separated list; supports "clear"/"none" to reset)
-5. Documentation directory
+## Setup Flow
 
-The flow loads any existing configuration from the current working directory (falling back to an empty `config.Config{}` if the load fails), applies defaults, prompts sequentially, and persists the result via `config.SaveConfig`.
+`RunSetupFlow(repoRoot)` loads any existing `.code-reducer.yaml` configuration, applies defaults, and merges user inputs before persisting the final configuration via `config.SaveConfig`. The function accepts a `bufio.Reader` parameter to support non-interactive testing. Invalid or empty input falls back to existing values or defaults (e.g., `"clear"`/`"none"` clears ignore lists).
 
-### update.go
+## Error Handling
 
-The `update` command (`updateCmd`) performs incremental documentation updates. It identifies files modified since the last documented commit using cached SHA-256 hashes and regenerates the corresponding wiki pages. The operation is tied to the last documented commit as the baseline. No direct I/O is performed in this file; all logic is delegated to `internal/engine` via `executeCommand(engine.ModeUpdate)`.
+The module follows a fail-fast pattern: functions return immediately on error without recovery or retry logic. All errors are wrapped with `fmt.Errorf("...: %w", err)` for context preservation in call chains. `fmt.Fprint`/`fmt.Fprintln` return values are ignored (no error handling).
 
-## Error Propagation
+## Filesystem Interactions
 
-All functions in `cmd` return `error` type. Errors propagate up the call chain via return values. No panics or crashes are present. The cobra framework displays returned errors to the user and exits with a non-zero status code. Errors from `executeCommand` are returned directly to the cobra command framework via `RunE`.
+| Operation | Function | Notes |
+|-----------|----------|-------|
+| Read current working directory | `os.Getwd()` | Errors wrapped with `%w` |
+| Read configuration files | `config.ResolveConfig()` | Paths inferred from `internal/config` |
+| Read wiki markdown files | `search.SearchWiki` / `search.ReadWikiSection()` | Reads from `cfg.DocsDir` |
+| Persist configuration | `config.SaveConfig` | Errors wrapped with `%w` |
+| Validate Git repository | `tools.VerifyGitRepo()` | Fail-fast on invalid repo |
+| Check configuration file presence | `config.ConfigExists()` | Used by `checkAndRunSetup` |
 
-## State and Concurrency
+## Signal Handling
 
-No synchronization mechanisms are present. Global variables (`initCmd`, `setupCmd`, `updateCmd`) are declared at package scope and initialized once; they are never modified after initialization. No mutexes, locks, atomic types, or async patterns are used.
+`signal.NotifyContext` wraps `context.Background()` for SIGINT/SIGTERM handling in `runEngine`. Cleanup is deferred via `defer stop()`.
+
+## Terminal Detection
+
+`isatty.IsTerminal(os.Stdin.Fd())` and `isatty.IsCygwinTerminal(os.Stdin.Fd())` detect an interactive terminal environment, gating the setup flow in `checkAndRunSetup`.
+
+## External Dependencies
+
+`executeCommand` and `engine.ModeInit`/`engine.ModeUpdate` are external references not defined in this package. Their behavior is unverifiable from this source alone.
