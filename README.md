@@ -1,5 +1,16 @@
 # Code-Reducer
 
+[![Quality Gate Status](https://img.shields.io/sonar/quality_gate/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Coverage](https://img.shields.io/sonar/coverage/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Bugs](https://img.shields.io/sonar/bugs/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Vulnerabilities](https://img.shields.io/sonar/vulnerabilities/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Code Smells](https://img.shields.io/sonar/code_smells/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Tech Debt](https://img.shields.io/sonar/tech_debt/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Duplicated Lines](https://img.shields.io/sonar/duplicated_lines_density/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Security Rating](https://img.shields.io/sonar/security_rating/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Reliability Rating](https://img.shields.io/sonar/reliability_rating/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Maintainability Rating](https://img.shields.io/sonar/sqale_rating/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+
 **Code-Reducer** is a lightweight, high-performance command-line tool written in Go that automatically generates, validates, and queries developer-friendly, comprehensive wikis for extensive repositories.
 
 Designed specifically for **local development and private LLMs**, Code-Reducer uses a custom **Hierarchical Map-Reduce Strategy** to analyze large codebases using small, local LLM models (e.g., 7B, 9B, or 26B parameters) via **Ollama** without exceeding context windows or degrading output quality.
