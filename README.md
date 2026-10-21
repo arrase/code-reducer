@@ -1,15 +1,16 @@
 # Code-Reducer
 
-[![Quality Gate Status](https://img.shields.io/sonar/quality_gate/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Coverage](https://img.shields.io/sonar/coverage/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Bugs](https://img.shields.io/sonar/bugs/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Vulnerabilities](https://img.shields.io/sonar/vulnerabilities/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Code Smells](https://img.shields.io/sonar/code_smells/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Tech Debt](https://img.shields.io/sonar/tech_debt/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Duplicated Lines](https://img.shields.io/sonar/duplicated_lines_density/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Security Rating](https://img.shields.io/sonar/security_rating/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Reliability Rating](https://img.shields.io/sonar/reliability_rating/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
-[![Maintainability Rating](https://img.shields.io/sonar/sqale_rating/arrase_code-reducer?server=https%3A%2F%2Fsonarcloud.io&logo=sonarcloud)](https://sonarcloud.io/summary/new_code?id=arrase_code-reducer)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=alert_status)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=coverage)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=bugs)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=vulnerabilities)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=code_smells)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=sqale_index)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Duplicated Lines (%)](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=duplicated_lines_density)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=security_rating)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=reliability_rating)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=sqale_rating)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=arrase_code-reducer&metric=ncloc)](https://sonarcloud.io/summary/overall?id=arrase_code-reducer)
 
 **Code-Reducer** is a lightweight, high-performance command-line tool written in Go that automatically generates, validates, and queries developer-friendly, comprehensive wikis for extensive repositories.
 
