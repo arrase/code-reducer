@@ -123,13 +123,8 @@ func ReadWikiSection(repoRoot, docsDir, target string) (string, error) {
 	}
 
 	cleanRel := filepath.ToSlash(relToDocs)
-	for _, seg := range strings.Split(cleanRel, "/") {
-		if strings.HasPrefix(seg, ".") {
-			return "", fmt.Errorf("invalid wiki target %q: hidden files and directories are not readable", target)
-		}
-	}
-	if !strings.EqualFold(path.Ext(cleanRel), ".md") {
-		return "", fmt.Errorf("invalid wiki target %q: only markdown (.md) files are readable", target)
+	if err := validateWikiMarkdownPath(cleanRel, target); err != nil {
+		return "", err
 	}
 
 	data, err := tools.ReadFileSafely(repoRoot, relToRoot)
@@ -144,6 +139,18 @@ func ReadWikiSection(repoRoot, docsDir, target string) (string, error) {
 	}
 
 	return extractSectionByAnchor(cleanRel, content, anchor)
+}
+
+func validateWikiMarkdownPath(cleanRel, rawTarget string) error {
+	for _, seg := range strings.Split(cleanRel, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return fmt.Errorf("invalid wiki target %q: hidden files and directories are not readable", rawTarget)
+		}
+	}
+	if !strings.EqualFold(path.Ext(cleanRel), ".md") {
+		return fmt.Errorf("invalid wiki target %q: only markdown (.md) files are readable", rawTarget)
+	}
+	return nil
 }
 
 func discoverWikiMarkdownFiles(docsAbs string) ([]string, error) {
@@ -235,22 +242,27 @@ func extractBacktickValues(s string) []string {
 	return vals
 }
 
+func stepFenceState(line string, inFence bool, fenceChar byte, fenceCount int) (bool, byte, int, bool) {
+	if !inFence {
+		if ch, count, _, ok := tools.ParseFenceOpen(line); ok {
+			return true, ch, count, true
+		}
+		return false, 0, 0, false
+	}
+	if tools.IsFenceClose(line, fenceChar, fenceCount) {
+		return false, 0, 0, true
+	}
+	return true, fenceChar, fenceCount, true
+}
+
 func detectSplitHeadingLevel(lines []string) int {
-	inFence := false
+	var inFence bool
 	var fenceChar byte
 	var fenceCount int
 	for _, line := range lines {
-		if !inFence {
-			if ch, count, _, ok := tools.ParseFenceOpen(line); ok {
-				inFence = true
-				fenceChar = ch
-				fenceCount = count
-				continue
-			}
-		} else {
-			if tools.IsFenceClose(line, fenceChar, fenceCount) {
-				inFence = false
-			}
+		var isFenced bool
+		inFence, fenceChar, fenceCount, isFenced = stepFenceState(line, inFence, fenceChar, fenceCount)
+		if isFenced {
 			continue
 		}
 		if level, _, ok := tools.ParseATXHeading(line); ok && level == 2 {
@@ -260,13 +272,29 @@ func detectSplitHeadingLevel(lines []string) int {
 	return 3
 }
 
+func isLeadingDocumentH1(level int, hasH1 bool, curAnchor string, sectionCount int, curBody []string) bool {
+	return level == 1 && !hasH1 && curAnchor == "" && sectionCount == 0 && strings.TrimSpace(strings.Join(curBody, "\n")) == ""
+}
+
+func appendSection(sections []wikiSection, pageRel, anchor, heading string, bodyLines []string, modPath string, sources []string) []wikiSection {
+	body := strings.TrimSpace(strings.Join(bodyLines, "\n"))
+	if anchor == "" && body == "" {
+		return sections
+	}
+	target := pageRel
+	if anchor != "" {
+		target = pageRel + "#" + anchor
+	}
+	return append(sections, buildWikiSection(pageRel, anchor, target, heading, body, modPath, sources))
+}
+
 func parseMarkdownSections(pageRel, markdown string) []wikiSection {
 	modPath, sources := parseProvenance(markdown, pageRel)
 	lines := strings.Split(markdown, "\n")
 	splitLevel := detectSplitHeadingLevel(lines)
 
 	seenCounts := make(map[string]int)
-	inFence := false
+	var inFence bool
 	var fenceChar byte
 	var fenceCount int
 
@@ -276,52 +304,31 @@ func parseMarkdownSections(pageRel, markdown string) []wikiSection {
 	var curBody []string
 	var rawSections []wikiSection
 
-	flushSection := func() {
-		body := strings.TrimSpace(strings.Join(curBody, "\n"))
-		if curAnchor == "" && body == "" {
-			return
-		}
-		target := pageRel
-		if curAnchor != "" {
-			target = pageRel + "#" + curAnchor
-		}
-		rawSections = append(rawSections, buildWikiSection(pageRel, curAnchor, target, curHeading, body, modPath, sources))
-	}
-
 	for _, line := range lines {
-		if !inFence {
-			if ch, count, _, ok := tools.ParseFenceOpen(line); ok {
-				inFence = true
-				fenceChar = ch
-				fenceCount = count
-				curBody = append(curBody, line)
-				continue
-			}
-		} else {
-			if tools.IsFenceClose(line, fenceChar, fenceCount) {
-				inFence = false
-			}
+		var isFenced bool
+		inFence, fenceChar, fenceCount, isFenced = stepFenceState(line, inFence, fenceChar, fenceCount)
+		if isFenced {
 			curBody = append(curBody, line)
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), provenancePrefix) {
 			continue
 		}
 
 		level, headingText, ok := tools.ParseATXHeading(line)
 		if !ok {
-			if strings.HasPrefix(strings.TrimSpace(line), provenancePrefix) {
-				continue
-			}
 			curBody = append(curBody, line)
 			continue
 		}
 
 		anchor := tools.NextHeadingAnchor(headingText, seenCounts)
-		if level == 1 && !hasH1 && curAnchor == "" && len(rawSections) == 0 && strings.TrimSpace(strings.Join(curBody, "\n")) == "" {
+		if isLeadingDocumentH1(level, hasH1, curAnchor, len(rawSections), curBody) {
 			hasH1 = true
 			curHeading = headingText
 			continue
 		}
 		if level == 1 || level == splitLevel {
-			flushSection()
+			rawSections = appendSection(rawSections, pageRel, curAnchor, curHeading, curBody, modPath, sources)
 			curHeading = headingText
 			curAnchor = anchor
 			curBody = nil
@@ -330,7 +337,7 @@ func parseMarkdownSections(pageRel, markdown string) []wikiSection {
 
 		curBody = append(curBody, line)
 	}
-	flushSection()
+	rawSections = appendSection(rawSections, pageRel, curAnchor, curHeading, curBody, modPath, sources)
 
 	if len(rawSections) == 0 {
 		rawSections = append(rawSections, buildWikiSection(pageRel, "", pageRel, curHeading, "", modPath, sources))
@@ -366,13 +373,12 @@ func buildWikiSection(page, anchor, target, heading, body, modPath string, sourc
 	}
 }
 
-func scoreAndRankSections(sections []wikiSection, queryTokens, pathHints []string, limit int) []SearchResult {
-	nDocs := float64(len(sections))
+func computeCorpusStats(sections []wikiSection, queryTokens []string) (map[string]int, float64) {
 	totalLen := 0.0
 	for _, s := range sections {
 		totalLen += s.docLen
 	}
-	avgDL := totalLen / nDocs
+	avgDL := totalLen / float64(len(sections))
 	if avgDL <= 0 {
 		avgDL = 1.0
 	}
@@ -385,36 +391,48 @@ func scoreAndRankSections(sections []wikiSection, queryTokens, pathHints []strin
 			}
 		}
 	}
+	return docFreq, avgDL
+}
+
+func scoreSection(s wikiSection, queryTokens []string, docFreq map[string]int, nDocs, avgDL float64, pathHints []string) float64 {
+	score := 0.0
+	matchedTerms := 0
+
+	for _, qt := range queryTokens {
+		tf := titleWeight*float64(s.titleTerms[qt]) +
+			sourceWeight*float64(s.sourceTerms[qt]) +
+			bodyWeight*float64(s.bodyTerms[qt])
+		if tf <= 0 {
+			continue
+		}
+		matchedTerms++
+		df := float64(docFreq[qt])
+		idf := math.Log(1.0 + (nDocs-df+0.5)/(df+0.5))
+		norm := tf * (bm25K1 + 1.0) / (tf + bm25K1*(1.0-bm25B+bm25B*(s.docLen/avgDL)))
+		score += idf * norm
+	}
+
+	if score <= 0 {
+		return 0
+	}
+	if matchedTerms > 1 {
+		score *= 1.0 + 0.25*float64(matchedTerms-1)
+	}
+	if len(pathHints) > 0 && matchesPathHints(s, pathHints) {
+		score *= pathHintBoost
+	}
+	return score
+}
+
+func scoreAndRankSections(sections []wikiSection, queryTokens, pathHints []string, limit int) []SearchResult {
+	nDocs := float64(len(sections))
+	docFreq, avgDL := computeCorpusStats(sections, queryTokens)
 
 	var results []SearchResult
 	for _, s := range sections {
-		score := 0.0
-		matchedTerms := 0
-
-		for _, qt := range queryTokens {
-			tf := titleWeight*float64(s.titleTerms[qt]) +
-				sourceWeight*float64(s.sourceTerms[qt]) +
-				bodyWeight*float64(s.bodyTerms[qt])
-			if tf <= 0 {
-				continue
-			}
-			matchedTerms++
-			df := float64(docFreq[qt])
-			idf := math.Log(1.0 + (nDocs-df+0.5)/(df+0.5))
-			norm := tf * (bm25K1 + 1.0) / (tf + bm25K1*(1.0-bm25B+bm25B*(s.docLen/avgDL)))
-			score += idf * norm
-		}
-
+		score := scoreSection(s, queryTokens, docFreq, nDocs, avgDL, pathHints)
 		if score <= 0 {
 			continue
-		}
-
-		if matchedTerms > 1 {
-			score *= 1.0 + 0.25*float64(matchedTerms-1)
-		}
-
-		if len(pathHints) > 0 && matchesPathHints(s, pathHints) {
-			score *= pathHintBoost
 		}
 
 		results = append(results, SearchResult{
@@ -445,6 +463,16 @@ func cleanPathHint(p string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.Trim(filepath.ToSlash(strings.TrimSpace(p)), "/")), "./")
 }
 
+func hintMatchesCandidate(hint, cand string) bool {
+	if hint == "" || cand == "" {
+		return false
+	}
+	if cand == "." {
+		return hint == "."
+	}
+	return strings.Contains(cand, hint) || strings.Contains(hint, cand)
+}
+
 func matchesPathHints(s wikiSection, pathHints []string) bool {
 	candidates := []string{cleanPathHint(s.page), cleanPathHint(s.modPath)}
 	for _, src := range s.sources {
@@ -453,20 +481,8 @@ func matchesPathHints(s wikiSection, pathHints []string) bool {
 
 	for _, rawHint := range pathHints {
 		h := cleanPathHint(rawHint)
-		if h == "" {
-			continue
-		}
 		for _, cand := range candidates {
-			if cand == "" {
-				continue
-			}
-			if cand == "." {
-				if h == "." {
-					return true
-				}
-				continue
-			}
-			if strings.Contains(cand, h) || strings.Contains(h, cand) {
+			if hintMatchesCandidate(h, cand) {
 				return true
 			}
 		}
@@ -474,46 +490,49 @@ func matchesPathHints(s wikiSection, pathHints []string) bool {
 	return false
 }
 
-func extractSnippet(body, fallbackHeading string, queryTokens []string) string {
-	lines := strings.Split(body, "\n")
-	inFence := false
+func isProseLine(trimmed string) bool {
+	return trimmed != "" &&
+		!strings.HasPrefix(trimmed, "#") &&
+		!strings.HasPrefix(trimmed, provenancePrefix) &&
+		!strings.HasPrefix(trimmed, "<!--") &&
+		trimmed != "---" &&
+		!isTableSeparator(trimmed)
+}
+
+func extractProseLines(body string) []string {
+	var inFence bool
 	var fenceChar byte
 	var fenceCount int
 	var proseLines []string
 
-	for _, rawLine := range lines {
-		if !inFence {
-			if ch, count, _, ok := tools.ParseFenceOpen(rawLine); ok {
-				inFence = true
-				fenceChar = ch
-				fenceCount = count
-				continue
-			}
-		} else {
-			if tools.IsFenceClose(rawLine, fenceChar, fenceCount) {
-				inFence = false
-			}
+	for _, rawLine := range strings.Split(body, "\n") {
+		var isFenced bool
+		inFence, fenceChar, fenceCount, isFenced = stepFenceState(rawLine, inFence, fenceChar, fenceCount)
+		if isFenced {
 			continue
 		}
-
-		trimmed := strings.TrimSpace(rawLine)
-		if trimmed == "" ||
-			strings.HasPrefix(trimmed, "#") ||
-			strings.HasPrefix(trimmed, provenancePrefix) ||
-			strings.HasPrefix(trimmed, "<!--") ||
-			trimmed == "---" ||
-			isTableSeparator(trimmed) {
-			continue
+		if trimmed := strings.TrimSpace(rawLine); isProseLine(trimmed) {
+			proseLines = append(proseLines, trimmed)
 		}
-		proseLines = append(proseLines, trimmed)
 	}
+	return proseLines
+}
 
+func lineMatchesQuery(line string, queryTokens []string) bool {
+	lineTerms := termFreqMap(tokenize(line))
+	for _, qt := range queryTokens {
+		if lineTerms[qt] > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func extractSnippet(body, fallbackHeading string, queryTokens []string) string {
+	proseLines := extractProseLines(body)
 	for _, line := range proseLines {
-		lineTerms := termFreqMap(tokenize(line))
-		for _, qt := range queryTokens {
-			if lineTerms[qt] > 0 {
-				return tools.TruncateRunes(line, maxSnippetRunes)
-			}
+		if lineMatchesQuery(line, queryTokens) {
+			return tools.TruncateRunes(line, maxSnippetRunes)
 		}
 	}
 	if len(proseLines) > 0 {
@@ -534,10 +553,18 @@ func isTableSeparator(trimmed string) bool {
 	return true
 }
 
+func missingAnchorError(pagePath, targetAnchor string, availableAnchors []string) error {
+	avail := "none"
+	if len(availableAnchors) > 0 {
+		avail = strings.Join(availableAnchors, ", ")
+	}
+	return fmt.Errorf("section anchor %q not found in %s (available anchors: %s)", targetAnchor, pagePath, avail)
+}
+
 func extractSectionByAnchor(pagePath, content, targetAnchor string) (string, error) {
 	lines := strings.Split(content, "\n")
 	seenCounts := make(map[string]int)
-	inFence := false
+	var inFence bool
 	var fenceChar byte
 	var fenceCount int
 
@@ -547,17 +574,9 @@ func extractSectionByAnchor(pagePath, content, targetAnchor string) (string, err
 	var availableAnchors []string
 
 	for i, line := range lines {
-		if !inFence {
-			if ch, count, _, ok := tools.ParseFenceOpen(line); ok {
-				inFence = true
-				fenceChar = ch
-				fenceCount = count
-				continue
-			}
-		} else {
-			if tools.IsFenceClose(line, fenceChar, fenceCount) {
-				inFence = false
-			}
+		var isFenced bool
+		inFence, fenceChar, fenceCount, isFenced = stepFenceState(line, inFence, fenceChar, fenceCount)
+		if isFenced {
 			continue
 		}
 
@@ -571,23 +590,17 @@ func extractSectionByAnchor(pagePath, content, targetAnchor string) (string, err
 			availableAnchors = append(availableAnchors, anchor)
 		}
 
-		if startLine == -1 {
-			if anchor == targetAnchor {
-				startLine = i
-				startLevel = level
-			}
-		} else if level <= startLevel {
+		if startLine == -1 && anchor == targetAnchor {
+			startLine = i
+			startLevel = level
+		} else if startLine != -1 && level <= startLevel {
 			endLine = i
 			break
 		}
 	}
 
 	if startLine == -1 {
-		avail := "none"
-		if len(availableAnchors) > 0 {
-			avail = strings.Join(availableAnchors, ", ")
-		}
-		return "", fmt.Errorf("section anchor %q not found in %s (available anchors: %s)", targetAnchor, pagePath, avail)
+		return "", missingAnchorError(pagePath, targetAnchor, availableAnchors)
 	}
 
 	return strings.TrimSpace(strings.Join(lines[startLine:endLine], "\n")), nil

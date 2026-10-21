@@ -52,9 +52,7 @@ func TestLoadConfig(t *testing.T) {
 func TestResolveConfig(t *testing.T) {
 	t.Run("valid config resolution order", func(t *testing.T) {
 		dir := t.TempDir()
-		cfg := &Config{OllamaNumCtx: 2048, ModelID: "yaml-model", Language: "yaml-lang"}
-		err := SaveConfig(dir, cfg)
-		if err != nil {
+		if err := SaveConfig(dir, &Config{OllamaNumCtx: 2048, ModelID: "yaml-model", Language: "yaml-lang"}); err != nil {
 			t.Fatalf("failed to save config: %v", err)
 		}
 
@@ -62,102 +60,81 @@ func TestResolveConfig(t *testing.T) {
 		t.Setenv(CodeReducerModelIDEnvKey, "env-model")
 		t.Setenv(CodeReducerLanguageEnvKey, "env-lang")
 
-		resolved, err := ResolveConfig(dir, "flag-model", "8192", "flag-lang")
-		if err != nil {
-			t.Fatalf("failed to resolve config: %v", err)
-		}
-
-		if resolved.OllamaNumCtx != 8192 {
-			t.Errorf("expected 8192, got %d", resolved.OllamaNumCtx)
-		}
-		if resolved.ModelID != "flag-model" {
-			t.Errorf("expected flag-model, got %s", resolved.ModelID)
-		}
-		if resolved.Language != "flag-lang" {
-			t.Errorf("expected flag-lang, got %s", resolved.Language)
-		}
-		if resolved.QuickstartPrompt != DefaultQuickstartPrompt {
-			t.Errorf("expected default quickstart prompt, got %s", resolved.QuickstartPrompt)
-		}
+		resolved := mustResolveConfig(t, dir, "flag-model", "8192", "flag-lang")
+		assertConfigField(t, "OllamaNumCtx", resolved.OllamaNumCtx, 8192)
+		assertConfigField(t, "ModelID", resolved.ModelID, "flag-model")
+		assertConfigField(t, "Language", resolved.Language, "flag-lang")
+		assertConfigField(t, "QuickstartPrompt", resolved.QuickstartPrompt, DefaultQuickstartPrompt)
 	})
 
 	t.Run("language 4-tier resolution", func(t *testing.T) {
 		dir := t.TempDir()
 
 		// Tier 4: Default ("")
-		resolved, err := ResolveConfig(dir, "", "", "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if resolved.Language != "" {
-			t.Errorf("expected empty default language, got %q", resolved.Language)
-		}
+		assertResolvedLanguage(t, dir, "", "")
 
 		// Tier 3: YAML config
 		if err := SaveConfig(dir, &Config{Language: "Spanish"}); err != nil {
 			t.Fatalf("failed to save config: %v", err)
 		}
-		resolved, err = ResolveConfig(dir, "", "", "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if resolved.Language != "Spanish" {
-			t.Errorf("expected Spanish from YAML, got %q", resolved.Language)
-		}
+		assertResolvedLanguage(t, dir, "", "Spanish")
 
 		// Tier 2: Environment variable overrides YAML
 		t.Setenv(CodeReducerLanguageEnvKey, "French")
-		resolved, err = ResolveConfig(dir, "", "", "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if resolved.Language != "French" {
-			t.Errorf("expected French from env, got %q", resolved.Language)
-		}
+		assertResolvedLanguage(t, dir, "", "French")
 
 		// Tier 1: CLI flag overrides Env and YAML
-		resolved, err = ResolveConfig(dir, "", "", "German")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if resolved.Language != "German" {
-			t.Errorf("expected German from CLI flag, got %q", resolved.Language)
-		}
+		assertResolvedLanguage(t, dir, "German", "German")
 	})
 
 	t.Run("fail fast on invalid num ctx env", func(t *testing.T) {
 		t.Setenv(OllamaNumCtxEnvKey, "invalid")
-		_, err := ResolveConfig(t.TempDir(), "", "", "")
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
+		assertResolveError(t, t.TempDir(), "", "", "")
 	})
 
 	t.Run("fail fast on zero num ctx env", func(t *testing.T) {
 		t.Setenv(OllamaNumCtxEnvKey, "0")
-		_, err := ResolveConfig(t.TempDir(), "", "", "")
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
+		assertResolveError(t, t.TempDir(), "", "", "")
 	})
 
 	t.Run("fail fast on invalid num ctx flag", func(t *testing.T) {
-		_, err := ResolveConfig(t.TempDir(), "", "invalid", "")
-		if err == nil {
-			t.Fatal("expected error, got nil")
-		}
+		assertResolveError(t, t.TempDir(), "", "invalid", "")
 	})
 
 	t.Run("resolve base url from env", func(t *testing.T) {
 		t.Setenv(OllamaBaseURLEnvKey, "http://custom-ollama:11434")
-		resolved, err := ResolveConfig(t.TempDir(), "", "", "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if resolved.OllamaBaseURL != "http://custom-ollama:11434" {
-			t.Errorf("expected http://custom-ollama:11434, got %s", resolved.OllamaBaseURL)
-		}
+		resolved := mustResolveConfig(t, t.TempDir(), "", "", "")
+		assertConfigField(t, "OllamaBaseURL", resolved.OllamaBaseURL, "http://custom-ollama:11434")
 	})
+}
+
+func mustResolveConfig(t *testing.T, dir, flagModel, flagCtx, flagLang string) *Config {
+	t.Helper()
+	resolved, err := ResolveConfig(dir, flagModel, flagCtx, flagLang)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return resolved
+}
+
+func assertResolveError(t *testing.T, dir, flagModel, flagCtx, flagLang string) {
+	t.Helper()
+	if _, err := ResolveConfig(dir, flagModel, flagCtx, flagLang); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func assertConfigField[T comparable](t *testing.T, name string, got, want T) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s: expected %v, got %v", name, want, got)
+	}
+}
+
+func assertResolvedLanguage(t *testing.T, dir, flagLang, want string) {
+	t.Helper()
+	resolved := mustResolveConfig(t, dir, "", "", flagLang)
+	assertConfigField(t, "Language", resolved.Language, want)
 }
 
 func TestLanguageInstruction(t *testing.T) {
