@@ -160,22 +160,10 @@ func sanitizeAndValidateMermaid(markdown string) (string, int) {
 			continue
 		}
 
-		infoFields := strings.Fields(info)
-		isMermaid := len(infoFields) > 0 && strings.EqualFold(infoFields[0], "mermaid")
+		bodyLines, closeLine, closed, nextIdx := collectFencedBlock(lines, i, fenceChar, fenceCount)
+		i = nextIdx
 
-		var bodyLines []string
-		closed := false
-		var closeLine string
-		for i = i + 1; i < len(lines); i++ {
-			if tools.IsFenceClose(lines[i], fenceChar, fenceCount) {
-				closed = true
-				closeLine = lines[i]
-				break
-			}
-			bodyLines = append(bodyLines, lines[i])
-		}
-
-		if !isMermaid {
+		if !isMermaidFence(info) {
 			out = append(out, line)
 			out = append(out, bodyLines...)
 			if closed {
@@ -184,33 +172,56 @@ func sanitizeAndValidateMermaid(markdown string) (string, int) {
 			continue
 		}
 
-		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		fence := strings.Repeat(string(fenceChar), fenceCount)
-		rawBody := strings.Join(bodyLines, "\n")
-		if !closed {
+		blockLines, degraded := renderMermaidFence(line, fenceChar, fenceCount, bodyLines, closeLine, closed)
+		out = append(out, blockLines...)
+		if degraded {
 			degradedCount++
-			out = append(out, fmt.Sprintf("%s%s (unclosed mermaid code fence) -->", indent, mermaidFailedPrefix))
-			out = append(out, fmt.Sprintf("%s%stext", indent, fence))
-			out = append(out, bodyLines...)
-			continue
 		}
-
-		sanitizedBody := sanitizeMermaidBody(rawBody)
-		if errMsg := heuristicMermaidError(sanitizedBody); errMsg != "" {
-			degradedCount++
-			out = append(out, fmt.Sprintf("%s%s (%s) -->", indent, mermaidFailedPrefix, errMsg))
-			out = append(out, fmt.Sprintf("%s%stext", indent, fence))
-			out = append(out, bodyLines...)
-			out = append(out, closeLine)
-			continue
-		}
-
-		out = append(out, line)
-		out = append(out, strings.Split(sanitizedBody, "\n")...)
-		out = append(out, closeLine)
 	}
 
 	return strings.Join(out, "\n"), degradedCount
+}
+
+func isMermaidFence(info string) bool {
+	fields := strings.Fields(info)
+	return len(fields) > 0 && strings.EqualFold(fields[0], "mermaid")
+}
+
+func collectFencedBlock(lines []string, openIdx int, fenceChar byte, fenceCount int) ([]string, string, bool, int) {
+	var bodyLines []string
+	for i := openIdx + 1; i < len(lines); i++ {
+		if tools.IsFenceClose(lines[i], fenceChar, fenceCount) {
+			return bodyLines, lines[i], true, i
+		}
+		bodyLines = append(bodyLines, lines[i])
+	}
+	return bodyLines, "", false, len(lines)
+}
+
+func renderMermaidFence(openLine string, fenceChar byte, fenceCount int, bodyLines []string, closeLine string, closed bool) ([]string, bool) {
+	indent := openLine[:len(openLine)-len(strings.TrimLeft(openLine, " \t"))]
+	fence := strings.Repeat(string(fenceChar), fenceCount)
+	if !closed {
+		out := []string{
+			fmt.Sprintf("%s%s (unclosed mermaid code fence) -->", indent, mermaidFailedPrefix),
+			fmt.Sprintf("%s%stext", indent, fence),
+		}
+		return append(out, bodyLines...), true
+	}
+
+	sanitizedBody := sanitizeMermaidBody(strings.Join(bodyLines, "\n"))
+	if errMsg := heuristicMermaidError(sanitizedBody); errMsg != "" {
+		out := []string{
+			fmt.Sprintf("%s%s (%s) -->", indent, mermaidFailedPrefix, errMsg),
+			fmt.Sprintf("%s%stext", indent, fence),
+		}
+		out = append(out, bodyLines...)
+		return append(out, closeLine), true
+	}
+
+	out := []string{openLine}
+	out = append(out, strings.Split(sanitizedBody, "\n")...)
+	return append(out, closeLine), false
 }
 
 func firstMermaidHeaderToken(body string) (string, int) {
@@ -288,46 +299,16 @@ func sanitizeFlowchartLine(line string) string {
 
 	for i < n {
 		if line[i] == '"' || line[i] == '|' {
-			delim := line[i]
-			b.WriteByte(delim)
-			i++
-			for i < n {
-				b.WriteByte(line[i])
-				if line[i] == delim && line[i-1] != '\\' {
-					i++
-					break
-				}
-				i++
-			}
+			end := skipDelimitedSegment(line, i)
+			b.WriteString(line[i:end])
+			i = end
 			continue
 		}
 
 		if isIdentChar(line[i]) {
-			start := i
-			for i < n && isIdentChar(line[i]) {
-				i++
-			}
-			ident := line[start:i]
-
-			if i < n && (line[i] == '[' || line[i] == '(' || line[i] == '{') {
-				openChar := line[i]
-				closeChar := matchingCloseBracket(openChar)
-				closeIdx := findMatchingDelimiter(line, i, openChar, closeChar)
-				if closeIdx != -1 {
-					if ident == "end" {
-						ident = "endNode"
-					}
-					openDelim, inner, closeDelim := splitNodeShape(line[i : closeIdx+1])
-					b.WriteString(ident)
-					b.WriteString(openDelim)
-					b.WriteString(sanitizeNodeLabel(inner))
-					b.WriteString(closeDelim)
-					i = closeIdx + 1
-					continue
-				}
-			}
-
-			b.WriteString(ident)
+			nodeExpr, nextIdx := consumeFlowchartIdentOrNode(line, i)
+			b.WriteString(nodeExpr)
+			i = nextIdx
 			continue
 		}
 
@@ -339,6 +320,47 @@ func sanitizeFlowchartLine(line string) string {
 	res = reArrowToEnd.ReplaceAllString(res, "$1$2 endNode")
 	res = reEndToArrow.ReplaceAllString(res, "endNode$1")
 	return res
+}
+
+func skipDelimitedSegment(s string, start int) int {
+	delim := s[start]
+	for i := start + 1; i < len(s); i++ {
+		if s[i] == delim && s[i-1] != '\\' {
+			return i + 1
+		}
+	}
+	return len(s)
+}
+
+func consumeFlowchartIdentOrNode(line string, start int) (string, int) {
+	i := start
+	for i < len(line) && isIdentChar(line[i]) {
+		i++
+	}
+	ident := line[start:i]
+
+	closeChar := matchingCloseBracket(peekByte(line, i))
+	if closeChar == 0 {
+		return ident, i
+	}
+
+	closeIdx := findMatchingDelimiter(line, i, line[i], closeChar)
+	if closeIdx == -1 {
+		return ident, i
+	}
+
+	if ident == "end" {
+		ident = "endNode"
+	}
+	openDelim, inner, closeDelim := splitNodeShape(line[i : closeIdx+1])
+	return ident + openDelim + sanitizeNodeLabel(inner) + closeDelim, closeIdx + 1
+}
+
+func peekByte(s string, idx int) byte {
+	if idx < len(s) {
+		return s[idx]
+	}
+	return 0
 }
 
 func findMatchingDelimiter(s string, openIdx int, openChar, closeChar byte) int {
@@ -413,25 +435,32 @@ func heuristicMermaidError(body string) string {
 			continue
 		}
 		contentLines++
-
-		if countUnescapedQuotes(trimmed)%2 != 0 {
-			return "unclosed double quote"
-		}
-		if !hasBalancedBrackets(trimmed, isFlow) {
-			return "unbalanced brackets"
-		}
-		if isFlow {
-			if hasFlowchartEndNodeID(trimmed) {
-				return "reserved keyword 'end' used as node ID"
-			}
-			if hasUnquotedSpecialLabel(trimmed) {
-				return "unquoted special characters in node label"
-			}
+		if errMsg := validateMermaidContentLine(trimmed, isFlow); errMsg != "" {
+			return errMsg
 		}
 	}
 
 	if contentLines == 0 {
 		return "diagram has no content lines"
+	}
+	return ""
+}
+
+func validateMermaidContentLine(trimmed string, isFlow bool) string {
+	if countUnescapedQuotes(trimmed)%2 != 0 {
+		return "unclosed double quote"
+	}
+	if !hasBalancedBrackets(trimmed, isFlow) {
+		return "unbalanced brackets"
+	}
+	if !isFlow {
+		return ""
+	}
+	if hasFlowchartEndNodeID(trimmed) {
+		return "reserved keyword 'end' used as node ID"
+	}
+	if hasUnquotedSpecialLabel(trimmed) {
+		return "unquoted special characters in node label"
 	}
 	return ""
 }
@@ -448,28 +477,29 @@ func hasBalancedBrackets(line string, checkBraces bool) bool {
 		if inQuotes {
 			continue
 		}
-		switch ch {
-		case '[', '(':
-			stack = append(stack, matchingCloseBracket(ch))
-		case '{':
-			if checkBraces {
-				stack = append(stack, '}')
-			}
-		case ']', ')':
+		if closeCh := expectedCloseBracket(ch, checkBraces); closeCh != 0 {
+			stack = append(stack, closeCh)
+			continue
+		}
+		if isTrackedCloseBracket(ch, checkBraces) {
 			if len(stack) == 0 || stack[len(stack)-1] != ch {
 				return false
 			}
 			stack = stack[:len(stack)-1]
-		case '}':
-			if checkBraces {
-				if len(stack) == 0 || stack[len(stack)-1] != ch {
-					return false
-				}
-				stack = stack[:len(stack)-1]
-			}
 		}
 	}
 	return len(stack) == 0
+}
+
+func expectedCloseBracket(ch byte, checkBraces bool) byte {
+	if ch == '{' && !checkBraces {
+		return 0
+	}
+	return matchingCloseBracket(ch)
+}
+
+func isTrackedCloseBracket(ch byte, checkBraces bool) bool {
+	return ch == ']' || ch == ')' || (checkBraces && ch == '}')
 }
 
 func hasFlowchartEndNodeID(line string) bool {
@@ -481,37 +511,15 @@ func hasUnquotedSpecialLabel(line string) bool {
 	n := len(line)
 	for i < n {
 		if line[i] == '"' || line[i] == '|' {
-			delim := line[i]
-			i++
-			for i < n {
-				if line[i] == delim && line[i-1] != '\\' {
-					i++
-					break
-				}
-				i++
-			}
+			i = skipDelimitedSegment(line, i)
 			continue
 		}
 		if isIdentChar(line[i]) {
-			for i < n && isIdentChar(line[i]) {
-				i++
+			bad, nextIdx := checkIdentNodeLabel(line, i)
+			if bad {
+				return true
 			}
-			if i < n && (line[i] == '[' || line[i] == '(' || line[i] == '{') {
-				openChar := line[i]
-				closeChar := matchingCloseBracket(openChar)
-				closeIdx := findMatchingDelimiter(line, i, openChar, closeChar)
-				if closeIdx == -1 {
-					return true
-				}
-				_, inner, _ := splitNodeShape(line[i : closeIdx+1])
-				inner = strings.TrimSpace(inner)
-				isQuoted := len(inner) >= 2 && strings.HasPrefix(inner, "\"") && strings.HasSuffix(inner, "\"")
-				if !isQuoted && strings.ContainsAny(inner, ";<>") {
-					return true
-				}
-				i = closeIdx + 1
-				continue
-			}
+			i = nextIdx
 			continue
 		}
 		i++
@@ -519,24 +527,34 @@ func hasUnquotedSpecialLabel(line string) bool {
 	return false
 }
 
+func checkIdentNodeLabel(line string, start int) (bool, int) {
+	i := start
+	for i < len(line) && isIdentChar(line[i]) {
+		i++
+	}
+	closeChar := matchingCloseBracket(peekByte(line, i))
+	if closeChar == 0 {
+		return false, i
+	}
+	closeIdx := findMatchingDelimiter(line, i, line[i], closeChar)
+	if closeIdx == -1 {
+		return true, len(line)
+	}
+	_, inner, _ := splitNodeShape(line[i : closeIdx+1])
+	inner = strings.TrimSpace(inner)
+	isQuoted := len(inner) >= 2 && strings.HasPrefix(inner, "\"") && strings.HasSuffix(inner, "\"")
+	if !isQuoted && strings.ContainsAny(inner, ";<>") {
+		return true, closeIdx + 1
+	}
+	return false, closeIdx + 1
+}
+
 // generateWikiIndex deterministically generates <docsDir>/index.md with links to
 // architecture.md, quickstart.md, and all documented modules.
 func generateWikiIndex(repoRoot, docsDir string, tree *DirNode, cache *MetadataCache) error {
 	var b strings.Builder
 	b.WriteString("# Documentation Index\n\n")
-
-	archExists := tools.FileExistsSafely(repoRoot, filepath.Join(docsDir, "architecture.md"))
-	qsExists := tools.FileExistsSafely(repoRoot, filepath.Join(docsDir, "quickstart.md"))
-	if archExists || qsExists {
-		b.WriteString("## Overview\n\n")
-		if archExists {
-			b.WriteString("- [Architecture Overview](architecture.md)\n")
-		}
-		if qsExists {
-			b.WriteString("- [Developer Quickstart](quickstart.md)\n")
-		}
-		b.WriteString("\n")
-	}
+	writeIndexOverview(&b, repoRoot, docsDir)
 
 	nodesByPath := collectTreeNodes(tree)
 	var dirPaths []string
@@ -547,80 +565,117 @@ func generateWikiIndex(repoRoot, docsDir string, tree *DirNode, cache *MetadataC
 
 	b.WriteString("## Modules\n\n")
 	for _, dirPath := range dirPaths {
-		relModPath := filepath.ToSlash(filepath.Join("modules", toSafeMarkdownFilename(dirPath)))
-		fullModPath := filepath.Join(docsDir, relModPath)
-
-		summary := strings.TrimSpace(cache.Modules[dirPath])
-		if summary == "" && tools.FileExistsSafely(repoRoot, fullModPath) {
-			if data, err := tools.ReadFileSafely(repoRoot, fullModPath); err == nil {
-				summary = strings.TrimSpace(string(data))
-			}
+		if line := formatModuleIndexLine(repoRoot, docsDir, dirPath, nodesByPath[dirPath], cache); line != "" {
+			b.WriteString(line + "\n")
 		}
-		if summary == "" {
-			continue
-		}
-
-		label := dirPath
-		if dirPath == "." {
-			label = "Root (.)"
-		}
-
-		desc := extractSummaryDescription(summary)
-		filesInfo := formatNodeFiles(nodesByPath[dirPath])
-
-		line := fmt.Sprintf("- [%s](%s)", label, relModPath)
-		if desc != "" {
-			line += " — " + desc
-		}
-		if filesInfo != "" {
-			line += " (" + filesInfo + ")"
-		}
-		b.WriteString(line + "\n")
 	}
 
 	indexPath := filepath.Join(docsDir, "index.md")
 	return tools.WriteFileSafely(repoRoot, indexPath, []byte(b.String()))
 }
 
+func writeIndexOverview(b *strings.Builder, repoRoot, docsDir string) {
+	archExists := tools.FileExistsSafely(repoRoot, filepath.Join(docsDir, "architecture.md"))
+	qsExists := tools.FileExistsSafely(repoRoot, filepath.Join(docsDir, "quickstart.md"))
+	if !archExists && !qsExists {
+		return
+	}
+	b.WriteString("## Overview\n\n")
+	if archExists {
+		b.WriteString("- [Architecture Overview](architecture.md)\n")
+	}
+	if qsExists {
+		b.WriteString("- [Developer Quickstart](quickstart.md)\n")
+	}
+	b.WriteString("\n")
+}
+
+func formatModuleIndexLine(repoRoot, docsDir, dirPath string, node *DirNode, cache *MetadataCache) string {
+	relModPath := filepath.ToSlash(filepath.Join("modules", toSafeMarkdownFilename(dirPath)))
+	summary := resolveModuleSummary(repoRoot, filepath.Join(docsDir, relModPath), cache.Modules[dirPath])
+	if summary == "" {
+		return ""
+	}
+
+	label := dirPath
+	if dirPath == "." {
+		label = "Root (.)"
+	}
+
+	line := fmt.Sprintf("- [%s](%s)", label, relModPath)
+	if desc := extractSummaryDescription(summary); desc != "" {
+		line += " — " + desc
+	}
+	if filesInfo := formatNodeFiles(node); filesInfo != "" {
+		line += " (" + filesInfo + ")"
+	}
+	return line
+}
+
+func resolveModuleSummary(repoRoot, fullModPath, cachedSummary string) string {
+	if summary := strings.TrimSpace(cachedSummary); summary != "" {
+		return summary
+	}
+	if !tools.FileExistsSafely(repoRoot, fullModPath) {
+		return ""
+	}
+	data, err := tools.ReadFileSafely(repoRoot, fullModPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 func extractSummaryDescription(summary string) string {
 	lines := strings.Split(summary, "\n")
-	inFence := false
-	var fenceChar byte
-	var fenceCount int
+	var fs fenceState
 
 	for _, rawLine := range lines {
-		if !inFence {
-			if ch, count, _, ok := tools.ParseFenceOpen(rawLine); ok {
-				inFence = true
-				fenceChar = ch
-				fenceCount = count
-				continue
-			}
-		} else {
-			if tools.IsFenceClose(rawLine, fenceChar, fenceCount) {
-				inFence = false
-			}
+		if fs.consume(rawLine) {
 			continue
 		}
 
 		trimmed := strings.TrimSpace(rawLine)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "#") ||
-			strings.HasPrefix(trimmed, ">") ||
-			strings.HasPrefix(trimmed, "```") ||
-			strings.HasPrefix(trimmed, "~~~") ||
-			strings.HasPrefix(trimmed, "|") ||
-			strings.HasPrefix(trimmed, "-") ||
-			strings.HasPrefix(trimmed, "*") ||
-			strings.HasPrefix(trimmed, "<!--") {
+		if trimmed == "" || isNonParagraphLine(trimmed) {
 			continue
 		}
 
 		return tools.TruncateRunes(trimmed, maxSummaryDescRunes)
 	}
 	return ""
+}
+
+var nonParagraphPrefixes = []string{"#", ">", "```", "~~~", "|", "-", "*", "<!--"}
+
+func isNonParagraphLine(trimmed string) bool {
+	for _, prefix := range nonParagraphPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+type fenceState struct {
+	inFence bool
+	char    byte
+	count   int
+}
+
+func (f *fenceState) consume(line string) bool {
+	if !f.inFence {
+		if ch, count, _, ok := tools.ParseFenceOpen(line); ok {
+			f.inFence = true
+			f.char = ch
+			f.count = count
+			return true
+		}
+		return false
+	}
+	if tools.IsFenceClose(line, f.char, f.count) {
+		f.inFence = false
+	}
+	return true
 }
 
 func formatNodeFiles(node *DirNode) string {
@@ -639,9 +694,6 @@ func formatNodeFiles(node *DirNode) string {
 	return fmt.Sprintf("%d %s: %s", len(names), unit, strings.Join(names, ", "))
 }
 
-// validateMarkdownLinks walks all .md files under docsDir, strips prior broken-link stamps,
-// auto-repairs relative module/doc links when unambiguous, and stamps any remaining broken
-// internal links or heading anchors. Returns the total count of broken links found.
 func validateMarkdownLinks(repoRoot, docsDir string) (int, error) {
 	mdFiles, err := listMarkdownFiles(repoRoot, docsDir)
 	if err != nil {
@@ -671,117 +723,8 @@ func validateMarkdownLinks(repoRoot, docsDir string) (int, error) {
 
 	totalBroken := 0
 	for _, relPath := range mdFiles {
-		cleaned := cleanContents[relPath]
-		rawLines := strings.Split(cleaned, "\n")
-		sourceDir := path.Dir(relPath)
-
-		inFence := false
-		var fenceChar byte
-		var fenceCount int
-		var outLines []string
-
-		for _, rawLine := range rawLines {
-			if !inFence {
-				if ch, count, _, ok := tools.ParseFenceOpen(rawLine); ok {
-					inFence = true
-					fenceChar = ch
-					fenceCount = count
-					outLines = append(outLines, rawLine)
-					continue
-				}
-			} else {
-				if tools.IsFenceClose(rawLine, fenceChar, fenceCount) {
-					inFence = false
-				}
-				outLines = append(outLines, rawLine)
-				continue
-			}
-
-			matches := findMarkdownLinks(rawLine)
-			if len(matches) == 0 {
-				outLines = append(outLines, rawLine)
-				continue
-			}
-
-			updatedLine := rawLine
-			var lineStamps []string
-
-			for i := len(matches) - 1; i >= 0; i-- {
-				m := matches[i]
-				rawHref := strings.TrimSpace(rawLine[m.hrefStart:m.hrefEnd])
-				hrefTarget := extractLinkTarget(rawHref)
-				if hrefTarget == "" || isExternalLink(hrefTarget) {
-					continue
-				}
-
-				linkPath, anchor, hasHash := strings.Cut(hrefTarget, "#")
-				if strings.HasPrefix(linkPath, "/") {
-					lineStamps = append(lineStamps, fmt.Sprintf("%s [%s] root-absolute link is not portable; use a relative path -->", brokenLinkCommentPrefix, hrefTarget))
-					continue
-				}
-
-				var targetRelPath string
-				if linkPath == "" {
-					targetRelPath = relPath
-				} else {
-					joinedRel := filepath.Join(filepath.FromSlash(sourceDir), filepath.FromSlash(linkPath))
-					resolvedAbs, resolveErr := security.SafeResolve(repoRoot, joinedRel)
-					exists := false
-					if resolveErr == nil {
-						if info, statErr := os.Stat(resolvedAbs); statErr == nil && !info.IsDir() {
-							exists = true
-							if relToRoot, relErr := filepath.Rel(rootAbs, resolvedAbs); relErr == nil {
-								targetRelPath = filepath.ToSlash(relToRoot)
-							}
-						}
-					}
-
-					if !exists {
-						if repairedLink, repairedRel, ok := tryAutoRepairLink(repoRoot, docsDir, sourceDir, linkPath); ok {
-							newHref := repairedLink
-							if hasHash {
-								newHref = repairedLink + "#" + anchor
-							}
-							updatedLine = updatedLine[:m.hrefStart] + newHref + updatedLine[m.hrefEnd:]
-							hrefTarget = newHref
-							linkPath = repairedLink
-							targetRelPath = repairedRel
-							exists = true
-						}
-					}
-
-					if !exists {
-						lineStamps = append(lineStamps, fmt.Sprintf("%s [%s] file %q does not exist -->", brokenLinkCommentPrefix, hrefTarget, linkPath))
-						continue
-					}
-				}
-
-				if anchor != "" && strings.EqualFold(path.Ext(targetRelPath), ".md") && !reLineAnchor.MatchString(anchor) {
-					targetAnchors, known := anchorsByFile[targetRelPath]
-					if !known {
-						if data, readErr := tools.ReadFileSafely(repoRoot, targetRelPath); readErr == nil {
-							targetAnchors = extractHeadingAnchors(string(data))
-							anchorsByFile[targetRelPath] = targetAnchors
-						}
-					}
-					if !targetAnchors[strings.ToLower(anchor)] {
-						displayPath := linkPath
-						if displayPath == "" {
-							displayPath = path.Base(relPath)
-						}
-						lineStamps = append(lineStamps, fmt.Sprintf("%s [%s] heading anchor %q does not exist in %q -->", brokenLinkCommentPrefix, hrefTarget, "#"+anchor, displayPath))
-					}
-				}
-			}
-
-			for i := len(lineStamps) - 1; i >= 0; i-- {
-				outLines = append(outLines, lineStamps[i])
-				totalBroken++
-			}
-			outLines = append(outLines, updatedLine)
-		}
-
-		finalContent := strings.Join(outLines, "\n")
+		finalContent, broken := processFileLinks(repoRoot, docsDir, rootAbs, relPath, cleanContents[relPath], anchorsByFile)
+		totalBroken += broken
 		if finalContent != rawContents[relPath] {
 			if err := tools.WriteFileSafely(repoRoot, relPath, []byte(finalContent)); err != nil {
 				return totalBroken, fmt.Errorf("failed to write %s: %w", relPath, err)
@@ -790,6 +733,138 @@ func validateMarkdownLinks(repoRoot, docsDir string) (int, error) {
 	}
 
 	return totalBroken, nil
+}
+
+func processFileLinks(repoRoot, docsDir, rootAbs, relPath, cleaned string, anchorsByFile map[string]map[string]bool) (string, int) {
+	rawLines := strings.Split(cleaned, "\n")
+	sourceDir := path.Dir(relPath)
+
+	var fs fenceState
+	var outLines []string
+	totalBroken := 0
+
+	for _, rawLine := range rawLines {
+		if fs.consume(rawLine) {
+			outLines = append(outLines, rawLine)
+			continue
+		}
+
+		updatedLine, lineStamps := processLineLinks(repoRoot, docsDir, rootAbs, relPath, sourceDir, rawLine, anchorsByFile)
+		for i := len(lineStamps) - 1; i >= 0; i-- {
+			outLines = append(outLines, lineStamps[i])
+			totalBroken++
+		}
+		outLines = append(outLines, updatedLine)
+	}
+
+	return strings.Join(outLines, "\n"), totalBroken
+}
+
+func processLineLinks(repoRoot, docsDir, rootAbs, relPath, sourceDir, rawLine string, anchorsByFile map[string]map[string]bool) (string, []string) {
+	matches := findMarkdownLinks(rawLine)
+	if len(matches) == 0 {
+		return rawLine, nil
+	}
+
+	updatedLine := rawLine
+	var lineStamps []string
+
+	for i := len(matches) - 1; i >= 0; i-- {
+		m := matches[i]
+		rawHref := strings.TrimSpace(rawLine[m.hrefStart:m.hrefEnd])
+		newHref, replaced, stamp := validateSingleLink(repoRoot, docsDir, rootAbs, relPath, sourceDir, rawHref, anchorsByFile)
+		if replaced {
+			updatedLine = updatedLine[:m.hrefStart] + newHref + updatedLine[m.hrefEnd:]
+		}
+		if stamp != "" {
+			lineStamps = append(lineStamps, stamp)
+		}
+	}
+
+	return updatedLine, lineStamps
+}
+
+func validateSingleLink(repoRoot, docsDir, rootAbs, relPath, sourceDir, rawHref string, anchorsByFile map[string]map[string]bool) (string, bool, string) {
+	hrefTarget := extractLinkTarget(rawHref)
+	if hrefTarget == "" || isExternalLink(hrefTarget) {
+		return "", false, ""
+	}
+
+	linkPath, anchor, hasHash := strings.Cut(hrefTarget, "#")
+	if strings.HasPrefix(linkPath, "/") {
+		return "", false, fmt.Sprintf("%s [%s] root-absolute link is not portable; use a relative path -->", brokenLinkCommentPrefix, hrefTarget)
+	}
+
+	targetRelPath, repairedLink, repaired, ok := resolveLinkPath(repoRoot, docsDir, rootAbs, relPath, sourceDir, linkPath)
+	if !ok {
+		return "", false, fmt.Sprintf("%s [%s] file %q does not exist -->", brokenLinkCommentPrefix, hrefTarget, linkPath)
+	}
+
+	newHref := ""
+	if repaired {
+		linkPath = repairedLink
+		newHref = repairedLink
+		if hasHash {
+			newHref = repairedLink + "#" + anchor
+		}
+		hrefTarget = newHref
+	}
+
+	stamp := validateAnchor(repoRoot, relPath, targetRelPath, linkPath, hrefTarget, anchor, anchorsByFile)
+	return newHref, repaired, stamp
+}
+
+func resolveLinkPath(repoRoot, docsDir, rootAbs, relPath, sourceDir, linkPath string) (string, string, bool, bool) {
+	if linkPath == "" {
+		return relPath, "", false, true
+	}
+
+	joinedRel := filepath.Join(filepath.FromSlash(sourceDir), filepath.FromSlash(linkPath))
+	if resolvedAbs, err := security.SafeResolve(repoRoot, joinedRel); err == nil {
+		if info, statErr := os.Stat(resolvedAbs); statErr == nil && !info.IsDir() {
+			var targetRelPath string
+			if relToRoot, relErr := filepath.Rel(rootAbs, resolvedAbs); relErr == nil {
+				targetRelPath = filepath.ToSlash(relToRoot)
+			}
+			return targetRelPath, "", false, true
+		}
+	}
+
+	if repairedLink, repairedRel, ok := tryAutoRepairLink(repoRoot, docsDir, sourceDir, linkPath); ok {
+		return repairedRel, repairedLink, true, true
+	}
+
+	return "", "", false, false
+}
+
+func validateAnchor(repoRoot, relPath, targetRelPath, linkPath, hrefTarget, anchor string, anchorsByFile map[string]map[string]bool) string {
+	if anchor == "" || !strings.EqualFold(path.Ext(targetRelPath), ".md") || reLineAnchor.MatchString(anchor) {
+		return ""
+	}
+
+	targetAnchors := getFileAnchors(repoRoot, targetRelPath, anchorsByFile)
+	if targetAnchors[strings.ToLower(anchor)] {
+		return ""
+	}
+
+	displayPath := linkPath
+	if displayPath == "" {
+		displayPath = path.Base(relPath)
+	}
+	return fmt.Sprintf("%s [%s] heading anchor %q does not exist in %q -->", brokenLinkCommentPrefix, hrefTarget, "#"+anchor, displayPath)
+}
+
+func getFileAnchors(repoRoot, targetRelPath string, anchorsByFile map[string]map[string]bool) map[string]bool {
+	if targetAnchors, known := anchorsByFile[targetRelPath]; known {
+		return targetAnchors
+	}
+	data, err := tools.ReadFileSafely(repoRoot, targetRelPath)
+	if err != nil {
+		return nil
+	}
+	targetAnchors := extractHeadingAnchors(string(data))
+	anchorsByFile[targetRelPath] = targetAnchors
+	return targetAnchors
 }
 
 func stripBrokenLinkStamps(markdown string) string {
@@ -809,22 +884,10 @@ func extractHeadingAnchors(markdown string) map[string]bool {
 	anchors := make(map[string]bool)
 	seenCounts := make(map[string]int)
 	lines := strings.Split(markdown, "\n")
-	inFence := false
-	var fenceChar byte
-	var fenceCount int
+	var fs fenceState
 
 	for _, line := range lines {
-		if !inFence {
-			if ch, count, _, ok := tools.ParseFenceOpen(line); ok {
-				inFence = true
-				fenceChar = ch
-				fenceCount = count
-				continue
-			}
-		} else {
-			if tools.IsFenceClose(line, fenceChar, fenceCount) {
-				inFence = false
-			}
+		if fs.consume(line) {
 			continue
 		}
 
@@ -849,68 +912,76 @@ func findMarkdownLinks(line string) []linkMatch {
 	n := len(line)
 	for i := 0; i < n; i++ {
 		if line[i] == '`' {
-			tickStart := i
-			for i < n && line[i] == '`' {
-				i++
-			}
-			tickLen := i - tickStart
-			j := i
-			closed := false
-			for j < n {
-				if line[j] != '`' {
-					j++
-					continue
-				}
-				runStart := j
-				for j < n && line[j] == '`' {
-					j++
-				}
-				if j-runStart == tickLen {
-					i = j - 1
-					closed = true
-					break
-				}
-			}
-			if !closed {
-				i = tickStart + tickLen - 1
-			}
+			i = skipInlineCodeSpan(line, i)
 			continue
 		}
 
-		if line[i] != '[' {
+		m, ok := matchLinkAt(line, i)
+		if !ok {
 			continue
 		}
-		if i > 0 && line[i-1] == '!' {
-			continue
-		}
-
-		closeBracket := -1
-		for j := i + 1; j < n; j++ {
-			if line[j] == '[' {
-				break
-			}
-			if line[j] == ']' {
-				closeBracket = j
-				break
-			}
-		}
-		if closeBracket == -1 || closeBracket+1 >= n || line[closeBracket+1] != '(' {
-			continue
-		}
-
-		openParen := closeBracket + 1
-		closeParen := findMatchingDelimiter(line, openParen, '(', ')')
-		if closeParen == -1 {
-			continue
-		}
-
-		matches = append(matches, linkMatch{
-			hrefStart: openParen + 1,
-			hrefEnd:   closeParen,
-		})
-		i = closeParen
+		matches = append(matches, m)
+		i = m.hrefEnd
 	}
 	return matches
+}
+
+func skipInlineCodeSpan(line string, tickStart int) int {
+	n := len(line)
+	i := tickStart
+	for i < n && line[i] == '`' {
+		i++
+	}
+	tickLen := i - tickStart
+
+	for j := i; j < n; {
+		if line[j] != '`' {
+			j++
+			continue
+		}
+		runStart := j
+		for j < n && line[j] == '`' {
+			j++
+		}
+		if j-runStart == tickLen {
+			return j - 1
+		}
+	}
+	return tickStart + tickLen - 1
+}
+
+func matchLinkAt(line string, start int) (linkMatch, bool) {
+	if line[start] != '[' || (start > 0 && line[start-1] == '!') {
+		return linkMatch{}, false
+	}
+
+	closeBracket := findLinkTextEnd(line, start+1)
+	if closeBracket == -1 || closeBracket+1 >= len(line) || line[closeBracket+1] != '(' {
+		return linkMatch{}, false
+	}
+
+	openParen := closeBracket + 1
+	closeParen := findMatchingDelimiter(line, openParen, '(', ')')
+	if closeParen == -1 {
+		return linkMatch{}, false
+	}
+
+	return linkMatch{
+		hrefStart: openParen + 1,
+		hrefEnd:   closeParen,
+	}, true
+}
+
+func findLinkTextEnd(line string, start int) int {
+	for j := start; j < len(line); j++ {
+		if line[j] == '[' {
+			return -1
+		}
+		if line[j] == ']' {
+			return j
+		}
+	}
+	return -1
 }
 
 func extractLinkTarget(rawHref string) string {

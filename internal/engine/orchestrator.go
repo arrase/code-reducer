@@ -36,7 +36,9 @@ type StatusFunc func(string)
 // Run executes the documentation pipeline for the specified mode.
 func Run(ctx context.Context, repoRoot string, cfg *config.Config, mode RunMode, onStatus StatusFunc) error {
 	if onStatus == nil {
-		onStatus = func(string) {}
+		onStatus = func(string) {
+			// No-op when caller does not provide a status callback.
+		}
 	}
 
 	if err := tools.EnsureGitignoreHasLockfile(repoRoot); err != nil {
@@ -135,21 +137,22 @@ func buildProjectContextItems(rootSum string, tree *DirNode, cache *MetadataCach
 	return items
 }
 
-func (o *orchestrator) GenerateStandardDocs(ctx context.Context, repoRoot, docsDir, rootSum string, tree *DirNode, cache *MetadataCache, cfg *config.Config, onStatus StatusFunc) error {
-	contextItems := buildProjectContextItems(rootSum, tree, cache)
-	langInstr := config.LanguageInstruction(cfg.Language)
+func (o *orchestrator) GenerateStandardDocs(ctx context.Context, pState *pipelineState, rootSum string, tree *DirNode) error {
+	contextItems := buildProjectContextItems(rootSum, tree, pState.cache)
+	langInstr := config.LanguageInstruction(pState.cfg.Language)
+	docsDir := pState.cfg.DocsDir
 
-	onStatus("Step 3: Global Architecture Synthesis...")
+	pState.onStatus("Step 3: Global Architecture Synthesis...")
 	archPath := filepath.Join(docsDir, "architecture.md")
 	archHeader := fmt.Sprintf("Write the global architecture overview (%s) based on the project context.", archPath)
-	if err := o.generateDoc(ctx, repoRoot, archPath, cfg.SystemPrompt+"\n"+cfg.ArchitecturePrompt+langInstr, archHeader, contextItems, onStatus); err != nil {
+	if err := o.generateDoc(ctx, pState.repoRoot, archPath, pState.cfg.SystemPrompt+"\n"+pState.cfg.ArchitecturePrompt+langInstr, archHeader, contextItems, pState.onStatus); err != nil {
 		return err
 	}
 
-	onStatus("Step 4: Generating Quickstart...")
+	pState.onStatus("Step 4: Generating Quickstart...")
 	qsPath := filepath.Join(docsDir, "quickstart.md")
 	qsHeader := fmt.Sprintf("Write the %s page based on the project context.", qsPath)
-	return o.generateDoc(ctx, repoRoot, qsPath, cfg.SystemPrompt+"\n"+cfg.QuickstartPrompt+langInstr, qsHeader, contextItems, onStatus)
+	return o.generateDoc(ctx, pState.repoRoot, qsPath, pState.cfg.SystemPrompt+"\n"+pState.cfg.QuickstartPrompt+langInstr, qsHeader, contextItems, pState.onStatus)
 }
 
 func setupPipeline(repoRoot string, cfg *config.Config) (string, []string, *MetadataCache, error) {
@@ -282,7 +285,7 @@ func (o *orchestrator) RunInit(ctx context.Context, repoRoot string, cfg *config
 		return err
 	}
 
-	if err := o.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, tree, cache, cfg, onStatus); err != nil {
+	if err := o.GenerateStandardDocs(ctx, pState, rootSum, tree); err != nil {
 		return err
 	}
 
@@ -321,6 +324,10 @@ func pruneStaleCache(repoRoot string, docsDir string, cache *MetadataCache, tree
 		activeDocs[filepath.Join(modulesRoot, toSafeMarkdownFilename(mPath))] = true
 	}
 
+	pruneStaleModuleDocs(modulesRoot, activeDocs)
+}
+
+func pruneStaleModuleDocs(modulesRoot string, activeDocs map[string]bool) {
 	var subdirs []string
 	_ = filepath.WalkDir(modulesRoot, func(p string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -375,6 +382,26 @@ func detectFileChanges(repoRoot string, ignores []string, cache *MetadataCache, 
 	return filteredChanges, currentHashes, validFiles, nil
 }
 
+func hasModifiedFileFactsChanged(ctx context.Context, pState *pipelineState, nodesByPath map[string]*DirNode, filePath string) (bool, error) {
+	prevEntry, ok := pState.cache.Files[filePath]
+	if !ok {
+		return true, nil
+	}
+	var siblingFiles []string
+	if dirNode := nodesByPath[path.Dir(filePath)]; dirNode != nil {
+		siblingFiles = dirNode.Files
+	}
+	newFacts, err := extractFileFacts(ctx, pState, filePath, siblingFiles)
+	if err != nil {
+		return false, err
+	}
+	if newFacts == prevEntry.Facts {
+		pState.onStatus(fmt.Sprintf("➜ Unchanged facts for modified file, skipping module re-synthesis: %s", filePath))
+		return false, nil
+	}
+	return true, nil
+}
+
 func resolveEffectiveChanges(ctx context.Context, pState *pipelineState, tree *DirNode, changes []FileChange) ([]FileChange, bool, error) {
 	nodesByPath := collectTreeNodes(tree)
 	var effective []FileChange
@@ -385,19 +412,12 @@ func resolveEffectiveChanges(ctx context.Context, pState *pipelineState, tree *D
 			structureChanged = true
 		}
 		if change.Status == StatusModified {
-			if prevEntry, ok := pState.cache.Files[change.Path]; ok {
-				var siblingFiles []string
-				if dirNode := nodesByPath[path.Dir(change.Path)]; dirNode != nil {
-					siblingFiles = dirNode.Files
-				}
-				newFacts, err := extractFileFacts(ctx, pState, change.Path, siblingFiles)
-				if err != nil {
-					return nil, false, err
-				}
-				if newFacts == prevEntry.Facts {
-					pState.onStatus(fmt.Sprintf("➜ Unchanged facts for modified file, skipping module re-synthesis: %s", change.Path))
-					continue
-				}
+			changed, err := hasModifiedFileFactsChanged(ctx, pState, nodesByPath, change.Path)
+			if err != nil {
+				return nil, false, err
+			}
+			if !changed {
+				continue
 			}
 		}
 		effective = append(effective, change)
@@ -481,7 +501,7 @@ func (o *orchestrator) RunUpdate(ctx context.Context, repoRoot string, cfg *conf
 	}
 
 	if missingGlobalDocs || structureChanged || rootSum != prevRootSum || topModulesChanged {
-		if err := o.GenerateStandardDocs(ctx, repoRoot, docsDir, rootSum, tree, cache, cfg, onStatus); err != nil {
+		if err := o.GenerateStandardDocs(ctx, pState, rootSum, tree); err != nil {
 			return err
 		}
 	} else {

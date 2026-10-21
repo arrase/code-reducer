@@ -2,9 +2,21 @@ package engine
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func assertChunks(t *testing.T, text string, maxRunes, overlapRunes int, want ...string) {
+	t.Helper()
+	chunks, err := chunkTextWithOverlap(text, maxRunes, overlapRunes)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !slices.Equal(chunks, want) {
+		t.Fatalf("expected %q, got %q", want, chunks)
+	}
+}
 
 func TestChunkTextWithOverlap(t *testing.T) {
 	t.Run("invalid maxRunes", func(t *testing.T) {
@@ -24,59 +36,19 @@ func TestChunkTextWithOverlap(t *testing.T) {
 	})
 
 	t.Run("text shorter than maxRunes", func(t *testing.T) {
-		chunks, err := chunkTextWithOverlap("hello", 10, 2)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(chunks) != 1 || chunks[0] != "hello" {
-			t.Fatalf("expected ['hello'], got %v", chunks)
-		}
+		assertChunks(t, "hello", 10, 2, "hello")
 	})
 
 	t.Run("text exactly maxRunes", func(t *testing.T) {
-		chunks, err := chunkTextWithOverlap("hello", 5, 2)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(chunks) != 1 || chunks[0] != "hello" {
-			t.Fatalf("expected ['hello'], got %v", chunks)
-		}
+		assertChunks(t, "hello", 5, 2, "hello")
 	})
 
 	t.Run("chunking with overlap", func(t *testing.T) {
-		chunks, err := chunkTextWithOverlap("abcdefg", 4, 2)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(chunks) != 3 {
-			t.Fatalf("expected 3 chunks, got %d", len(chunks))
-		}
-		if chunks[0] != "abcd" {
-			t.Errorf("expected chunk 0 to be 'abcd', got '%s'", chunks[0])
-		}
-		if chunks[1] != "cdef" {
-			t.Errorf("expected chunk 1 to be 'cdef', got '%s'", chunks[1])
-		}
-		if chunks[2] != "efg" {
-			t.Errorf("expected chunk 2 to be 'efg', got '%s'", chunks[2])
-		}
+		assertChunks(t, "abcdefg", 4, 2, "abcd", "cdef", "efg")
 	})
 
 	t.Run("chunking splits at last newline in tail window", func(t *testing.T) {
-		text := "line1\nline2\nline3\n"
-		chunks, err := chunkTextWithOverlap(text, 14, 2)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(chunks) != 2 {
-			t.Fatalf("expected 2 chunks, got %d: %q", len(chunks), chunks)
-		}
-		if chunks[0] != "line1\nline2\n" {
-			t.Errorf("expected chunk 0 to end after newline 'line1\\nline2\\n', got %q", chunks[0])
-		}
-		if chunks[1] != "2\nline3\n" {
-			t.Errorf("expected chunk 1 to preserve overlap '2\\nline3\\n', got %q", chunks[1])
-		}
+		assertChunks(t, "line1\nline2\nline3\n", 14, 2, "line1\nline2\n", "2\nline3\n")
 	})
 }
 

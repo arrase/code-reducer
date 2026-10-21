@@ -162,6 +162,88 @@ Alpha token appears here as well.
 	}
 }
 
+func mustReadWikiSection(t *testing.T, repoRoot, docsDir, target string) string {
+	t.Helper()
+	got, err := ReadWikiSection(repoRoot, docsDir, target)
+	if err != nil {
+		t.Fatalf("unexpected error reading %q: %v", target, err)
+	}
+	return got
+}
+
+func testReadFullPage(t *testing.T, repoRoot, archContent string) {
+	t.Helper()
+	if got := mustReadWikiSection(t, repoRoot, "wiki", "architecture.md"); got != archContent {
+		t.Errorf("expected full content, got %q", got)
+	}
+	if got := mustReadWikiSection(t, repoRoot, "wiki", "wiki/architecture.md"); got != archContent {
+		t.Errorf("expected full content with wiki/ prefix, got %q", got)
+	}
+}
+
+func testReadH2Section(t *testing.T, repoRoot string) {
+	t.Helper()
+	got := mustReadWikiSection(t, repoRoot, "wiki", "modules/internal/engine/README.md#public-api")
+	if !strings.HasPrefix(got, "## Public API") {
+		t.Errorf("expected section to start with '## Public API', got %q", got)
+	}
+	if !strings.Contains(got, "### Functions") || !strings.Contains(got, "func Run() {}") {
+		t.Errorf("expected nested H3 and code fence in section, got %q", got)
+	}
+	if strings.Contains(got, "First details section") {
+		t.Errorf("expected section to stop before next H2, got %q", got)
+	}
+}
+
+func testReadDuplicateAnchors(t *testing.T, repoRoot string) {
+	t.Helper()
+	first := mustReadWikiSection(t, repoRoot, "wiki", "modules/internal/engine/README.md#details")
+	if !strings.Contains(first, "First details section.") || strings.Contains(first, "Second duplicate") {
+		t.Errorf("unexpected content for #details: %q", first)
+	}
+
+	second := mustReadWikiSection(t, repoRoot, "wiki", "modules/internal/engine/README.md#details-1")
+	if !strings.Contains(second, "Second duplicate details section.") || strings.Contains(second, "First details") {
+		t.Errorf("unexpected content for #details-1: %q", second)
+	}
+}
+
+func testReadMissingAnchor(t *testing.T, repoRoot string) {
+	t.Helper()
+	_, err := ReadWikiSection(repoRoot, "wiki", "modules/internal/engine/README.md#non-existent")
+	if err == nil {
+		t.Fatalf("expected error for missing anchor, got nil")
+	}
+	if !strings.Contains(err.Error(), "public-api") || !strings.Contains(err.Error(), "details-1") {
+		t.Errorf("expected error to list available anchors, got: %v", err)
+	}
+}
+
+func testReadPathTraversal(t *testing.T, repoRoot string) {
+	t.Helper()
+	writeTestDoc(t, repoRoot, "secret.md", "# Secret outside wiki\n")
+
+	for _, badTarget := range []string{"../../etc/passwd", "../secret.md", "/etc/passwd"} {
+		_, err := ReadWikiSection(repoRoot, "wiki", badTarget)
+		if !errors.Is(err, security.ErrPathTraversal) {
+			t.Errorf("expected ErrPathTraversal for %q, got: %v", badTarget, err)
+		}
+	}
+}
+
+func testReadRejectedTargets(t *testing.T, repoRoot string) {
+	t.Helper()
+	writeTestDoc(t, repoRoot, "wiki/.metadata.json", `{"files":{}}`)
+	writeTestDoc(t, repoRoot, "wiki/.hidden/secret.md", "# Hidden\n")
+	writeTestDoc(t, repoRoot, "wiki/notes.txt", "plain text")
+
+	for _, badTarget := range []string{".metadata.json", "wiki/.metadata.json", ".hidden/secret.md", "notes.txt"} {
+		if _, err := ReadWikiSection(repoRoot, "wiki", badTarget); err == nil {
+			t.Errorf("expected ReadWikiSection to reject %q, got nil", badTarget)
+		}
+	}
+}
+
 func TestReadWikiSection(t *testing.T) {
 	repoRoot := t.TempDir()
 
@@ -197,91 +279,22 @@ Second duplicate details section.
 	writeTestDoc(t, repoRoot, "wiki/modules/internal/engine/README.md", modContent)
 
 	t.Run("read full page with and without docsDir prefix", func(t *testing.T) {
-		got1, err := ReadWikiSection(repoRoot, "wiki", "architecture.md")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got1 != archContent {
-			t.Errorf("expected full content, got %q", got1)
-		}
-
-		got2, err := ReadWikiSection(repoRoot, "wiki", "wiki/architecture.md")
-		if err != nil {
-			t.Fatalf("unexpected error with wiki/ prefix: %v", err)
-		}
-		if got2 != archContent {
-			t.Errorf("expected full content with wiki/ prefix, got %q", got2)
-		}
+		testReadFullPage(t, repoRoot, archContent)
 	})
-
 	t.Run("read specific H2 section including nested H3 and fenced code", func(t *testing.T) {
-		got, err := ReadWikiSection(repoRoot, "wiki", "modules/internal/engine/README.md#public-api")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !strings.HasPrefix(got, "## Public API") {
-			t.Errorf("expected section to start with '## Public API', got %q", got)
-		}
-		if !strings.Contains(got, "### Functions") || !strings.Contains(got, "func Run() {}") {
-			t.Errorf("expected nested H3 and code fence in section, got %q", got)
-		}
-		if strings.Contains(got, "First details section") {
-			t.Errorf("expected section to stop before next H2, got %q", got)
-		}
+		testReadH2Section(t, repoRoot)
 	})
-
 	t.Run("read duplicate heading anchors", func(t *testing.T) {
-		first, err := ReadWikiSection(repoRoot, "wiki", "modules/internal/engine/README.md#details")
-		if err != nil {
-			t.Fatalf("unexpected error reading #details: %v", err)
-		}
-		if !strings.Contains(first, "First details section.") || strings.Contains(first, "Second duplicate") {
-			t.Errorf("unexpected content for #details: %q", first)
-		}
-
-		second, err := ReadWikiSection(repoRoot, "wiki", "modules/internal/engine/README.md#details-1")
-		if err != nil {
-			t.Fatalf("unexpected error reading #details-1: %v", err)
-		}
-		if !strings.Contains(second, "Second duplicate details section.") || strings.Contains(second, "First details") {
-			t.Errorf("unexpected content for #details-1: %q", second)
-		}
+		testReadDuplicateAnchors(t, repoRoot)
 	})
-
 	t.Run("error on missing anchor lists available anchors", func(t *testing.T) {
-		_, err := ReadWikiSection(repoRoot, "wiki", "modules/internal/engine/README.md#non-existent")
-		if err == nil {
-			t.Fatalf("expected error for missing anchor, got nil")
-		}
-		if !strings.Contains(err.Error(), "public-api") || !strings.Contains(err.Error(), "details-1") {
-			t.Errorf("expected error to list available anchors, got: %v", err)
-		}
+		testReadMissingAnchor(t, repoRoot)
 	})
-
 	t.Run("error on path traversal", func(t *testing.T) {
-		writeTestDoc(t, repoRoot, "secret.md", "# Secret outside wiki\n")
-
-		for _, badTarget := range []string{"../../etc/passwd", "../secret.md", "/etc/passwd"} {
-			_, err := ReadWikiSection(repoRoot, "wiki", badTarget)
-			if err == nil {
-				t.Errorf("expected error for traversal target %q, got nil", badTarget)
-			}
-			if !errors.Is(err, security.ErrPathTraversal) {
-				t.Errorf("expected ErrPathTraversal for %q, got: %v", badTarget, err)
-			}
-		}
+		testReadPathTraversal(t, repoRoot)
 	})
-
 	t.Run("reject hidden files and non-markdown files", func(t *testing.T) {
-		writeTestDoc(t, repoRoot, "wiki/.metadata.json", `{"files":{}}`)
-		writeTestDoc(t, repoRoot, "wiki/.hidden/secret.md", "# Hidden\n")
-		writeTestDoc(t, repoRoot, "wiki/notes.txt", "plain text")
-
-		for _, badTarget := range []string{".metadata.json", "wiki/.metadata.json", ".hidden/secret.md", "notes.txt"} {
-			if _, err := ReadWikiSection(repoRoot, "wiki", badTarget); err == nil {
-				t.Errorf("expected ReadWikiSection to reject %q, got nil", badTarget)
-			}
-		}
+		testReadRejectedTargets(t, repoRoot)
 	})
 }
 
