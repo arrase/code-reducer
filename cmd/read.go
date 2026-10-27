@@ -33,9 +33,9 @@ var readCmd = &cobra.Command{
 
 		out := cmd.OutOrStdout()
 		if strings.HasSuffix(content, "\n") {
-			fmt.Fprint(out, content)
+			_, _ = fmt.Fprint(out, content)
 		} else {
-			fmt.Fprintln(out, content)
+			_, _ = fmt.Fprintln(out, content)
 		}
 		return nil
 	},

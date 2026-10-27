@@ -102,5 +102,7 @@ func TestAcquireLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireLock() failed after unlock: %v", err)
 	}
-	lock2.Unlock()
+	if err := lock2.Unlock(); err != nil {
+		t.Errorf("Unlock() failed: %v", err)
+	}
 }

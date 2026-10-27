@@ -40,18 +40,18 @@ var searchCmd = &cobra.Command{
 
 		out := cmd.OutOrStdout()
 		if len(results) == 0 {
-			fmt.Fprintf(out, "No results found for %q.\n", query)
+			_, _ = fmt.Fprintf(out, "No results found for %q.\n", query)
 			return nil
 		}
 
 		for i, r := range results {
-			fmt.Fprintf(out, "[%d] %s (score: %.2f)\n", i+1, r.Target, r.Score)
-			fmt.Fprintf(out, "    Heading: %s\n", r.Heading)
+			_, _ = fmt.Fprintf(out, "[%d] %s (score: %.2f)\n", i+1, r.Target, r.Score)
+			_, _ = fmt.Fprintf(out, "    Heading: %s\n", r.Heading)
 			if len(r.Sources) > 0 {
-				fmt.Fprintf(out, "    Sources: %s\n", strings.Join(r.Sources, ", "))
+				_, _ = fmt.Fprintf(out, "    Sources: %s\n", strings.Join(r.Sources, ", "))
 			}
 			if r.Snippet != "" {
-				fmt.Fprintf(out, "    Snippet: %s\n", r.Snippet)
+				_, _ = fmt.Fprintf(out, "    Snippet: %s\n", r.Snippet)
 			}
 		}
 		return nil

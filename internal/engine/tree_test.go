@@ -45,14 +45,20 @@ func TestBuildTree(t *testing.T) {
 func TestDetermineAndPropagateAffected(t *testing.T) {
 	tempDir := t.TempDir()
 	docsDir := filepath.Join(tempDir, "docs")
-	os.MkdirAll(filepath.Join(docsDir, "modules"), 0755)
+	if err := os.MkdirAll(filepath.Join(docsDir, "modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create dummy module files so os.Stat doesn't fail
 	for _, m := range []string{".", "cmd", "internal", "internal/app"} {
 		safeName := toSafeMarkdownFilename(m)
 		fullPath := filepath.Join(docsDir, "modules", safeName)
-		os.MkdirAll(filepath.Dir(fullPath), 0755)
-		os.WriteFile(fullPath, []byte("test"), 0644)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte("test"), 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	tree := &DirNode{

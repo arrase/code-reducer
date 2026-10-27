@@ -16,7 +16,7 @@ type mockLLMCaller struct {
 	userPrompts   []string
 }
 
-func (m *mockLLMCaller) CallLLM(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+func (m *mockLLMCaller) CallLLM(_ context.Context, systemPrompt, userPrompt string) (string, error) {
 	m.systemPrompts = append(m.systemPrompts, systemPrompt)
 	m.userPrompts = append(m.userPrompts, userPrompt)
 	return "Mocked LLM summary response", nil

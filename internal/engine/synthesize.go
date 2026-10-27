@@ -101,7 +101,7 @@ func extractFileFacts(ctx context.Context, p *pipelineState, f string, siblingFi
 			return "", err
 		}
 		if consolidatedFact != "" {
-			factsBuilder.WriteString(fmt.Sprintf("#### [%s]\n%s\n\n", step.Name, consolidatedFact))
+			_, _ = fmt.Fprintf(&factsBuilder, "#### [%s]\n%s\n\n", step.Name, consolidatedFact)
 		}
 	}
 	facts := strings.TrimSpace(factsBuilder.String())

@@ -117,7 +117,7 @@ func AcquireLock(repoRoot string) (*SimpleLock, error) {
 		return nil, fmt.Errorf("failed to acquire lock at %s: %w", lockPath, err)
 	}
 
-	if _, err := f.Write([]byte(fmt.Sprintf("%d\n", os.Getpid()))); err != nil {
+	if _, err := fmt.Fprintf(f, "%d\n", os.Getpid()); err != nil {
 		_ = f.Close()
 		_ = os.Remove(lockPath)
 		return nil, fmt.Errorf("failed to write pid to lockfile: %w", err)

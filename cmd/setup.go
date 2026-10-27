@@ -16,7 +16,7 @@ var setupCmd = &cobra.Command{
 	Use:   "setup",
 	Short: "Configure the application",
 	Long:  `Run the interactive configuration setup to generate the .code-reducer.yaml file.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(_ *cobra.Command, _ []string) error {
 		repoRoot, err := os.Getwd()
 		if err != nil {
 			return fmt.Errorf("failed to get current working directory: %w", err)

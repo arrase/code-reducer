@@ -1,6 +1,6 @@
 module github.com/arrase/code-reducer
 
-go 1.26
+go 1.26.10
 
 require (
 	github.com/mattn/go-isatty v0.0.24

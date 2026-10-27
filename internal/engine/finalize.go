@@ -375,9 +375,10 @@ func findMatchingDelimiter(s string, openIdx int, openChar, closeChar byte) int 
 		if inQuotes {
 			continue
 		}
-		if ch == openChar {
+		switch ch {
+		case openChar:
 			depth++
-		} else if ch == closeChar {
+		case closeChar:
 			depth--
 			if depth == 0 {
 				return i

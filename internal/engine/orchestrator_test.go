@@ -251,7 +251,7 @@ func TestPrepareOllamaRequest(t *testing.T) {
 }
 
 func TestCallLLMDoneReasonLengthWarning(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		resp := ollamaResponse{
 			Message:    Message{Role: "assistant", Content: "partial output"},
 			DoneReason: "length",
