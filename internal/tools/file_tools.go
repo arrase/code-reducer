@@ -169,9 +169,9 @@ func EnsureGitignoreHasLockfile(repoRoot string) error {
 		contentToAppend = "\n" + contentToAppend
 	}
 
-	newData := append(data, []byte(contentToAppend)...)
+	data = append(data, []byte(contentToAppend)...)
 
-	return WriteFileAtomic(gitignorePath, newData, defaultFilePerm)
+	return WriteFileAtomic(gitignorePath, data, defaultFilePerm)
 }
 
 // LoadGitignore reads the .gitignore file from repoRoot and returns its active ignore patterns.

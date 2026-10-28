@@ -187,6 +187,23 @@ func TestDiscoverCodeFiles(t *testing.T) {
 	}
 }
 
+func TestEnsureGitignoreHasLockfile(t *testing.T) {
+	repoRoot := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(repoRoot, ".gitignore"), []byte("*.log"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tools.EnsureGitignoreHasLockfile(repoRoot); err != nil {
+		t.Fatalf("EnsureGitignoreHasLockfile() failed: %v", err)
+	}
+
+	// Second call should be a no-op
+	if err := tools.EnsureGitignoreHasLockfile(repoRoot); err != nil {
+		t.Fatalf("EnsureGitignoreHasLockfile() second call failed: %v", err)
+	}
+}
+
 func TestVerifyGitRepo(t *testing.T) {
 	nonGitDir := t.TempDir()
 	if err := tools.VerifyGitRepo(nonGitDir); err == nil {

@@ -111,9 +111,9 @@ func buildProjectContextItems(rootSum string, tree *DirNode, cache *MetadataCach
 		copy(files, node.Files)
 		sort.Strings(files)
 		if len(files) > 0 {
-			mapBuilder.WriteString(fmt.Sprintf("- `%s` -> `%s` (files: %s)\n", dirPath, docPath, strings.Join(files, ", ")))
+			fmt.Fprintf(&mapBuilder, "- `%s` -> `%s` (files: %s)\n", dirPath, docPath, strings.Join(files, ", "))
 		} else {
-			mapBuilder.WriteString(fmt.Sprintf("- `%s` -> `%s`\n", dirPath, docPath))
+			fmt.Fprintf(&mapBuilder, "- `%s` -> `%s`\n", dirPath, docPath)
 		}
 	}
 

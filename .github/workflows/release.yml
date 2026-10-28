@@ -4,13 +4,14 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   release:
     name: Build and Release Binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     strategy:
       matrix:
         goos: [linux, windows, darwin]
@@ -20,12 +21,15 @@ jobs:
             goarch: "386"
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26'
+          go-version-file: 'go.mod'
+          cache: false
 
       - name: Run Vet
         run: go vet ./...
@@ -40,7 +44,7 @@ jobs:
           CGO_ENABLED: 0
         run: |
           BINARY_NAME="code-reducer"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
+          if [ "${GOOS}" = "windows" ]; then
             BINARY_NAME="code-reducer.exe"
           fi
           # Compile with optimizations and strip symbols
@@ -48,19 +52,23 @@ jobs:
 
       - name: Package Binary
         id: package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           cd dist
           BINARY_NAME="code-reducer"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
+          if [ "${GOOS}" = "windows" ]; then
             BINARY_NAME="code-reducer.exe"
-            zip "../code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.zip" "${BINARY_NAME}"
-            echo "asset_path=code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.zip" >> $GITHUB_OUTPUT
+            zip "../code-reducer-${GOOS}-${GOARCH}.zip" "${BINARY_NAME}"
+            echo "asset_path=code-reducer-${GOOS}-${GOARCH}.zip" >> "$GITHUB_OUTPUT"
           else
-            tar -czvf "../code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" "${BINARY_NAME}"
-            echo "asset_path=code-reducer-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" >> $GITHUB_OUTPUT
+            tar -czvf "../code-reducer-${GOOS}-${GOARCH}.tar.gz" "${BINARY_NAME}"
+            echo "asset_path=code-reducer-${GOOS}-${GOARCH}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload to Release
+        # zizmor: ignore[superfluous-actions]
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: ${{ steps.package.outputs.asset_path }}

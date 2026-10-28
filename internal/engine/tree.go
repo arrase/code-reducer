@@ -144,4 +144,3 @@ func collectTreeNodes(tree *DirNode) map[string]*DirNode {
 	walk(tree)
 	return nodes
 }
-
