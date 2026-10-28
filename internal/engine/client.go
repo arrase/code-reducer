@@ -101,7 +101,7 @@ func (c *llmClient) CallLLM(ctx context.Context, systemPrompt, userPrompt string
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
 		respData, err := io.ReadAll(resp.Body)

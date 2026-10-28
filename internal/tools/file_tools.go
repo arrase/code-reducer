@@ -109,8 +109,8 @@ func WriteFileAtomic(targetPath string, data []byte, perm os.FileMode) error {
 	var success bool
 	defer func() {
 		if !success {
-			_ = tmpFile.Close()
-			_ = os.Remove(tmpName)
+			tmpFile.Close()
+			os.Remove(tmpName)
 		}
 	}()
 
@@ -235,7 +235,7 @@ func isBinaryFile(path string) bool {
 	if err != nil {
 		return false
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	var buf [512]byte
 	n, _ := f.Read(buf[:])

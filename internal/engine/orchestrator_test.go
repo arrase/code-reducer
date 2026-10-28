@@ -305,6 +305,12 @@ func TestBuildProjectContextItems(t *testing.T) {
 	if strings.Contains(item0, "`modules/internal/README.md`") {
 		t.Errorf("did not expect empty module 'internal' to be listed in Module Documentation Map, got:\n%s", item0)
 	}
+
+	cache.Modules["internal"] = "Internal umbrella summary"
+	itemsWithParent := buildProjectContextItems("Root summary", tree, cache)
+	if !strings.Contains(itemsWithParent[0], "- `internal` -> `modules/internal/README.md`\n") {
+		t.Errorf("expected parent module without direct files to be listed, got:\n%s", itemsWithParent[0])
+	}
 }
 
 func TestRunUpdateIdenticalFactsShortCircuit(t *testing.T) {

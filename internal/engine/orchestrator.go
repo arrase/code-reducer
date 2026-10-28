@@ -49,7 +49,7 @@ func Run(ctx context.Context, repoRoot string, cfg *config.Config, mode RunMode,
 	if err != nil {
 		return fmt.Errorf("failed to acquire repository lock: %w", err)
 	}
-	defer func() { _ = lock.Unlock() }()
+	defer lock.Unlock()
 
 	client := newLLMClient(cfg.ModelID, cfg.OllamaBaseURL, cfg.OllamaNumCtx, onStatus)
 	orch := &orchestrator{client: client}
@@ -111,9 +111,9 @@ func buildProjectContextItems(rootSum string, tree *DirNode, cache *MetadataCach
 		copy(files, node.Files)
 		sort.Strings(files)
 		if len(files) > 0 {
-			_, _ = fmt.Fprintf(&mapBuilder, "- `%s` -> `%s` (files: %s)\n", dirPath, docPath, strings.Join(files, ", "))
+			fmt.Fprintf(&mapBuilder, "- `%s` -> `%s` (files: %s)\n", dirPath, docPath, strings.Join(files, ", "))
 		} else {
-			_, _ = fmt.Fprintf(&mapBuilder, "- `%s` -> `%s`\n", dirPath, docPath)
+			fmt.Fprintf(&mapBuilder, "- `%s` -> `%s`\n", dirPath, docPath)
 		}
 	}
 
